@@ -58,8 +58,13 @@ func (c ReplicationConfig) policyPrefix() string {
 	return c.Prefix + "." + c.Project + "."
 }
 
+// namespacePolicyPrefix starts the name of every policy of a namespace.
+func (c ReplicationConfig) namespacePolicyPrefix(namespace string) string {
+	return c.policyPrefix() + namespace + "."
+}
+
 func (c ReplicationConfig) policyName(namespace, name string) string {
-	return c.policyPrefix() + namespace + "." + name
+	return c.namespacePolicyPrefix(namespace) + name
 }
 
 // destination is where a replication copies to. A source repository keeps its path under it.

@@ -303,6 +303,14 @@ func TestValidateReplication(t *testing.T) {
 		"destination that fits in length": {change: func(o *v1alpha1.HarborReplication) {
 			o.Spec.Repository = strings.Repeat("a", 255-len("proj/k8s/ns1/nginx/"))
 		}},
+		"metadata that fits in size": {change: func(o *v1alpha1.HarborReplication) {
+			o.Labels = map[string]string{"a": strings.Repeat("b", 63)}
+			o.Annotations = map[string]string{"c": strings.Repeat("<", 8192-64-1)}
+		}},
+		"large metadata": {change: func(o *v1alpha1.HarborReplication) {
+			o.Labels = map[string]string{"a": strings.Repeat("b", 63)}
+			o.Annotations = map[string]string{"c": strings.Repeat("<", 8192-64)}
+		}, want: []string{"metadata"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			obj := replication("nginx")
@@ -578,6 +586,16 @@ func TestListReplications(t *testing.T) {
 	}
 	if len(h.calls) != 0 {
 		t.Errorf("listing ns3 made calls %v", h.calls)
+	}
+}
+
+func TestListReplicationsInNamespaceListsOnlyItsPolicies(t *testing.T) {
+	r, h, _ := newReplications()
+	create(t, r, "ns1", replication("web"))
+	h.calls = nil
+	listReplications(t, r, "ns1", nil)
+	if diff := cmp.Diff([]string{"ListReplicationPolicies k8s.proj.ns1.", "LatestReplicationExecution 1"}, h.calls); diff != "" {
+		t.Errorf("calls (-want +got):\n%s", diff)
 	}
 }
 

@@ -134,10 +134,15 @@ func (r *Replications) find(ctx context.Context, namespace, name string) (*v1alp
 func (r *Replications) List(ctx context.Context, opts *metainternalversion.ListOptions) (runtime.Object, error) {
 	list := &v1alpha1.HarborReplicationList{Items: []v1alpha1.HarborReplication{}}
 	namespace := genericapirequest.NamespaceValue(ctx)
-	if namespace != "" && !r.namespaces.Allows(namespace) {
-		return list, nil
+	prefix := r.config.policyPrefix()
+	if namespace != "" {
+		if !r.namespaces.Allows(namespace) {
+			return list, nil
+		}
+		// Other namespaces' policies then cannot slow or break this list.
+		prefix = r.config.namespacePolicyPrefix(namespace)
 	}
-	policies, err := r.harbor.ListReplicationPolicies(ctx, r.config.policyPrefix())
+	policies, err := r.harbor.ListReplicationPolicies(ctx, prefix)
 	if err != nil {
 		return nil, replicationError(err, "Listing replication policies failed")
 	}
@@ -452,6 +457,9 @@ const (
 	maxTagLength        = 128
 	// maxScheduleLength is the length of Harbor's schedule.cron column.
 	maxScheduleLength = 64
+	// maxMetadataBytes bounds the labels and annotations in a policy's description.
+	// Escaping can grow each byte to 7 in Harbor's response, and a page of 100 policies must fit in the client's 16 MiB limit.
+	maxMetadataBytes = 8 << 10
 )
 
 var (
@@ -477,6 +485,11 @@ func (c ReplicationConfig) validate(obj *v1alpha1.HarborReplication) field.Error
 	if obj.ResourceVersion != "" {
 		errs = append(errs, field.Forbidden(metadata.Child("resourceVersion"), "must not be set on create"))
 	}
+	if metadataBytes(obj.Labels)+metadataBytes(obj.Annotations) > maxMetadataBytes {
+		err := field.TooLong(metadata, "", maxMetadataBytes)
+		err.Detail = "labels and annotations together " + err.Detail
+		errs = append(errs, err)
+	}
 	if !slices.Contains(c.Registries, obj.Spec.Registry) {
 		errs = append(errs, field.NotSupported(spec.Child("registry"), obj.Spec.Registry, c.Registries))
 	}
@@ -501,6 +514,15 @@ func (c ReplicationConfig) validate(obj *v1alpha1.HarborReplication) field.Error
 		errs = append(errs, field.Invalid(spec.Child("schedule"), obj.Spec.Schedule, msg))
 	}
 	return errs
+}
+
+// metadataBytes measures labels or annotations as Kubernetes does.
+func metadataBytes(m map[string]string) int {
+	n := 0
+	for k, v := range m {
+		n += len(k) + len(v)
+	}
+	return n
 }
 
 // scheduleError returns why Harbor would reject a schedule, or why it could run more than once an hour.
