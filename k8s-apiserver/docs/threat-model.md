@@ -1,25 +1,32 @@
 # Threat model
 
 harbor-apiserver shows one Harbor project's metadata to Kubernetes users.
-This model covers an install from `deploy/` as the [README](../README.md) describes.
+With the component [deploy/components/replication](../deploy/components/replication/kustomization.yaml), it also lets them copy images into the project.
+This model covers an install from `deploy/`, with or without that component, as the [README](../README.md) describes.
 
 ## Assets
 
-- Secret `harbor-apiserver` holds the robot credentials.
+- Secret `harbor-apiserver` holds the project robot's credentials.
   With the README's permissions, they can list repository and artifact metadata in one project, but cannot pull, push, or change anything.
+- Secret `harbor-apiserver-replication`, from the replication component, holds a system-level robot account's credentials.
+  With the README's permissions, they can list registry endpoints, and create, start, stop, and delete replication policies anywhere in Harbor.
+- The project's content and storage quota, which replications write to.
 - The project metadata includes repository names and descriptions, artifact digests, tags, sizes, media types, OCI annotations, and push and pull times and counts.
 - Secret `harbor-apiserver-ca` holds the serving CA's key, and Secret `harbor-apiserver-tls` holds the serving key.
   The aggregator trusts every serving certificate that the CA signs for this API.
 - The cluster's API depends on this server, because an unavailable APIService breaks discovery and namespace deletion cluster-wide.
 - Harbor's availability is at stake, because each replica reads the whole project from Harbor every poll interval.
+  Replication requests call Harbor directly, and each replication runs jobs in Harbor.
 
 ## Actors
 
-- **Namespace users** can get or list the two kinds in a namespace, usually through the `view`, `edit`, or `admin` role.
+- **Namespace users** can get or list the kinds in a namespace, usually through the `view`, `edit`, or `admin` role.
 - **Namespace-label writers** can create namespaces or change their labels, directly or through a tool.
 - **Cluster admins** can read Secrets and change RBAC, the APIService, and the `harbor-apiserver` namespace.
-- **Harbor admins** manage the project, its visibility, and the robot account.
+- **Replication creators** can create and delete replications in a labeled namespace, usually through `harbor.goharbor.io:replicate`.
+- **Harbor admins** manage the project, its visibility, the robot accounts, and the registry endpoints.
 - **Project pushers** control repository names, digests, tags, and annotations.
+- **Source publishers** control the images in the source repositories that replications copy.
 - **Network attackers** can reach the pod network or the path from the pods to Harbor.
 
 ## Trust boundaries
@@ -37,9 +44,14 @@ This model covers an install from `deploy/` as the [README](../README.md) descri
    It authorizes them as in boundary 2.
    `/healthz`, `/readyz`, and `/livez` skip authorization.
 4. **harbor-apiserver to Harbor.**
-   Every request carries the robot's credentials as HTTP basic auth.
+   Every read of the project carries the project robot's credentials as HTTP basic auth.
 5. **harbor-apiserver to kube-apiserver.**
    The ServiceAccount can list and watch namespaces, create TokenReviews and SubjectAccessReviews, and read ConfigMap `kube-system/extension-apiserver-authentication` ([rbac.yaml](../deploy/base/rbac.yaml)).
+6. **harbor-apiserver to Harbor, as the replication robot.**
+   Replication requests, and each poll's list of replication policies, carry the replication robot's credentials to the same URL as in boundary 4.
+   Harbor authorizes them by system permission alone, and checks neither the project nor the registry endpoints of a policy ([replication.go](../../src/server/v2.0/handler/replication.go)).
+   The server enforces those itself.
+   Harbor's job service then pulls from the endpoint with the endpoint's credentials, and writes into the project as Harbor.
 
 ## Threats
 
@@ -61,6 +73,7 @@ Residual risk: access is all or nothing per namespace, and a cluster can hold on
 
 A namespace sees the project when it has `harbor.goharbor.io/project=<project>` ([gate.go](../pkg/namespaces/gate.go)).
 Anyone who can create namespaces or update their labels can grant that.
+With replications, the label also lets the namespace's replication creators write into the project.
 The built-in `admin` and `edit` roles cannot change a Namespace object, but many clusters let tenants set namespace labels in other ways:
 
 - GitOps controllers with cluster-wide rights, such as Argo CD or Flux, create namespaces with the labels that a repository declares, and tenants may control that repository.
@@ -74,16 +87,20 @@ Mitigations:
 
 Residual risk: visibility depends on cluster governance outside this server.
 Removing the label revokes visibility as soon as each replica's namespace informer sees the change.
+It also hides the namespace's replications, but leaves them running (see [Removing the label leaves replications running](#removing-the-label-leaves-replications-running)).
 
 ### Harbor cannot attribute reads to Kubernetes users
 
-Harbor sees only the robot's polls, which no Kubernetes request triggers.
+For reads of the project, Harbor sees only the project robot's polls, which no Kubernetes request triggers.
 Harbor's audit log records writes, pushes, and pulls, but not API reads such as these ([basic.go](../../src/pkg/auditext/event/basic.go)).
 If the cluster has an audit policy, the Kubernetes audit log records the user, verb, resource, and namespace of each request that kube-apiserver proxies.
 Clusters that kubeadm or kind creates have no audit policy by default.
 harbor-apiserver keeps no audit log of its own.
 
-Residual risk: only the Kubernetes audit log can show which users read the project.
+Harbor cannot attribute replications either.
+It records the replication robot as the creator of every policy that the server creates, and its audit log does not record replication policy changes.
+
+Residual risk: only the Kubernetes audit log can show which users read the project, or created and deleted replications.
 Direct calls to the Service leave no Kubernetes audit record.
 
 ### Direct calls to the Service
@@ -111,21 +128,25 @@ Mitigations:
 
 - API responses describe Harbor failures only with fixed 503 messages ([store.go](../pkg/registry/store.go), [poll.go](../pkg/registry/poll.go), [registry.go](../pkg/registry/registry.go)): `harbor has not been read yet`, `harbor is unavailable`, `reading harbor takes longer than the staleness limit`, `reading a repository's artifacts failed`, `harbor rejected the robot account credentials`, `harbor denied the robot account access`, `not found in harbor`, or `unexpected error reading harbor`.
   They never include Harbor's URL, Harbor's response, or the credentials.
-- The server logs the full error of a failed read of Harbor.
+- Replication requests use fixed messages too ([replications.go](../pkg/registry/replications.go)): `harbor is unavailable` (503), `harbor rejected the robot account credentials`, `harbor denied the robot account access`, or `unexpected error from harbor` (500), and `harbor rejected the replication policy` (400).
+  Some create errors name the Harbor policy, whose name comes from the replication's namespace and name.
+  Lists of artifacts by the replication label can fail with `listing replication policies failed`, followed by one of the 503 messages above.
+- The server logs the full error of a failed Harbor request.
   That error holds the request URL, the HTTP status, and Harbor's error message ([client.go](../pkg/harbor/client.go)).
   The credentials travel only in the `Authorization` header, which no error includes, and `net/http` redacts any password in a URL.
   A credential file error names the file, not its contents.
   The Harbor client does not use client-go, so no log verbosity logs its requests.
-- The client refuses redirects, so the credentials go only to `--harbor-url`.
+- The client refuses redirects, so both robots' credentials go only to `--harbor-url`.
 - The container runs a distroless image as non-root, with a read-only root filesystem and no privilege escalation ([deployment.yaml](../deploy/base/deployment.yaml)).
 
 Residual risk:
 
 - Cluster admins, anyone who can read Secrets or create pods in `harbor-apiserver`, and admins of the nodes running the pods can read the credentials.
+  With replications, that includes the replication robot's credentials, which control replication across Harbor (see [The replication robot controls replication across Harbor](#the-replication-robot-controls-replication-across-harbor)).
   etcd stores them unencrypted unless the cluster encrypts Secrets at rest.
 - With an `http://` URL, which the README forbids but the server accepts, the secret crosses the network in clear text.
 - If Harbor, or a proxy in front of it, echoed request headers in an error body, the log would include them.
-- A leaked credential reads a little more than the server shows: Harbor's artifact list can also return labels, accessories, and vulnerability and SBOM overviews.
+- A leaked project robot credential reads a little more than the server shows: Harbor's artifact list can also return labels, accessories, and vulnerability and SBOM overviews.
 
 ### A public project hides broken credentials
 
@@ -178,24 +199,171 @@ It trusts `X-Remote-User`, `X-Remote-Group`, and `X-Remote-Extra-*` only from a 
 Residual risk: any holder of a front-proxy client certificate with an allowed name can act as any user here, as on every aggregated API server.
 Keep the front-proxy CA separate from the cluster CA, and set `--requestheader-allowed-names` on kube-apiserver.
 
+### The replication robot controls replication across Harbor
+
+Harbor checks the replication robot's permissions only at the system level ([replication.go](../../src/server/v2.0/handler/replication.go)).
+It cannot limit the robot to one project, to one registry endpoint, or to pulling.
+With the robot's credentials, anyone can:
+
+- Push any project to any registry endpoint, with the endpoint's credentials.
+- Pull from any endpoint into any project, replacing its tags, or into a new project, which Harbor creates ([adapter.go](../../src/pkg/reg/adapter/harbor/base/adapter.go)).
+  So they can replace any tag in Harbor with any image that an endpoint reaches, such as a public image on Docker Hub.
+- Copy anything that an endpoint's credentials can read, such as a private upstream repository, into any project, including a public one.
+  Through an endpoint that points back at this Harbor, that includes every private project that the endpoint's credentials can read.
+- Start, stop, or delete any replication policy, including those that Harbor admins created.
+- List the registry endpoints, with their URLs and access keys, but not their secrets.
+- Read every policy's description, which holds a replication's metadata (see [Harbor admins see replication metadata](#harbor-admins-see-replication-metadata)).
+
+The server uses the robot more narrowly ([replication_policy.go](../pkg/registry/replication_policy.go), [replications.go](../pkg/registry/replications.go)):
+
+- It creates only pull policies from an allowed endpoint into `<project>/<prefix>/<namespace>/<name>`, which don't replicate deletions.
+- It never updates a policy.
+- It shows, stops, or deletes a policy, or links artifacts to it, only if all of these hold:
+  - The policy's name is `<prefix>.<project>.<namespace>.<name>`, and its description names that namespace and name, and says that harbor-apiserver manages it.
+  - Its destination is `<project>/<prefix>/<namespace>/<name>` in the local Harbor, and keeps each source repository's full path.
+  - Its source is the allowed endpoint that the description's spec names.
+  - Its filters and trigger are those that the server creates from that spec.
+  - The namespace sees the project, and has the UID that the description records.
+- It stops only the running executions of a policy that it is deleting.
+  The Harbor client drops any execution of another policy that Harbor returns ([replication.go](../pkg/harbor/replication.go)).
+
+Mitigations:
+
+- Enable replications only where you need them. The base install holds no such credentials.
+- Give the robot only the README's permissions, and an expiration.
+- Give every registry endpoint in Harbor credentials that can only read content that anyone who can reach Harbor may see, or none.
+  Then no policy can push through an endpoint, or expose private content by copying it.
+  Never give an endpoint that points back at this Harbor the credentials of an account that can read private projects.
+- Grant `edit` and `admin` in `harbor-apiserver` only to cluster admins, as for [APIService TLS](#apiservice-tls).
+
+Residual risk: whoever reads Secret `harbor-apiserver-replication` can do all of the above.
+
+### Replications bring external content into a shared project
+
+Replications write into the project that every labeled namespace sees.
+A replication creator in one namespace chooses content that every labeled namespace lists as `HarborArtifact` objects, and that anyone who can pull from the project can pull.
+Source publishers control that content: each run copies whatever the matching tags point to at the time, and replaces the tags that an earlier run copied.
+A replication creator can copy anything that the endpoint's credentials can read, and so expose private content, such as a private upstream repository.
+The path `<prefix>/<namespace>/<name>/` keeps replications out of repositories that people push to, and out of each other's.
+But project pushers can push under that path too, and their artifacts then get the replication's label and ownerReference ([store.go](../pkg/registry/store.go)).
+
+Replicated images count against the project's storage quota, which every labeled namespace and every pusher shares.
+One replication with `tag: "*"` of a large repository can fill it, and then pushes to the project fail.
+Without a quota, it can fill Harbor's storage.
+
+Mitigations:
+
+- Bind `harbor.goharbor.io:replicate` only to users whom you trust to choose content for every labeled namespace.
+- Allow only endpoints whose content you trust, and whose credentials can only read what everyone who can pull from the project may see.
+- Set a storage quota on the project.
+- Clients should pull by digest or verify signatures, rather than trust a tag or the replication label.
+
+Residual risk: the server does not limit how many replications a namespace has, or how much they copy (see [Denial of service](#denial-of-service-against-harbor-and-the-server)).
+
+### Removing the label leaves replications running
+
+Removing `harbor.goharbor.io/project` from a namespace, or changing it, hides the namespace's replications ([replication_policy.go](../pkg/registry/replication_policy.go)).
+Their policies stay in Harbor, and their schedules keep running.
+Kubernetes users can no longer see or delete them, and deleting the namespace no longer deletes them.
+Restoring the label shows them again.
+The same happens to the replications of an endpoint that `registries` no longer allows, to all replications when `--replication-prefix` changes or replications are disabled, and to a policy whose name, description, source, destination, filters, or trigger someone changes in Harbor.
+Other changes in Harbor, such as disabling a policy, leave it visible, and the server doesn't show them.
+
+Mitigations: delete the replications before you remove a label, an endpoint, or the component.
+A Harbor administrator can find the policies by their name prefix, `<prefix>.<project>.<namespace>.`, and delete them.
+
+### Harbor admins see replication metadata
+
+Each policy's description holds its replication's namespace, namespace UID, name, UID, labels, annotations, and spec, as JSON ([replication_policy.go](../pkg/registry/replication_policy.go)).
+After `kubectl apply`, the annotations include `kubectl.kubernetes.io/last-applied-configuration`, which repeats the object.
+Harbor system admins, system robots that can read replication policies, and anyone with the replication robot's credentials can read the descriptions, in Harbor's UI under **Administration** > **Replications** or through its API.
+
+Mitigation: don't put secrets in a replication's labels or annotations.
+
+### A recreated namespace does not inherit replications
+
+A namespace that is deleted and created again gets a new UID.
+Each policy's description records the UID of the namespace that created it, and the server hides a policy whose namespace now has another UID.
+Artifact links check the UID too ([store.go](../pkg/registry/store.go)).
+So a new namespace with the old name cannot see or delete the old namespace's replications, and doesn't see their labels on artifacts.
+
+The namespace controller normally deletes a namespace's replications with the namespace (see [Namespace deletion waits for Harbor](#namespace-deletion-waits-for-harbor)).
+A policy outlives its namespace only if the server hid it first (see [Removing the label leaves replications running](#removing-the-label-leaves-replications-running)), the server was uninstalled first, or a create raced with the namespace's deletion.
+Such a policy keeps running, and blocks its namespace and name.
+A create there fails with AlreadyExists, and the message names the Harbor policy and says that a Harbor administrator must delete it ([replications.go](../pkg/registry/replications.go)).
+
+### Namespace deletion waits for Harbor
+
+Before it deletes a namespace, the namespace controller deletes every object in it, including replications, through this server.
+The server deletes each replication as it deletes any other ([replications.go](../pkg/registry/replications.go)).
+Harbor refuses to delete a policy while one of its executions runs, so the server stops the running executions, and retries every second.
+After 30 seconds, or when the request ends, it returns Conflict, and the namespace controller retries later.
+The namespace stays Terminating until every delete succeeds.
+
+Listing a labeled namespace's replications calls Harbor, even when there are none.
+It lists only that namespace's policies, so other namespaces' replications cannot delay its deletion.
+So while Harbor is unavailable, or rejects the replication robot, such as after it expires, no labeled namespace can finish deleting.
+
+Mitigations: track the replication robot's expiry.
+If Harbor cannot recover, removing a Terminating namespace's label lets it finish deleting, and leaves its policies in Harbor for a Harbor administrator to delete.
+
+### Replications skip admission
+
+The server runs no admission plugins, and kube-apiserver does not run admission for requests that it proxies to an aggregated API server.
+So admission webhooks, such as those of Kyverno or Gatekeeper, ValidatingAdmissionPolicies, and ResourceQuota never see replications.
+The server's validation, the endpoint allow-list, the namespace label, and RBAC are the only checks on a replication.
+The server refuses creates in a terminating namespace itself, as kube-apiserver's NamespaceLifecycle admission does.
+
+Residual risk: every replication creator can use every allowed endpoint, and any repository and tag there.
+
+### Two clusters that share a project
+
+Each server shows only the policies whose namespace UID matches one of its cluster's namespaces, so clusters don't see each other's replications.
+Clusters that share a project must set different `--replication-prefix` values.
+With the same prefix, a replication in one cluster blocks the same namespace and name in the other, and the error there asks a Harbor administrator to delete the first cluster's policy.
+Users of each cluster see every artifact in the project, including those that the other cluster's replications copied, but without the replication label.
+Each cluster's replication robot can stop or delete the other cluster's policies through Harbor's API, although neither server does.
+The clusters share the project's quota.
+
 ### Denial of service against Harbor and the server
 
-Kubernetes requests never call Harbor.
+Requests for repositories and artifacts never call Harbor.
 Instead, each replica polls Harbor ([poll.go](../pkg/registry/poll.go)).
 Each poll makes one repository list, then one artifact list per repository, 4 at a time.
+With replications, each poll also lists the replication policies, alongside those lists.
 Each Harbor list pages through 100 items at a time, and starts over after 1 second, up to 3 tries in all, when the item count drops during it.
 After a poll, the replica waits `--harbor-poll-interval` (30s) plus up to 10% jitter.
 After a poll that fails, or that keeps a repository's artifacts from an earlier poll, it retries once after 1 second, and then waits the poll interval until a poll succeeds.
 
+Requests for replications call Harbor directly, as the replication robot ([replications.go](../pkg/registry/replications.go)):
+
+- A `get` makes one policy list and one execution read.
+- A `list` makes one list of the policies of its namespace, or of every namespace, then one execution read per replication that it returns, 4 at a time.
+- A `create` lists the registry endpoints, then creates, reads, and starts the policy, and reads its execution.
+  A dry run lists the policies instead of creating one.
+- A `delete` finds the replication as a `get` does, then deletes the policy.
+  While Harbor refuses, because an execution runs, it lists and stops the running executions, and retries every second for up to 30 seconds.
+- Each replication runs jobs in Harbor's job service, which all of Harbor shares: once when it is created, and then on its schedule.
+
 Limits:
 
 - [client.go](../pkg/harbor/client.go) reads at most 1000 pages per list and 16 MiB per response, and fails the list beyond either.
+- A replication's labels and annotations total at most 8 KiB, so a page of 100 policies stays below 16 MiB, even when escaping grows each byte to 7.
 - `--harbor-timeout` (10s) bounds each Harbor request, and `--harbor-staleness-limit` (5m) bounds each poll.
-- Each replica has at most 4 Harbor requests in flight.
-- Each replica serves at most 400 read requests at once.
+- Each poll has at most 5 Harbor requests in flight: 4 for the project, and 1 for the replication policies.
+- Each replication `list` has at most 4 Harbor requests in flight.
+- Each replica serves at most 400 read requests and 200 creates and deletes at once.
+- A schedule runs a replication at most once an hour. On Harbor 2.14 or later, runs of one replication don't overlap.
 - kube-apiserver's API Priority and Fairness applies to the requests it proxies, but not to direct calls to the Service.
 
-Residual risk: Harbor's load grows with the project's size and the number of replicas, but not with Kubernetes requests.
+Residual risk: the polls' load on Harbor grows with the project's size and the number of replicas, but not with Kubernetes requests.
+Replication requests load Harbor in proportion to their rate.
+The server does not limit the number of replications.
+Many replications slow cluster-wide lists of replications, and each poll, which waits for its policy list.
+Beyond 100,000, those policy lists fail.
+Then cluster-wide lists of replications fail, and, once `--harbor-staleness-limit` passes, so do lists of artifacts by the `harbor.goharbor.io/replication` label.
+Lists of replications in one namespace read only its policies, so other namespaces' replications don't affect them.
+A replication creator can load Harbor's job service, which also runs garbage collection, scans, and other replications, with many replications, or with one of a large repository and `tag: "*"`.
 The server ignores `limit` and `continue`.
 
 The page and size limits do not bound memory in practice.
@@ -219,7 +387,13 @@ A poll that runs longer than `--harbor-staleness-limit` fails, and gives `readin
 Some failures of one repository's artifact list, such as a timeout while the server reads Harbor's response, or more than 1000 pages, don't fail the poll.
 The replica then keeps that repository's artifacts from an earlier poll, or none if no earlier poll listed the repository.
 Once they are older than `--harbor-staleness-limit`, or at once on a pod's first poll, requests that could return them fail with `reading a repository's artifacts failed`.
-Other requests still succeed: those for `HarborRepository` objects, and those for artifacts that a get's name, a `harbor.goharbor.io/repository` label selector, or an equality `status.repository` or `metadata.name` field selector confines to other repositories ([artifacts.go](../pkg/registry/artifacts.go)).
+Other requests still succeed: those for `HarborRepository` objects, and those for artifacts that a get's name, a `harbor.goharbor.io/repository` or `harbor.goharbor.io/replication` label selector, or an equality `status.repository` or `metadata.name` field selector confines to other repositories ([artifacts.go](../pkg/registry/artifacts.go)).
+
+A failed list of the replication policies doesn't fail the poll.
+Artifacts keep their links to replications from the last list that succeeded ([store.go](../pkg/registry/store.go)).
+Once that list is older than `--harbor-staleness-limit`, lists of artifacts by the `harbor.goharbor.io/replication` label fail with `listing replication policies failed`, and other requests still succeed, with the old links.
+Requests for replications read Harbor directly, so they fail during an outage with `harbor is unavailable` or `unexpected error from harbor`.
+Labeled namespaces cannot finish deleting until Harbor recovers (see [Namespace deletion waits for Harbor](#namespace-deletion-waits-for-harbor)).
 
 A pod becomes ready once it has listed namespaces and its first poll has ended, in success or failure ([server.go](../cmd/harbor-apiserver/server.go)).
 An outage ends that poll within about `--harbor-timeout`.

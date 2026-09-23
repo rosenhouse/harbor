@@ -8,6 +8,7 @@ Each replica reads the project from Harbor as a project robot account every `--h
 Replicas read Harbor independently, so two requests can see different snapshots.
 Requests fail with 503 until a replica first reads Harbor successfully, and again once its snapshot is older than `--harbor-staleness-limit`.
 A namespace sees the project only when it has the label `harbor.goharbor.io/project=<project>`.
+Optionally, the server also lets users copy images into the project with the kind `HarborReplication` (see [Enable replications](#enable-replications)).
 
 Kubernetes RBAC and that label are the only access controls.
 Read the [threat model](docs/threat-model.md) before you install.
@@ -309,6 +310,207 @@ sha256:c78a0b5f2b067d7f1fce102453eac8a9f6a2a557ede231774cb293ed8b4c9308
 The label is missing when the `HarborRepository` name is longer than 63 characters.
 Select by field instead.
 
+## Enable replications
+
+Replications let Kubernetes users copy images into the project from registry endpoints that you allow.
+They are off by default, because they weaken the security model.
+
+The server needs a system-level Harbor robot account for them, which Harbor cannot limit to one project, to one endpoint, or to pulling.
+With its credentials, anyone can replicate any project to any registry endpoint, and stop or delete any replication policy in Harbor.
+They can also copy anything that an endpoint's credentials can read into any project, including a public one, and so overwrite tags or expose private content.
+The server limits what it does with them, but anyone who can read Secret `harbor-apiserver-replication`, or create pods in `harbor-apiserver`, can use them directly.
+Users who can create replications can copy anything that an allowed endpoint's credentials can read into the project, which every labeled namespace sees, and whose quota they all share.
+While Harbor is unavailable, or rejects the replication robot, such as after it expires, no labeled namespace can finish deleting.
+Read the [threat model](docs/threat-model.md#the-replication-robot-controls-replication-across-harbor) before you enable them.
+
+### Create registry endpoints
+
+Users copy only from endpoints that a Harbor system administrator creates under **Administration** > **Registries** > **New Endpoint**, and that you allow in the Secret below.
+Users name an endpoint, and never see its credentials.
+Give every endpoint in Harbor credentials that can only read content that anyone who can reach Harbor may see, or none.
+Never give an endpoint that points back at this Harbor the credentials of an account that can read private projects.
+
+### Create a system robot account
+
+Give the robot only these system permissions:
+
+| Resource | Actions |
+| --- | --- |
+| Registry | List |
+| Replication Policy | List, Read, Create, Delete |
+| Replication | List, Create |
+
+Keep the robot's name and secret in a private directory until you create the Secret below:
+
+```sh
+dir=$(mktemp -d)
+```
+
+As a Harbor system administrator, open **Administration** > **Robot Accounts** > **New Robot Account**.
+Name it `harbor-apiserver-replication`, set an expiration, select only the system permissions above, and select no project permissions.
+The UI offers these permissions from Harbor 2.10.
+Harbor then shows the robot's full name, such as `robot$harbor-apiserver-replication`, and, only this once, its secret.
+Save them in `$dir/username` and `$dir/password`.
+
+Or, as a Harbor system administrator, use the API:
+
+```sh
+curl -fsS -u my-harbor-admin -H 'Content-Type: application/json' \
+  https://harbor.example.com/api/v2.0/robots -o "$dir/robot.json" -d '{
+    "name": "harbor-apiserver-replication",
+    "level": "system",
+    "duration": 90,
+    "permissions": [{"kind": "system", "namespace": "/", "access": [
+      {"resource": "registry", "action": "list"},
+      {"resource": "replication-policy", "action": "list"},
+      {"resource": "replication-policy", "action": "read"},
+      {"resource": "replication-policy", "action": "create"},
+      {"resource": "replication-policy", "action": "delete"},
+      {"resource": "replication", "action": "list"},
+      {"resource": "replication", "action": "create"}]}]}'
+jq -r .name "$dir/robot.json" >"$dir/username"
+jq -r .secret "$dir/robot.json" >"$dir/password"
+```
+
+### Create the replication Secret
+
+`registries` holds the names of the endpoints that replications may copy from, separated by commas.
+
+```sh
+kubectl -n harbor-apiserver create secret generic harbor-apiserver-replication \
+  --from-literal=registries=docker-hub,quay \
+  --from-file=username="$dir/username" \
+  --from-file=password="$dir/password" \
+  --dry-run=client -o yaml | kubectl apply --server-side -f -
+rm -r "$dir"
+```
+
+| Key | Used as | Read |
+| --- | --- | --- |
+| `registries` | `--replication-registries` | at startup |
+| `username` | `--replication-username-file=/etc/harbor-replication/username` | on every Harbor request |
+| `password` | `--replication-password-file=/etc/harbor-replication/password` | on every Harbor request |
+
+The server reaches Harbor at the same `url`, with the same `ca.crt`, as for the project robot.
+Rotate these credentials as the project robot's, and restart the pods after you change `registries`.
+
+### Add the component
+
+Add the component to `my-install/kustomization.yaml`:
+
+```yaml
+components:
+  - ../deploy/components/replication
+```
+
+Then apply it:
+
+```sh
+kubectl apply -k my-install
+kubectl -n harbor-apiserver rollout status deployment/harbor-apiserver
+```
+
+`kubectl api-resources --api-group=harbor.goharbor.io` then lists `harborreplications`.
+
+Each replication copies into the project under `--replication-prefix`, which defaults to `k8s`.
+If another cluster replicates into the same project, give each cluster its own prefix with this item in the overlay's `patches:` list:
+
+```yaml
+- target: {kind: Deployment, name: harbor-apiserver}
+  patch: |
+    - op: add
+      path: /spec/template/spec/containers/0/args/-
+      value: --replication-prefix=k8s-prod
+```
+
+Changing the prefix hides existing replications, so set it before you create any.
+
+### Grant replication access
+
+The component adds two ClusterRoles:
+
+- `harbor.goharbor.io:view-replications` grants `get` and `list` on replications, and aggregates into `view`, like `harbor.goharbor.io:view`.
+- `harbor.goharbor.io:replicate` grants `create` and `delete`. It does not aggregate, so bind it explicitly:
+
+  ```sh
+  kubectl -n my-namespace create rolebinding harbor-replicators --clusterrole=harbor.goharbor.io:replicate --group=my-team
+  ```
+
+`kubectl apply` also needs `get`, which `view` grants.
+To narrow who can view replications, remove the aggregation label of `harbor.goharbor.io:view-replications` as in [Grant access](#grant-access).
+
+### Replicate
+
+```sh
+kubectl apply --validate=false -f - <<'EOF'
+apiVersion: harbor.goharbor.io/v1alpha1
+kind: HarborReplication
+metadata:
+  name: nginx
+  namespace: my-namespace
+spec:
+  registry: docker-hub
+  repository: library/nginx
+  tag: "1.27.5"
+  schedule: "0 0 3 * * *"
+EOF
+```
+
+- `registry` names an allowed endpoint.
+- `repository` is one source repository, without a glob.
+- `tag` is Harbor's tag filter, a pattern such as `1.27.*`. `*` copies every tag.
+- `schedule` is optional. Here, it reruns the replication daily at 03:00 UTC.
+
+Without `--validate=false`, kubectl lists CRDs to validate a replication, which `view`, `edit`, and `admin` do not allow.
+
+The replication runs once when you create it.
+Poll with `kubectl get` until its phase is no longer `InProgress`:
+
+```console
+$ kubectl -n my-namespace get harborreplications
+NAME    REGISTRY     REPOSITORY      TAG      SCHEDULE      PHASE       AGE
+nginx   docker-hub   library/nginx   1.27.5   0 0 3 * * *   Succeeded   2m
+$ kubectl -n my-namespace get harborreplication nginx -o jsonpath='{.status.destination}'
+my-project/k8s/my-namespace/nginx
+```
+
+The phase is the last run's: `InProgress`, `Succeeded`, `Failed`, or `Stopped`.
+`status.lastExecution` also holds the run's counts and Harbor's message.
+A source repository keeps its path under `status.destination`.
+
+In the replication's namespace, the copied artifacts have the label `harbor.goharbor.io/replication` and an ownerReference to the replication:
+
+```console
+$ kubectl -n my-namespace get harborartifacts -l harbor.goharbor.io/replication=nginx
+NAME                                                       REPOSITORY                                        TAGS     TYPE    SIZE      AGE
+k8s.my-namespace.nginx.library.nginx.sha256-6784fb0834aa   my-project/k8s/my-namespace/nginx/library/nginx   1.27.5   IMAGE   68.9MiB   2m
+```
+
+Other labeled namespaces see these artifacts too, but without the label or the ownerReference.
+
+### Limits
+
+- The server supports no `update` or `patch`, and so no server-side apply, which Flux requires.
+  Client-side `kubectl apply` creates a replication, but cannot change one. To change it, delete and recreate it.
+  Without `patch`, kubectl validates a replication by listing CRDs, so users who cannot list CRDs need `--validate=false`.
+- There is no `watch`, so `kubectl wait` does not work.
+- There is no way to rerun a replication on demand yet.
+- Deleting a replication stops its runs, and deletes its policy and run history from Harbor.
+  It leaves the copied artifacts.
+  If the runs have not stopped after 30 seconds, the delete fails with a Conflict. Retry it.
+- Deleting a labeled namespace deletes its replications' policies, and leaves their artifacts.
+  The namespace stays Terminating until Harbor answers.
+- Removing a namespace's label, an endpoint from `registries`, or the component hides the affected replications, but their schedules keep running in Harbor.
+  Delete the replications first. Before you remove the component, run `kubectl delete harborreplications --all --all-namespaces`.
+- A policy that the server hides blocks its namespace and name until a Harbor administrator deletes it.
+  Examples are a policy from an earlier namespace of the same name, and one whose description, source, destination, filters, or trigger someone changed in Harbor.
+  Creating the replication fails with AlreadyExists, and the message names the policy.
+- The server needs Harbor 2.3 or later. Before Harbor 2.14, a run can start while the previous one is still running.
+- A schedule has 6 fields separated by single spaces: seconds, minutes, hours, day of month, month, and day of week, in UTC.
+  Seconds must be `0`, and minutes a single number, so a replication runs at most once an hour. It must be at most 64 characters.
+- The destination repository, `<project>/<prefix>/<namespace>/<name>/<repository>`, must fit in 255 characters.
+- A replication's labels and annotations together must fit in 8192 bytes, because its Harbor policy holds them.
+
 ## Flags
 
 These flags are specific to harbor-apiserver.
@@ -325,6 +527,11 @@ The Deployment sets only the required ones.
 | `--harbor-poll-interval` | How long to wait between polls of the project. Each wait adds up to 10% jitter. After a poll fails, the replica retries once after 1 second, and then waits this interval until a poll succeeds. Default `30s`. |
 | `--harbor-staleness-limit` | How old data can be before requests that need it fail with 503. A poll that takes longer than this fails. It must be longer than 2.2 times `--harbor-poll-interval` plus twice `--harbor-timeout`. Default `5m`. |
 | `--kubeconfig` | Kubeconfig for reading namespaces. Defaults to the in-cluster configuration. |
+| `--enable-replications` | Serve the writable `HarborReplication` kind. It needs a system-level Harbor robot account that Harbor cannot limit to the project (see the [threat model](docs/threat-model.md#the-replication-robot-controls-replication-across-harbor)). The other `--replication-*` flags need it. Default `false`. |
+| `--replication-registries` | Names of the Harbor registry endpoints that replications may copy from, separated by commas. Required with `--enable-replications`. |
+| `--replication-username-file` | File holding the replication robot account name. Required with `--enable-replications`. |
+| `--replication-password-file` | File holding the replication robot account secret. Required with `--enable-replications`. |
+| `--replication-prefix` | Path segment in the project that replications copy into, and the prefix of their Harbor policy names. It must be a DNS label. Clusters that share a project need different prefixes. Default `k8s`. |
 
 The other flags are the standard secure serving, delegated authentication and authorization, and logging flags of `k8s.io/apiserver`.
 `docker run --rm "$image" --help` lists them all.
@@ -346,8 +553,8 @@ The [threat model](docs/threat-model.md#harbor-outages) explains which requests 
 While it is not Available, kubectl reports that it couldn't get the resource list for `harbor.goharbor.io/v1alpha1`, and namespaces cannot finish deleting.
 
 - `MissingEndpoints`: no pod is ready. Run `kubectl -n harbor-apiserver describe pods`.
-  - `ContainerCreating` means a Secret is missing. Check Secret `harbor-apiserver`, and Secret `harbor-apiserver-tls` from cert-manager (`kubectl -n harbor-apiserver get certificate`) or `hack/gen-serving-cert.sh`.
-  - `CreateContainerConfigError` means Secret `harbor-apiserver` lacks `url` or `project`.
+  - `ContainerCreating` means a Secret is missing. Check Secret `harbor-apiserver`, Secret `harbor-apiserver-tls` from cert-manager (`kubectl -n harbor-apiserver get certificate`) or `hack/gen-serving-cert.sh`, and, with replications, Secret `harbor-apiserver-replication`.
+  - `CreateContainerConfigError` means Secret `harbor-apiserver` lacks `url` or `project`, or Secret `harbor-apiserver-replication` lacks `registries`.
   - `ImagePullBackOff` or `ErrImagePull` means the nodes cannot pull the image. If the registry needs credentials, add the `imagePullSecrets` patch to your overlay.
   - `CrashLoopBackOff`: the logs name the problem, such as a missing flag, an invalid `--harbor-project`, a `--harbor-staleness-limit` that is too short, a missing or empty credentials file, or an unreadable CA file.
     `exec format error` means the image was built for another architecture.
@@ -385,7 +592,35 @@ If the project is public, Harbor serves requests with a wrong, expired, or disab
 harbor-core then logs an error, such as `failed to authenticate robot account` or `the robot account is expired`, for each request.
 Check the robot's expiry in Harbor, or make the project private so that broken credentials fail.
 
+### Replications fail
+
+Requests for replications call Harbor with the replication robot, and report its failures with these messages:
+
+- `harbor is unavailable` (503), as above.
+- `harbor rejected the robot account credentials` (500): the replication robot's name or secret is wrong, or the robot is expired or disabled.
+- `harbor denied the robot account access` (500): the replication robot lacks a permission above.
+- `harbor rejected the replication policy` (400): the logs give Harbor's reason.
+- `unexpected error from harbor` (500): see the logs.
+
+A create in a namespace without the label fails with Forbidden.
+`spec.registry: Unsupported value` means that the endpoint is not in `registries`, and `spec.registry: Not found` means that Harbor has no endpoint with that name.
+
+If Harbor fails to start the first run, the create still succeeds, without `status.lastExecution`, and the server logs `"Starting a replication failed"`.
+`status.lastExecution.message` says why a run failed, and Harbor shows each task's log under **Administration** > **Replications**.
+
+When a poll cannot list the replication policies, the server logs `"Listing replication policies failed, so artifacts keep the replications that they were linked to before until the staleness limit"`.
+Artifacts keep their labels and ownerReferences from the last list that succeeded.
+Once that list is older than `--harbor-staleness-limit`, lists of artifacts by the `harbor.goharbor.io/replication` label fail with a 503 that starts with `listing replication policies failed`.
+
 ## Uninstall
+
+If replications are enabled, delete them first, or their policies stay in Harbor, and their schedules keep running:
+
+```sh
+kubectl delete harborreplications --all --all-namespaces
+```
+
+Then remove the rest:
 
 ```sh
 kubectl delete apiservice v1alpha1.harbor.goharbor.io
@@ -395,7 +630,7 @@ kubectl label namespace -l harbor.goharbor.io/project harbor.goharbor.io/project
 ```
 
 Deleting the APIService first keeps discovery working while the pods stop.
-Then delete the robot account in Harbor.
+Then delete the robot accounts in Harbor.
 
 ## Development
 

@@ -1,0 +1,15 @@
+# Serves the writable HarborReplication kind.
+# Secret harbor-apiserver-replication holds a system-level Harbor robot account, which Harbor cannot limit to one project or to pulling.
+# With its credentials, anyone can replicate any project to any registry endpoint, and stop or delete any replication policy.
+# They can also replace any tag in any project with anything an endpoint's credentials can read, and copy private content into a public project.
+# While Harbor is unavailable, or rejects the robot, such as after it expires, no labeled namespace can finish deleting.
+# Read docs/threat-model.md#the-replication-robot-controls-replication-across-harbor first.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - rbac.yaml
+patches:
+  - path: deployment.yaml
+    target:
+      kind: Deployment
+      name: harbor-apiserver

@@ -1,0 +1,33 @@
+# The harbor-apiserver-replication Secret holds username, password, and registries.
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --enable-replications
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --replication-registries=$(HARBOR_REPLICATION_REGISTRIES)
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --replication-username-file=/etc/harbor-replication/username
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --replication-password-file=/etc/harbor-replication/password
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: HARBOR_REPLICATION_REGISTRIES
+    valueFrom:
+      secretKeyRef:
+        name: harbor-apiserver-replication
+        key: registries
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    name: harbor-replication
+    mountPath: /etc/harbor-replication
+    readOnly: true
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: harbor-replication
+    secret:
+      secretName: harbor-apiserver-replication

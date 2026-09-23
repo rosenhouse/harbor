@@ -1,0 +1,21 @@
+# Grants read access to everyone bound to the built-in view, edit, or admin roles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: harbor.goharbor.io:view-replications
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: [harbor.goharbor.io]
+    resources: [harborreplications]
+    verbs: [get, list]
+---
+# Not aggregated, because a replication writes into the project that every labeled namespace sees.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: harbor.goharbor.io:replicate
+rules:
+  - apiGroups: [harbor.goharbor.io]
+    resources: [harborreplications]
+    verbs: [create, delete]
