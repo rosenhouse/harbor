@@ -31,8 +31,8 @@ func (h *harborOptions) addFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&h.PasswordFile, "harbor-password-file", h.PasswordFile, "File holding the robot account secret.")
 	fs.StringVar(&h.CAFile, "harbor-ca-file", h.CAFile, "PEM bundle of extra CAs to trust for Harbor.")
 	fs.DurationVar(&h.Timeout, "harbor-timeout", 10*time.Second, "Timeout for each request to Harbor. It must be positive.")
-	fs.DurationVar(&h.PollInterval, "harbor-poll-interval", 30*time.Second, "How long to wait between reads of the project from Harbor.")
-	fs.DurationVar(&h.StalenessLimit, "harbor-staleness-limit", 5*time.Minute, "How old the snapshot of the project can be before requests fail with 503. A read that takes longer fails. It must be longer than 2.2 times --harbor-poll-interval plus twice --harbor-timeout.")
+	fs.DurationVar(&h.PollInterval, "harbor-poll-interval", 30*time.Second, "How long to wait between polls of the project.")
+	fs.DurationVar(&h.StalenessLimit, "harbor-staleness-limit", 5*time.Minute, "How old data can be before requests that need it fail with 503. A poll that takes longer fails. It must be longer than 2.2 times --harbor-poll-interval plus twice --harbor-timeout.")
 }
 
 // trimmedString is a flag value without surrounding whitespace, such as the trailing newline of a Secret value.

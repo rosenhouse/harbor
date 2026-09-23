@@ -65,7 +65,7 @@ func (s *Store) failed(err error) {
 }
 
 // snapshot returns the items, or an error once the repository list is older than the staleness limit.
-// It also fails once the artifacts of a repository that the response needs are.
+// It also fails once the artifacts of a repository that the response needs are older than the limit.
 func (s *Store) snapshot(needs func(repository string) bool) (map[key]*item, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

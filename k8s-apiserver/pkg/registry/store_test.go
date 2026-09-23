@@ -98,7 +98,7 @@ func expectAvailable(t *testing.T, f *fixture, namespace string) {
 	}
 }
 
-func TestUnavailableUntilFirstRead(t *testing.T) {
+func TestUnavailableUntilFirstPoll(t *testing.T) {
 	f := newUnreadFixture(repositoryHarbor())
 	expectUnavailable(t, f, "ns1", "harbor has not been read yet")
 	if _, err := f.repositories.List(inNamespace(""), nil); !apierrors.IsServiceUnavailable(err) {
@@ -122,7 +122,7 @@ func TestUnavailableUntilFirstRead(t *testing.T) {
 	expectAvailable(t, f, "ns1")
 }
 
-func TestServesLastReadUntilStale(t *testing.T) {
+func TestServesLastPollUntilStale(t *testing.T) {
 	for _, tc := range []struct {
 		harborErr error
 		want      string

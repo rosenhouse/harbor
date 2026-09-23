@@ -322,8 +322,8 @@ The Deployment sets only the required ones.
 | `--harbor-password-file` | File holding the robot account secret. Required. |
 | `--harbor-ca-file` | PEM bundle of CAs to trust for Harbor, in addition to the system roots. |
 | `--harbor-timeout` | Timeout for each HTTP request to Harbor. It must be positive. A list makes one request per page of 100. Default `10s`. |
-| `--harbor-poll-interval` | How long to wait between reads of the project from Harbor. Each wait adds up to 10% jitter. After a read fails, the replica retries once after 1 second, and then waits this interval until a read succeeds. Default `30s`. |
-| `--harbor-staleness-limit` | How old a replica's snapshot can be before requests fail with 503. A read that takes longer than this fails. It must be longer than 2.2 times `--harbor-poll-interval` plus twice `--harbor-timeout`. Default `5m`. |
+| `--harbor-poll-interval` | How long to wait between polls of the project. Each wait adds up to 10% jitter. After a poll fails, the replica retries once after 1 second, and then waits this interval until a poll succeeds. Default `30s`. |
+| `--harbor-staleness-limit` | How old data can be before requests that need it fail with 503. A poll that takes longer than this fails. It must be longer than 2.2 times `--harbor-poll-interval` plus twice `--harbor-timeout`. Default `5m`. |
 | `--kubeconfig` | Kubeconfig for reading namespaces. Defaults to the in-cluster configuration. |
 
 The other flags are the standard secure serving, delegated authentication and authorization, and logging flags of `k8s.io/apiserver`.
@@ -333,10 +333,10 @@ Keep `-v` below 8: from 8 up, client-go logs request bodies, including TokenRevi
 ## Troubleshooting
 
 Read the server's logs with `kubectl -n harbor-apiserver logs -l app=harbor-apiserver --prefix`.
-When a read of Harbor fails, the server logs the error as `"Reading Harbor failed"`.
-A read that takes longer than `--harbor-poll-interval` logs `"Reading Harbor took longer than the poll interval"`.
-When one repository's artifact list fails without failing the read, the server logs `"Listing a repository's artifacts failed, so the server keeps those it listed before"`.
-Once that repository's artifacts are older than `--harbor-staleness-limit`, each read logs `"Requests for a repository's artifacts fail, because they were not listed within the staleness limit"`.
+When a poll of Harbor fails, the server logs the error as `"Reading Harbor failed"`.
+A poll that takes longer than `--harbor-poll-interval` logs `"Reading Harbor took longer than the poll interval"`.
+When one repository's artifact list fails without failing the poll, the server logs `"Listing a repository's artifacts failed, so the server keeps those it listed before"`.
+Once that repository's artifacts are older than `--harbor-staleness-limit`, each poll logs `"Requests for a repository's artifacts fail, because they were not listed within the staleness limit"`.
 Both messages name the repository.
 The [threat model](docs/threat-model.md#harbor-outages) explains which requests fail.
 
@@ -352,7 +352,7 @@ While it is not Available, kubectl reports that it couldn't get the resource lis
   - `CrashLoopBackOff`: the logs name the problem, such as a missing flag, an invalid `--harbor-project`, a `--harbor-staleness-limit` that is too short, a missing or empty credentials file, or an unreadable CA file.
     `exec format error` means the image was built for another architecture.
     `unable to load configmap based request-header-client-ca-file` means the RoleBinding in `kube-system` is missing.
-  - `Running` but not ready means the server has not listed namespaces yet, which needs the ClusterRoleBinding `harbor-apiserver`, or its first read of Harbor has not ended. `--harbor-staleness-limit` bounds that read.
+  - `Running` but not ready means the server has not listed namespaces yet, which needs the ClusterRoleBinding `harbor-apiserver`, or its first poll of Harbor has not ended. `--harbor-staleness-limit` bounds that poll.
 - `FailedDiscoveryCheck` with a certificate error: the `caBundle` does not match the serving certificate.
   Rerun `hack/gen-serving-cert.sh`, or check that cert-manager's CA injector is running.
 - `FailedDiscoveryCheck` with a timeout or `dial tcp` error: kube-apiserver cannot reach the pods on TCP port 6443.
@@ -362,10 +362,10 @@ While it is not Available, kubectl reports that it couldn't get the resource lis
 
 A 503's message gives the reason:
 
-- `harbor has not been read yet`: the replica's first read has not ended.
+- `harbor has not been read yet`: the replica's first poll has not ended.
 - `harbor is unavailable`: the server could not reach Harbor, timed out waiting for Harbor to respond, or got a 429 or 5xx response.
   A TLS error, such as an unknown certificate authority, also shows as unavailable; set `ca.crt` as above.
-- `reading harbor takes longer than the staleness limit`: a read ran longer than `--harbor-staleness-limit`, which cancelled it, or the snapshot passed the limit while a read was running.
+- `reading harbor takes longer than the staleness limit`: a poll ran longer than `--harbor-staleness-limit`, which cancelled it, or the data passed the limit while a poll was running.
   Harbor is slow, or the project is too large for the limit. Raise `--harbor-staleness-limit`.
 - `reading a repository's artifacts failed`: the response could include artifacts of a repository that the server has not listed within `--harbor-staleness-limit`. The logs name the repository.
 - `harbor rejected the robot account credentials`: Harbor returned 401. The robot's name or secret is wrong, or the robot is expired or disabled.

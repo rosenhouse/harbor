@@ -16,6 +16,7 @@ var (
 	hashSuffix   = regexp.MustCompile(`-[0-9a-f]{10}$`)
 
 	nameableDigest = regexp.MustCompile(`^([a-z0-9]{1,16}):([0-9a-f]{12})[0-9a-f]*$`)
+	artifactSuffix = regexp.MustCompile(`\.[a-z0-9]{1,16}-[0-9a-f]{12}$`)
 )
 
 // repositoryObjectName maps a repository name within its project, such as "team/api", to an object name.
@@ -51,10 +52,10 @@ func artifactObjectName(repository, digest string) string {
 	return repositoryObjectNameWithin(repository, validation.DNS1123SubdomainMaxLength-len(suffix)) + suffix
 }
 
-// namesArtifactOf returns whether the part of name before its last dot could name repository in artifactObjectName.
+// namesArtifactOf returns whether artifactObjectName could return name for an artifact of repository.
 func namesArtifactOf(name, repository string) bool {
-	i := strings.LastIndex(name, ".")
-	return i >= 0 && name[:i] == repositoryObjectNameWithin(repository, validation.DNS1123SubdomainMaxLength-len(name[i:]))
+	suffix := artifactSuffix.FindStringIndex(name)
+	return suffix != nil && name[:suffix[0]] == repositoryObjectNameWithin(repository, validation.DNS1123SubdomainMaxLength-(len(name)-suffix[0]))
 }
 
 func isHashed(objectName string) bool {

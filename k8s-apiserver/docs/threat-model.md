@@ -219,17 +219,18 @@ A poll that runs longer than `--harbor-staleness-limit` fails, and gives `readin
 Some failures of one repository's artifact list, such as a timeout while the server reads Harbor's response, or more than 1000 pages, don't fail the poll.
 The replica then keeps that repository's artifacts from an earlier poll, or none if no earlier poll listed the repository.
 Once they are older than `--harbor-staleness-limit`, or at once on a pod's first poll, requests that could return them fail with `reading a repository's artifacts failed`.
-Other requests still succeed: those for `HarborRepository` objects, and those for artifacts that a get's name, a `harbor.goharbor.io/repository` label selector, or a `status.repository` or `metadata.name` field selector confines to other repositories ([artifacts.go](../pkg/registry/artifacts.go)).
+Other requests still succeed: those for `HarborRepository` objects, and those for artifacts that a get's name, a `harbor.goharbor.io/repository` label selector, or an equality `status.repository` or `metadata.name` field selector confines to other repositories ([artifacts.go](../pkg/registry/artifacts.go)).
 
-Readiness does not depend on Harbor's health ([server.go](../cmd/harbor-apiserver/server.go)).
-A pod becomes ready once it has listed namespaces and its first poll has ended, in success or failure.
-`--harbor-staleness-limit` bounds that poll.
+A pod becomes ready once it has listed namespaces and its first poll has ended, in success or failure ([server.go](../cmd/harbor-apiserver/server.go)).
+An outage ends that poll within about `--harbor-timeout`.
 So the APIService stays Available, discovery keeps working, and pods can restart during an outage.
 A pod that starts during an outage fails requests with 503 until it reads Harbor.
 The e2e test `TestHarborOutageIsServiceUnavailable` checks this behavior.
 
 Residual risk: during an outage, clients get data up to `--harbor-staleness-limit` old, without an error.
 If the image is hosted in the same Harbor, new pods cannot pull it during the outage.
+A slow Harbor or a large project can keep a new pod unready for up to `--harbor-staleness-limit`.
+If all replicas restart then, the APIService is unavailable for that long.
 
 ### Untrusted Harbor data
 

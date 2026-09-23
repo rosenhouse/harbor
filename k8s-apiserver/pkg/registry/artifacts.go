@@ -9,6 +9,7 @@ import (
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apiserver/pkg/registry/rest"
@@ -53,10 +54,8 @@ func mayReturn(opts *metainternalversion.ListOptions, project, repository string
 	if opts == nil {
 		return true
 	}
-	if opts.LabelSelector != nil {
-		if label, ok := opts.LabelSelector.RequiresExactMatch(v1alpha1.RepositoryLabel); ok && label != repositoryObjectName(repository) {
-			return false
-		}
+	if opts.LabelSelector != nil && !opts.LabelSelector.Matches(artifactLabels(repository)) {
+		return false
 	}
 	if opts.FieldSelector != nil {
 		if full, ok := opts.FieldSelector.RequiresExactMatch("status.repository"); ok && full != project+"/"+repository {
@@ -99,10 +98,16 @@ func artifactItem(project, repository string, artifact harbor.Artifact) *item {
 	if !slices.Contains(indexMediaTypes, artifact.ManifestMediaType) {
 		obj.Status.ConfigMediaType = artifact.MediaType
 	}
-	if label := repositoryObjectName(repository); len(validation.IsValidLabelValue(label)) == 0 {
-		obj.Labels = map[string]string{v1alpha1.RepositoryLabel: label}
-	}
+	obj.Labels = artifactLabels(repository)
 	return &item{harborID: artifact.ID, obj: obj}
+}
+
+// artifactLabels returns the labels of every artifact of repository.
+func artifactLabels(repository string) labels.Set {
+	if label := repositoryObjectName(repository); len(validation.IsValidLabelValue(label)) == 0 {
+		return labels.Set{v1alpha1.RepositoryLabel: label}
+	}
+	return nil
 }
 
 func tags(harborTags []harbor.Tag) []v1alpha1.HarborTag {

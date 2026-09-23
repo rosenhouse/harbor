@@ -131,7 +131,7 @@ func TestNamesArtifactOf(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range []string{"team", ""} {
+	for _, name := range []string{"team", "", "team.sha256-0123456789ab.x", "x." + strings.Repeat("a", 250), "x." + strings.Repeat("a", 300)} {
 		if namesArtifactOf(name, "team") {
 			t.Errorf("%q names an artifact of team", name)
 		}

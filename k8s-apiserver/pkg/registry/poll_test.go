@@ -106,23 +106,25 @@ func TestPollStopsAtFailureOfHarbor(t *testing.T) {
 	}
 }
 
-// artifactRequests are requests for artifacts in ns1, and whether they could return nginx's.
+// artifactRequests are requests for artifacts in ns1, and the repositories whose artifacts they could return. Nil means any.
 var artifactRequests = []struct {
-	desc  string
-	nginx bool
-	send  func(*Artifacts) error
+	desc         string
+	repositories []string
+	send         func(*Artifacts) error
 }{
-	{"get of an nginx artifact", true, getArtifact("nginx.sha256-111111111111")},
-	{"get of a team/api artifact", false, getArtifact("team.api.sha256-aaaaaaaaaaaa")},
-	{"get of a dotted.name artifact", false, getArtifact(dottedArtifact)},
-	{"list", true, listArtifacts(nil)},
-	{"list by label inequality", true, listArtifacts(notTeamAPI)},
-	{"list by nginx label", true, listArtifacts(byLabel("nginx"))},
-	{"list by team.api label", false, listArtifacts(byLabel("team.api"))},
-	{"list by nginx repository", true, listArtifacts(byRepository("proj/nginx"))},
-	{"list by team/api repository", false, listArtifacts(byRepository("proj/team/api"))},
-	{"list by nginx artifact name", true, listArtifacts(byName("nginx.sha256-111111111111"))},
-	{"list by team/api artifact name", false, listArtifacts(byName("team.api.sha256-aaaaaaaaaaaa"))},
+	{"get of an nginx artifact", []string{"nginx"}, getArtifact("nginx.sha256-111111111111")},
+	{"get of a team/api artifact", []string{"team/api"}, getArtifact("team.api.sha256-aaaaaaaaaaaa")},
+	{"get of a dotted.name artifact", []string{"dotted.name"}, getArtifact(dottedArtifact)},
+	{"list", nil, listArtifacts(nil)},
+	{"list by label inequality", []string{"nginx", "dotted.name"}, listArtifacts(notTeamAPI)},
+	{"list by label set", []string{"team/api", "dotted.name"}, listArtifacts(byLabelSelector(v1alpha1.RepositoryLabel + " notin (nginx)"))},
+	{"list by nginx label", []string{"nginx"}, listArtifacts(byLabel("nginx"))},
+	{"list by team.api label", []string{"team/api"}, listArtifacts(byLabel("team.api"))},
+	{"list by dotted.name label", []string{"dotted.name"}, listArtifacts(byLabel(repositoryObjectName("dotted.name")))},
+	{"list by nginx repository", []string{"nginx"}, listArtifacts(byRepository("proj/nginx"))},
+	{"list by team/api repository", []string{"team/api"}, listArtifacts(byRepository("proj/team/api"))},
+	{"list by nginx artifact name", []string{"nginx"}, listArtifacts(byName("nginx.sha256-111111111111"))},
+	{"list by team/api artifact name", []string{"team/api"}, listArtifacts(byName("team.api.sha256-aaaaaaaaaaaa"))},
 }
 
 func getArtifact(name string) func(*Artifacts) error {
@@ -139,13 +141,13 @@ func listArtifacts(opts *metainternalversion.ListOptions) func(*Artifacts) error
 	}
 }
 
-// expectArtifactRequests checks that requests fail if and only if they could return nginx's artifacts and those are stale.
-func expectArtifactRequests(t *testing.T, f *fixture, nginxStale bool) {
+// expectArtifactRequests checks that requests fail if and only if they could return artifacts of the stale repository, if any.
+func expectArtifactRequests(t *testing.T, f *fixture, stale string) {
 	t.Helper()
 	for _, r := range artifactRequests {
 		err := r.send(f.artifacts)
 		switch {
-		case !r.nginx || !nginxStale:
+		case stale == "" || r.repositories != nil && !slices.Contains(r.repositories, stale):
 			if err != nil {
 				t.Errorf("%s: %v", r.desc, err)
 			}
@@ -177,14 +179,14 @@ func TestPollKeepsArtifactsOfRepositoryThatFailsUntilStale(t *testing.T) {
 
 	f.clock.Step(stalenessLimit / 2)
 	f.poll(t)
-	expectArtifactRequests(t, f, false)
+	expectArtifactRequests(t, f, "")
 	f.clock.Step(time.Nanosecond)
-	expectArtifactRequests(t, f, true)
+	expectArtifactRequests(t, f, "nginx")
 	expectAvailable(t, f, "ns1")
 
 	delete(h.artifactErrs, "proj/nginx")
 	f.poll(t)
-	expectArtifactRequests(t, f, false)
+	expectArtifactRequests(t, f, "")
 }
 
 func TestNewRepositoryHasNoArtifactsAsOfTheLastPoll(t *testing.T) {
@@ -207,7 +209,7 @@ func TestNewRepositoryHasNoArtifactsAsOfTheLastPoll(t *testing.T) {
 
 	f.clock.Step(stalenessLimit / 2)
 	f.poll(t)
-	expectArtifactRequests(t, f, false)
+	expectArtifactRequests(t, f, "")
 	f.clock.Step(time.Nanosecond)
 	expectAvailable(t, f, "ns1")
 	for _, send := range []func(*Artifacts) error{getArtifact("new.sha256-999999999999"), listArtifacts(nil)} {
@@ -224,17 +226,35 @@ func TestFirstPollWithoutSomeArtifactsFailsRequestsForThem(t *testing.T) {
 	h := artifactHarbor()
 	h.artifactErrs = map[string]error{"proj/nginx": errors.New("unexpected response from harbor")}
 	f := newFixture(t, h)
-	expectArtifactRequests(t, f, true)
+	expectArtifactRequests(t, f, "nginx")
 	expectAvailable(t, f, "ns1")
 	f.poll(t)
-	expectArtifactRequests(t, f, true)
+	expectArtifactRequests(t, f, "nginx")
 
 	delete(h.artifactErrs, "proj/nginx")
 	f.poll(t)
-	expectArtifactRequests(t, f, false)
+	expectArtifactRequests(t, f, "")
 }
 
-func TestStalenessCountsFromTheStartOfARead(t *testing.T) {
+func TestFirstPollWithoutArtifactsOfAHashedRepositoryFailsRequestsForThem(t *testing.T) {
+	h := artifactHarbor()
+	h.artifactErrs = map[string]error{"proj/dotted.name": errors.New("unexpected response from harbor")}
+	f := newFixture(t, h)
+	expectArtifactRequests(t, f, "dotted.name")
+}
+
+func TestDeletingAStaleRepositoryEndsItsFailures(t *testing.T) {
+	h := artifactHarbor()
+	h.artifactErrs = map[string]error{"proj/nginx": errors.New("unexpected response from harbor")}
+	f := newFixture(t, h)
+	h.repositories = slices.DeleteFunc(h.repositories, func(r harbor.Repository) bool { return r.Name == "proj/nginx" })
+	f.poll(t)
+	if _, err := f.artifacts.List(inNamespace("ns1"), nil); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestStalenessCountsFromTheStartOfAPoll(t *testing.T) {
 	h := repositoryHarbor()
 	f := newFixture(t, h)
 	h.onList = func() { f.clock.Step(stalenessLimit / 2) }
