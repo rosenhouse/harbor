@@ -1,0 +1,15 @@
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.harbor.goharbor.io
+spec:
+  group: harbor.goharbor.io
+  version: v1alpha1
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+  # TODO(#11): verify the serving certificate with caBundle.
+  insecureSkipTLSVerify: true
+  service:
+    name: harbor-apiserver
+    namespace: harbor-apiserver
+    port: 443

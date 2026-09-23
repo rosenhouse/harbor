@@ -12,3 +12,6 @@ formatters:
     goimports:
       local-prefixes:
         - github.com/rosenhouse/harbor/k8s-apiserver
+run:
+  build-tags:
+    - e2e

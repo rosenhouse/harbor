@@ -27,3 +27,28 @@ jobs:
         with:
           version: v2.13.2
           working-directory: k8s-apiserver
+
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      E2E_KUBECONFIG: /tmp/harbor-apiserver-e2e.kubeconfig
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: k8s-apiserver/go.mod
+          cache-dependency-path: k8s-apiserver/go.sum
+      - run: go install sigs.k8s.io/kind@v0.33.0
+      - run: |
+          curl -fsSLo "$RUNNER_TEMP/kubectl" https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl
+          sudo install "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
+      - run: hack/e2e.sh
+      - if: failure()
+        env:
+          KUBECONFIG: ${{ env.E2E_KUBECONFIG }}
+        run: |
+          set +e
+          kubectl get apiservice v1alpha1.harbor.goharbor.io -o yaml
+          kubectl -n harbor-apiserver describe pods
+          kubectl -n harbor-apiserver logs -l app=harbor-apiserver --prefix --tail=200
+          kubectl -n harbor-apiserver logs -l app=harbor-apiserver --prefix --tail=200 --previous
