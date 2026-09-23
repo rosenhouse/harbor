@@ -1,5 +1,3 @@
-//go:build e2e
-
 package main
 
 import (
@@ -29,7 +27,7 @@ func TestApplySecretPipesItToKubectl(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(args) != "apply -f -\n" {
+	if string(args) != "apply --server-side --field-manager=harbor-apiserver-e2e --force-conflicts -f -\n" {
 		t.Errorf("kubectl args: got %q", args)
 	}
 	stdin, err := os.ReadFile(filepath.Join(dir, "stdin"))
@@ -43,11 +41,11 @@ func TestApplySecretPipesItToKubectl(t *testing.T) {
 	want := corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 		ObjectMeta: metav1.ObjectMeta{Namespace: "harbor-apiserver", Name: "harbor-apiserver"},
-		StringData: map[string]string{
-			"url":      "http://harbor.harbor.svc",
-			"project":  "e2e",
-			"username": "robot$e2e+harbor-apiserver",
-			"password": "s3cret",
+		Data: map[string][]byte{
+			"url":      []byte("http://harbor.harbor.svc"),
+			"project":  []byte("e2e"),
+			"username": []byte("robot$e2e+harbor-apiserver"),
+			"password": []byte("s3cret"),
 		},
 	}
 	if diff := cmp.Diff(want, got); diff != "" {

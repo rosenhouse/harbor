@@ -45,7 +45,9 @@ jobs:
           sudo install "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
           curl -fsSL https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz | tar -xzC "$RUNNER_TEMP"
           sudo install "$RUNNER_TEMP/linux-amd64/helm" /usr/local/bin/helm
+      # A step timeout fails the step, so the diagnostics still run. A job timeout would cancel them.
       - run: hack/e2e.sh
+        timeout-minutes: 25
       - if: failure()
         env:
           KUBECONFIG: ${{ env.E2E_KUBECONFIG }}
@@ -58,4 +60,5 @@ jobs:
           kubectl -n harbor get pods
           kubectl -n harbor describe pods
           kubectl -n harbor get events --sort-by=.lastTimestamp
-          kubectl -n harbor logs -l 'app=harbor,component in (core,registry,nginx)' --all-containers --prefix --tail=200
+          kubectl -n harbor logs -l 'app=harbor,component in (core,registry,nginx)' --all-containers --prefix --tail=200 --ignore-errors
+          kubectl -n harbor logs -l 'app=harbor,component in (core,registry,nginx)' --all-containers --prefix --tail=200 --ignore-errors --previous

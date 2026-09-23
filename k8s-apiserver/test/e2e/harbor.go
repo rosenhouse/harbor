@@ -1,5 +1,3 @@
-//go:build e2e
-
 // Package e2e seeds Harbor and tests a deployed harbor-apiserver.
 package e2e
 
@@ -36,6 +34,9 @@ const (
 
 var adminAuth = authn.Basic{Username: "admin", Password: "Harbor12345"}
 
+// requestTimeout bounds each Harbor API call.
+var requestTimeout = 30 * time.Second
+
 // Seed is what Harbor holds after seeding. Its images are reproducible, so tests can recompute their digests.
 type Seed struct {
 	App, Untagged, TeamAPI, Dotted v1.Image
@@ -59,8 +60,8 @@ func NewSeed() Seed {
 	return s
 }
 
-// Push replaces the repositories in the e2e project with the seed images.
-func (s Seed) Push(ctx context.Context, a *Admin) error {
+// ReplaceRepositories creates the e2e project if needed and replaces its repositories with the seed images.
+func (a *Admin) ReplaceRepositories(ctx context.Context, s Seed) error {
 	if err := a.do(ctx, http.MethodPost, "/projects", map[string]any{"project_name": HarborProject}, nil, http.StatusCreated, http.StatusConflict); err != nil {
 		return err
 	}
@@ -116,7 +117,7 @@ type Admin struct {
 }
 
 func NewAdmin(harborURL string) *Admin {
-	return &Admin{url: harborURL, http: &http.Client{Timeout: 30 * time.Second}}
+	return &Admin{url: harborURL, http: &http.Client{Timeout: requestTimeout}}
 }
 
 // push pushes to ref in the e2e project.
@@ -128,19 +129,24 @@ func (a *Admin) push(ctx context.Context, ref string, t remote.Taggable) error {
 	return remote.Push(r, t, remote.WithAuth(&adminAuth), remote.WithContext(ctx))
 }
 
+// deleteRepositories rereads the first page of repositories until it is empty, because deleting shifts the pages.
 func (a *Admin) deleteRepositories(ctx context.Context) error {
-	var repos []struct{ Name string }
-	if err := a.do(ctx, http.MethodGet, "/projects/"+HarborProject+"/repositories?page_size=100", nil, &repos, http.StatusOK); err != nil {
-		return err
-	}
-	for _, r := range repos {
-		// Harbor requires repository names containing "/" to be encoded twice.
-		escaped := url.PathEscape(url.PathEscape(strings.TrimPrefix(r.Name, HarborProject+"/")))
-		if err := a.do(ctx, http.MethodDelete, "/projects/"+HarborProject+"/repositories/"+escaped, nil, nil, http.StatusOK); err != nil {
+	for {
+		var repos []struct{ Name string }
+		if err := a.do(ctx, http.MethodGet, "/projects/"+HarborProject+"/repositories?page_size=100", nil, &repos, http.StatusOK); err != nil {
 			return err
 		}
+		if len(repos) == 0 {
+			return nil
+		}
+		for _, r := range repos {
+			// Harbor requires repository names containing "/" to be encoded twice.
+			escaped := url.PathEscape(url.PathEscape(strings.TrimPrefix(r.Name, HarborProject+"/")))
+			if err := a.do(ctx, http.MethodDelete, "/projects/"+HarborProject+"/repositories/"+escaped, nil, nil, http.StatusOK); err != nil {
+				return err
+			}
+		}
 	}
-	return nil
 }
 
 // CreateRobot replaces the project robot account for harbor-apiserver, granting only the permissions it needs.

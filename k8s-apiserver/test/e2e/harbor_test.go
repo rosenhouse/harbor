@@ -7,13 +7,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
-	"slices"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 )
@@ -31,15 +28,6 @@ func clientAs(t *testing.T, username, password string) *harbor.Client {
 		t.Fatal(err)
 	}
 	return c
-}
-
-func digest(t *testing.T, x interface{ Digest() (v1.Hash, error) }) string {
-	t.Helper()
-	d, err := x.Digest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return d.String()
 }
 
 func secretValue(t *testing.T, key string) string {
@@ -118,36 +106,4 @@ func TestRobotWithWrongPassword(t *testing.T) {
 	if !errors.Is(err, harbor.ErrUnauthorized) {
 		t.Errorf("got %v, want %v", err, harbor.ErrUnauthorized)
 	}
-}
-
-type artifactSummary struct {
-	Digest     string
-	Tags       []string
-	References []string
-}
-
-func summarize(artifacts []harbor.Artifact) []artifactSummary {
-	var s []artifactSummary
-	for _, a := range artifacts {
-		x := artifactSummary{Digest: a.Digest}
-		for _, tag := range a.Tags {
-			x.Tags = append(x.Tags, tag.Name)
-		}
-		slices.Sort(x.Tags)
-		for _, r := range a.References {
-			arch := "<no platform>"
-			if r.Platform != nil {
-				arch = r.Platform.Architecture
-			}
-			x.References = append(x.References, arch+"="+r.ChildDigest)
-		}
-		slices.Sort(x.References)
-		s = append(s, x)
-	}
-	return sortedSummaries(s)
-}
-
-func sortedSummaries(s []artifactSummary) []artifactSummary {
-	slices.SortFunc(s, func(a, b artifactSummary) int { return strings.Compare(a.Digest, b.Digest) })
-	return s
 }
