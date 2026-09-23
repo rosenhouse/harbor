@@ -105,7 +105,7 @@ func TestUnavailableUntilFirstRead(t *testing.T) {
 		t.Errorf("list from all namespaces: got %v, want ServiceUnavailable", err)
 	}
 
-	f.harbor.err = fmt.Errorf("%w: dial tcp 10.0.0.1:443: refused", harbor.ErrUnavailable)
+	f.harbor.setErr(fmt.Errorf("%w: dial tcp 10.0.0.1:443: refused", harbor.ErrUnavailable))
 	f.poll(t)
 	expectUnavailable(t, f, "ns1", "harbor is unavailable")
 
@@ -117,7 +117,7 @@ func TestUnavailableUntilFirstRead(t *testing.T) {
 		t.Errorf("list from a namespace that does not see the project: got %v", n)
 	}
 
-	f.harbor.err = nil
+	f.harbor.setErr(nil)
 	f.poll(t)
 	expectAvailable(t, f, "ns1")
 }
@@ -134,7 +134,7 @@ func TestServesLastReadUntilStale(t *testing.T) {
 		{fmt.Errorf("boom from 10.0.0.1"), "unexpected error reading harbor"},
 	} {
 		f := newFixture(t, repositoryHarbor())
-		f.harbor.err = tc.harborErr
+		f.harbor.setErr(tc.harborErr)
 		f.clock.Step(stalenessLimit / 2)
 		f.poll(t)
 		f.clock.Step(stalenessLimit / 2)
@@ -148,14 +148,18 @@ func TestServesLastReadUntilStale(t *testing.T) {
 			}
 		}
 
-		f.harbor.err = nil
+		f.harbor.setErr(nil)
 		f.poll(t)
 		expectAvailable(t, f, "ns1")
 	}
 }
 
-func TestStaleWithoutFailedRead(t *testing.T) {
+func TestStaleAfterASuccessfulPoll(t *testing.T) {
 	f := newFixture(t, repositoryHarbor())
+	f.harbor.setErr(harbor.ErrUnavailable)
+	f.poll(t)
+	f.harbor.setErr(nil)
+	f.poll(t)
 	f.clock.Step(stalenessLimit + time.Nanosecond)
 	expectUnavailable(t, f, "ns1", "reading harbor takes longer than the staleness limit")
 }

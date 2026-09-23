@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apis/harbor/v1alpha1"
@@ -87,8 +88,8 @@ func TestPollStopsAtFailureOfHarbor(t *testing.T) {
 	for _, err := range []error{harbor.ErrUnavailable, harbor.ErrUnauthorized, harbor.ErrForbidden} {
 		h := artifactHarbor()
 		f := failingArtifacts{h, err, make(chan string, len(h.repositories))}
-		s := NewStore(stalenessLimit, fakeNamespaces{"ns1"})
-		if got := NewPoller(f, "proj", s).Poll(t.Context()); !errors.Is(got, err) {
+		s := NewStore("proj", stalenessLimit, fakeNamespaces{"ns1"})
+		if got := NewPoller(f, s).Poll(t.Context()); !errors.Is(got, err) {
 			t.Errorf("poll returned %v, want %v", got, err)
 		}
 		if _, err := NewArtifacts(s).List(inNamespace("ns1"), nil); !apierrors.IsServiceUnavailable(err) {
@@ -105,37 +106,88 @@ func TestPollStopsAtFailureOfHarbor(t *testing.T) {
 	}
 }
 
+// artifactRequests are requests for artifacts in ns1, and whether they could return nginx's.
+var artifactRequests = []struct {
+	desc  string
+	nginx bool
+	send  func(*Artifacts) error
+}{
+	{"get of an nginx artifact", true, getArtifact("nginx.sha256-111111111111")},
+	{"get of a team/api artifact", false, getArtifact("team.api.sha256-aaaaaaaaaaaa")},
+	{"get of a dotted.name artifact", false, getArtifact(dottedArtifact)},
+	{"list", true, listArtifacts(nil)},
+	{"list by label inequality", true, listArtifacts(notTeamAPI)},
+	{"list by nginx label", true, listArtifacts(byLabel("nginx"))},
+	{"list by team.api label", false, listArtifacts(byLabel("team.api"))},
+	{"list by nginx repository", true, listArtifacts(byRepository("proj/nginx"))},
+	{"list by team/api repository", false, listArtifacts(byRepository("proj/team/api"))},
+	{"list by nginx artifact name", true, listArtifacts(byName("nginx.sha256-111111111111"))},
+	{"list by team/api artifact name", false, listArtifacts(byName("team.api.sha256-aaaaaaaaaaaa"))},
+}
+
+func getArtifact(name string) func(*Artifacts) error {
+	return func(a *Artifacts) error {
+		_, err := a.Get(inNamespace("ns1"), name, &metav1.GetOptions{})
+		return err
+	}
+}
+
+func listArtifacts(opts *metainternalversion.ListOptions) func(*Artifacts) error {
+	return func(a *Artifacts) error {
+		_, err := a.List(inNamespace("ns1"), opts)
+		return err
+	}
+}
+
+// expectArtifactRequests checks that requests fail if and only if they could return nginx's artifacts and those are stale.
+func expectArtifactRequests(t *testing.T, f *fixture, nginxStale bool) {
+	t.Helper()
+	for _, r := range artifactRequests {
+		err := r.send(f.artifacts)
+		switch {
+		case !r.nginx || !nginxStale:
+			if err != nil {
+				t.Errorf("%s: %v", r.desc, err)
+			}
+		case !apierrors.IsServiceUnavailable(err) || !strings.Contains(err.Error(), "reading a repository's artifacts failed"):
+			t.Errorf("%s: got %v, want ServiceUnavailable", r.desc, err)
+		}
+	}
+}
+
 func TestPollKeepsArtifactsOfRepositoryThatFailsUntilStale(t *testing.T) {
 	h := artifactHarbor()
 	f := newFixture(t, h)
 	before := artifactNames(artifactItems(t, f.artifacts, "ns1", nil))
 
 	h.artifactErrs = map[string]error{"proj/nginx": errors.New("more than 1000 pages")}
-	h.artifacts["proj/nginx"] = nil
 	h.artifacts["proj/team/api"][0].Size++
 	f.clock.Step(stalenessLimit / 2)
-	f.poll(t)
+	if err := f.poller.Poll(t.Context()); !errors.Is(err, errArtifactsRead) {
+		t.Errorf("poll returned %v, want %v", err, errArtifactsRead)
+	}
 
 	items := artifactItems(t, f.artifacts, "ns1", nil)
 	if diff := cmp.Diff(before, artifactNames(items)); diff != "" {
 		t.Errorf("names (-before +after):\n%s", diff)
 	}
 	if size := items[3].Status.Size; size != 1537 {
-		t.Errorf("team/api artifact has size %d, want the new read's 1537", size)
+		t.Errorf("team/api artifact has size %d, want the new poll's 1537", size)
 	}
 
 	f.clock.Step(stalenessLimit / 2)
 	f.poll(t)
-	expectAvailable(t, f, "ns1")
+	expectArtifactRequests(t, f, false)
 	f.clock.Step(time.Nanosecond)
-	expectUnavailable(t, f, "ns1", "reading a repository's artifacts failed")
+	expectArtifactRequests(t, f, true)
+	expectAvailable(t, f, "ns1")
 
 	delete(h.artifactErrs, "proj/nginx")
 	f.poll(t)
-	expectAvailable(t, f, "ns1")
+	expectArtifactRequests(t, f, false)
 }
 
-func TestNewRepositoryHasNoArtifactsAsOfTheLastRead(t *testing.T) {
+func TestNewRepositoryHasNoArtifactsAsOfTheLastPoll(t *testing.T) {
 	h := artifactHarbor()
 	f := newFixture(t, h)
 	before := artifactNames(artifactItems(t, f.artifacts, "ns1", nil))
@@ -146,7 +198,6 @@ func TestNewRepositoryHasNoArtifactsAsOfTheLastRead(t *testing.T) {
 	if err := f.poller.Poll(t.Context()); !errors.Is(err, errArtifactsRead) {
 		t.Errorf("poll returned %v, want %v", err, errArtifactsRead)
 	}
-	expectAvailable(t, f, "ns1")
 	if _, err := f.repositories.Get(inNamespace("ns1"), "new", &metav1.GetOptions{}); err != nil {
 		t.Error(err)
 	}
@@ -156,22 +207,31 @@ func TestNewRepositoryHasNoArtifactsAsOfTheLastRead(t *testing.T) {
 
 	f.clock.Step(stalenessLimit / 2)
 	f.poll(t)
-	expectAvailable(t, f, "ns1")
+	expectArtifactRequests(t, f, false)
 	f.clock.Step(time.Nanosecond)
-	expectUnavailable(t, f, "ns1", "reading a repository's artifacts failed")
+	expectAvailable(t, f, "ns1")
+	for _, send := range []func(*Artifacts) error{getArtifact("new.sha256-999999999999"), listArtifacts(nil)} {
+		if err := send(f.artifacts); !apierrors.IsServiceUnavailable(err) {
+			t.Errorf("got %v, want ServiceUnavailable", err)
+		}
+	}
+	if err := getArtifact("team.api.sha256-aaaaaaaaaaaa")(f.artifacts); err != nil {
+		t.Error(err)
+	}
 }
 
-func TestFirstReadWithoutSomeArtifactsIsStale(t *testing.T) {
+func TestFirstPollWithoutSomeArtifactsFailsRequestsForThem(t *testing.T) {
 	h := artifactHarbor()
 	h.artifactErrs = map[string]error{"proj/nginx": errors.New("unexpected response from harbor")}
 	f := newFixture(t, h)
-	expectUnavailable(t, f, "ns1", "reading a repository's artifacts failed")
+	expectArtifactRequests(t, f, true)
+	expectAvailable(t, f, "ns1")
 	f.poll(t)
-	expectUnavailable(t, f, "ns1", "reading a repository's artifacts failed")
+	expectArtifactRequests(t, f, true)
 
 	delete(h.artifactErrs, "proj/nginx")
 	f.poll(t)
-	expectAvailable(t, f, "ns1")
+	expectArtifactRequests(t, f, false)
 }
 
 func TestStalenessCountsFromTheStartOfARead(t *testing.T) {
@@ -205,8 +265,8 @@ func TestPollEndsAtTheStalenessLimit(t *testing.T) {
 		fmt.Errorf("%w: %w", harbor.ErrUnavailable, context.DeadlineExceeded),
 		fmt.Errorf("decoding a response: %w", context.DeadlineExceeded),
 	} {
-		s := NewStore(50*time.Millisecond, fakeNamespaces{"ns1"})
-		if got := NewPoller(slowArtifacts{err}, "proj", s).Poll(t.Context()); !errors.Is(got, errSlowRead) {
+		s := NewStore("proj", 50*time.Millisecond, fakeNamespaces{"ns1"})
+		if got := NewPoller(slowArtifacts{err}, s).Poll(t.Context()); !errors.Is(got, errSlowRead) {
 			t.Errorf("%v: poll returned %v, want %v", err, got, errSlowRead)
 		}
 		_, listErr := NewRepositories(s).List(inNamespace("ns1"), nil)
@@ -214,6 +274,15 @@ func TestPollEndsAtTheStalenessLimit(t *testing.T) {
 			t.Errorf("%v: list returned %v", err, listErr)
 		}
 	}
+}
+
+func TestPollAtShutdownRecordsNoFailure(t *testing.T) {
+	f := newUnreadFixture(repositoryHarbor())
+	f.harbor.setErr(context.Canceled)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_ = f.poller.Poll(ctx)
+	expectUnavailable(t, f, "ns1", "harbor has not been read yet")
 }
 
 func TestPollsDoNotOverlap(t *testing.T) {
@@ -237,15 +306,14 @@ func TestPollsDoNotOverlap(t *testing.T) {
 	wg.Wait()
 }
 
-// stepWhenWaiting steps the clock once something waits on it.
-func stepWhenWaiting(t *testing.T, f *fixture, d time.Duration) {
+// waitForWaiter waits until something waits on the clock.
+func waitForWaiter(t *testing.T, f *fixture) {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Second); !f.clock.HasWaiters(); time.Sleep(time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("nothing waits on the clock")
 		}
 	}
-	f.clock.Step(d)
 }
 
 func expectRepositoryLists(t *testing.T, h *fakeHarbor, want int) {
@@ -257,38 +325,65 @@ func expectRepositoryLists(t *testing.T, h *fakeHarbor, want int) {
 	}
 }
 
-func TestRunRetriesOnceSoonerAfterAFailure(t *testing.T) {
-	h := repositoryHarbor()
-	h.setErr(harbor.ErrUnavailable)
-	f := newUnreadFixture(h)
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	t.Cleanup(func() { cancel(); <-done })
-	go func() { defer close(done); f.poller.Run(ctx, time.Minute) }()
-
-	select {
-	case <-f.poller.Attempted():
-	case <-time.After(5 * time.Second):
-		t.Fatal("no read attempted")
+// expectWaiting checks that Run waits on the clock, and has listed repositories lists times.
+// Run lists repositories before it waits again, so this sees any poll that the clock started.
+func expectWaiting(t *testing.T, f *fixture, lists int) {
+	t.Helper()
+	if !f.clock.HasWaiters() || f.harbor.repositoryLists() != lists {
+		t.Fatalf("waiting %v after listing repositories %d times, want waiting after %d", f.clock.HasWaiters(), f.harbor.repositoryLists(), lists)
 	}
-	expectRepositoryLists(t, h, 1)
-	stepWhenWaiting(t, f, 1100*time.Millisecond)
-	expectRepositoryLists(t, h, 2)
-	stepWhenWaiting(t, f, 59*time.Second)
-	time.Sleep(10 * time.Millisecond)
-	expectRepositoryLists(t, h, 2)
+}
 
-	h.setErr(nil)
-	stepWhenWaiting(t, f, 7*time.Second)
-	expectRepositoryLists(t, h, 3)
-	stepWhenWaiting(t, f, 59*time.Second)
-	time.Sleep(10 * time.Millisecond)
-	expectRepositoryLists(t, h, 3)
-	expectAvailable(t, f, "ns1")
+func TestRunRetriesOnceSoonerAfterAFailure(t *testing.T) {
+	for _, tc := range []struct{ interval, retry time.Duration }{
+		{time.Minute, time.Second},
+		{100 * time.Millisecond, 100 * time.Millisecond},
+	} {
+		h := repositoryHarbor()
+		h.setErr(harbor.ErrUnavailable)
+		f := newUnreadFixture(h)
+		f.poller.jitter = func(d time.Duration) time.Duration { return d + d/10 }
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		t.Cleanup(func() { cancel(); <-done })
+		go func() { defer close(done); f.poller.Run(ctx, tc.interval) }()
 
-	h.setErr(harbor.ErrUnavailable)
-	stepWhenWaiting(t, f, 7*time.Second)
-	expectRepositoryLists(t, h, 4)
-	stepWhenWaiting(t, f, 1100*time.Millisecond)
-	expectRepositoryLists(t, h, 5)
+		// waitThenPoll checks that Run waits d plus a tenth, and then polls.
+		polls := 1
+		waitThenPoll := func(d time.Duration) {
+			t.Helper()
+			f.clock.Step(d)
+			expectWaiting(t, f, polls)
+			f.clock.Step(d / 10)
+			polls++
+			expectRepositoryLists(t, h, polls)
+			waitForWaiter(t, f)
+		}
+		expectRepositoryLists(t, h, 1)
+		waitForWaiter(t, f)
+		waitThenPoll(tc.retry)
+		h.setErr(nil)
+		waitThenPoll(tc.interval)
+		waitThenPoll(tc.interval)
+		expectAvailable(t, f, "ns1")
+		h.setErr(harbor.ErrUnavailable)
+		waitThenPoll(tc.interval)
+		waitThenPoll(tc.retry)
+		waitThenPoll(tc.interval)
+	}
+}
+
+func TestJitterAddsUpToATenth(t *testing.T) {
+	jitter := NewPoller(nil, nil).jitter
+	lengthened := false
+	for range 100 {
+		d := jitter(time.Minute)
+		if d < time.Minute || d > time.Minute+time.Minute/10 {
+			t.Fatalf("jittered a minute to %v", d)
+		}
+		lengthened = lengthened || d > time.Minute
+	}
+	if !lengthened {
+		t.Error("jitter never lengthened a minute")
+	}
 }

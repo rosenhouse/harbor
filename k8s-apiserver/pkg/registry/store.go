@@ -12,8 +12,9 @@ import (
 	"k8s.io/utils/clock"
 )
 
-// Store holds the last read of a Harbor project and serves a copy of it to each namespace that sees the project.
+// Store holds a Harbor project as polled, and serves a copy of it to each namespace that sees the project.
 type Store struct {
+	project        string
 	stalenessLimit time.Duration
 	namespaces     Namespaces
 	clock          clock.Clock
@@ -21,9 +22,11 @@ type Store struct {
 	mu sync.Mutex
 	// items is replaced but never modified, so requests read it after releasing mu.
 	items map[key]*item
-	// read is when the oldest part of the last read of Harbor started, and readErr is why no later read replaced that part.
-	read    time.Time
-	readErr error
+	// listed is when the last poll that listed the repositories started, and err is why the polls since then failed.
+	listed time.Time
+	err    error
+	// olderArtifacts maps each repository whose artifacts come from an earlier poll to when that poll started.
+	olderArtifacts map[string]time.Time
 }
 
 type key struct{ resource, name string }
@@ -42,39 +45,45 @@ func (it *item) object(resource, namespace string) object {
 	return o
 }
 
-// NewStore returns a store that fails requests once its last read of Harbor is older than stalenessLimit.
-func NewStore(stalenessLimit time.Duration, n Namespaces) *Store {
-	return &Store{stalenessLimit: stalenessLimit, namespaces: n, clock: clock.RealClock{}}
+// NewStore returns a store of project that fails requests once the data they need is older than stalenessLimit.
+func NewStore(project string, stalenessLimit time.Duration, n Namespaces) *Store {
+	return &Store{project: project, stalenessLimit: stalenessLimit, namespaces: n, clock: clock.RealClock{}}
 }
 
-// update replaces the last read of Harbor.
-// read is when the oldest part of items was read, and err is why later reads of that part failed.
-func (s *Store) update(items map[key]*item, read time.Time, err error) {
+// update replaces the items with those of the poll that started at listed.
+func (s *Store) update(items map[key]*item, listed time.Time, olderArtifacts map[string]time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.items, s.read, s.readErr = items, read, err
+	s.items, s.listed, s.err, s.olderArtifacts = items, listed, nil, olderArtifacts
 }
 
-// failed records why a read of Harbor failed.
+// failed records why a poll failed.
 func (s *Store) failed(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.readErr = err
+	s.err = err
 }
 
-// snapshot returns the last read of Harbor, or an error once it is older than the staleness limit.
-func (s *Store) snapshot() (map[key]*item, error) {
+// snapshot returns the items, or an error once the repository list is older than the staleness limit.
+// It also fails once the artifacts of a repository that the response needs are.
+func (s *Store) snapshot(needs func(repository string) bool) (map[key]*item, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	switch {
-	case s.clock.Since(s.read) <= s.stalenessLimit:
-		return s.items, nil
-	case s.readErr != nil:
-		return nil, apierrors.NewServiceUnavailable(errorKind(s.readErr).Error())
-	case s.read.IsZero():
-		return nil, apierrors.NewServiceUnavailable("harbor has not been read yet")
+	if s.clock.Since(s.listed) > s.stalenessLimit {
+		switch {
+		case s.err != nil:
+			return nil, apierrors.NewServiceUnavailable(errorKind(s.err).Error())
+		case s.listed.IsZero():
+			return nil, apierrors.NewServiceUnavailable("harbor has not been read yet")
+		}
+		return nil, apierrors.NewServiceUnavailable(errSlowRead.Error())
 	}
-	return nil, apierrors.NewServiceUnavailable(errSlowRead.Error())
+	for repository, started := range s.olderArtifacts {
+		if s.clock.Since(started) > s.stalenessLimit && needs(repository) {
+			return nil, apierrors.NewServiceUnavailable(errArtifactsRead.Error())
+		}
+	}
+	return s.items, nil
 }
 
 // covered returns, sorted, the namespaces that see the project among those that a request for namespace covers.
@@ -88,11 +97,11 @@ func (s *Store) covered(namespace string) []string {
 	return nil
 }
 
-func (s *Store) get(resource schema.GroupResource, namespace, name string) (runtime.Object, error) {
+func (s *Store) get(resource schema.GroupResource, namespace, name string, needs func(repository string) bool) (runtime.Object, error) {
 	if !s.namespaces.Allows(namespace) {
 		return nil, apierrors.NewNotFound(resource, name)
 	}
-	items, err := s.snapshot()
+	items, err := s.snapshot(needs)
 	if err != nil {
 		return nil, err
 	}
@@ -104,18 +113,18 @@ func (s *Store) get(resource schema.GroupResource, namespace, name string) (runt
 }
 
 // list returns the objects of resource that match, in the namespaces that a request for namespace covers, sorted by namespace and name.
-func (s *Store) list(resource, namespace string, match func(object, string) bool) ([]runtime.Object, error) {
+func (s *Store) list(resource schema.GroupResource, namespace string, match func(object, string) bool, needs func(repository string) bool) ([]runtime.Object, error) {
 	namespaces := s.covered(namespace)
 	if len(namespaces) == 0 {
 		return nil, nil
 	}
-	items, err := s.snapshot()
+	items, err := s.snapshot(needs)
 	if err != nil {
 		return nil, err
 	}
 	var keys []key
 	for k := range items {
-		if k.resource == resource {
+		if k.resource == resource.Resource {
 			keys = append(keys, k)
 		}
 	}
@@ -124,7 +133,7 @@ func (s *Store) list(resource, namespace string, match func(object, string) bool
 	for _, ns := range namespaces {
 		for _, k := range keys {
 			if it := items[k]; match(it.obj, ns) {
-				objs = append(objs, it.object(resource, ns))
+				objs = append(objs, it.object(resource.Resource, ns))
 			}
 		}
 	}

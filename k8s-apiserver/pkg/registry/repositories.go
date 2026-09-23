@@ -24,6 +24,7 @@ var (
 	_ rest.Lister               = &Repositories{}
 	_ rest.Scoper               = &Repositories{}
 	_ rest.SingularNameProvider = &Repositories{}
+	_ rest.TableConvertor       = &Repositories{}
 )
 
 func NewRepositories(s *Store) *Repositories {

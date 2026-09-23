@@ -44,8 +44,8 @@ func (allowed) Namespaces() []string  { return []string{"allowed"} }
 
 func newHandler(t *testing.T) http.Handler {
 	t.Helper()
-	store := registry.NewStore(time.Minute, allowed{})
-	if err := registry.NewPoller(fakeHarbor{}, "proj", store).Poll(t.Context()); err != nil {
+	store := registry.NewStore("proj", time.Minute, allowed{})
+	if err := registry.NewPoller(fakeHarbor{}, store).Poll(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	c := apiserver.NewConfig()

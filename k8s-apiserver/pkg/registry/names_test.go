@@ -117,3 +117,23 @@ func TestLongArtifactObjectNames(t *testing.T) {
 		}
 	}
 }
+
+func TestNamesArtifactOf(t *testing.T) {
+	fits := strings.Repeat("a", validation.DNS1123SubdomainMaxLength-len(".sha256-0123456789ab"))
+	repositories := []string{"team", "team/api", "dotted.name", fits, fits + "a", fits + "b"}
+	for _, of := range repositories {
+		for _, digest := range []string{sha256Digest, "b:0123456789ab"} {
+			name := artifactObjectName(of, digest)
+			for _, repository := range repositories {
+				if got := namesArtifactOf(name, repository); got != (repository == of) {
+					t.Errorf("%q names an artifact of %q: got %v", name, repository, got)
+				}
+			}
+		}
+	}
+	for _, name := range []string{"team", ""} {
+		if namesArtifactOf(name, "team") {
+			t.Errorf("%q names an artifact of team", name)
+		}
+	}
+}

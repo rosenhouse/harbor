@@ -41,7 +41,7 @@ type object interface {
 }
 
 // storage serves one resource from a Store.
-// It ignores resourceVersion, since it serves only the last read of Harbor, and its objects have none.
+// It ignores resourceVersion, since it serves only the store's current items, and its objects have none.
 type storage struct {
 	store     *Store
 	resource  schema.GroupResource
@@ -49,6 +49,8 @@ type storage struct {
 	newList   func() runtime.Object
 	// fields returns an object's selectable fields besides its name and namespace.
 	fields func(runtime.Object) fields.Set
+	// mayReturnArtifacts returns whether a request with opts could return artifacts of repository in project. Nil means never.
+	mayReturnArtifacts func(opts *metainternalversion.ListOptions, project, repository string) bool
 }
 
 func (s *storage) New() runtime.Object     { return s.newObject() }
@@ -57,11 +59,12 @@ func (s *storage) Destroy()                {}
 func (s *storage) NamespaceScoped() bool   { return true }
 
 func (s *storage) Get(ctx context.Context, name string, _ *metav1.GetOptions) (runtime.Object, error) {
-	return s.store.get(s.resource, genericapirequest.NamespaceValue(ctx), name)
+	byName := &metainternalversion.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.name", name)}
+	return s.store.get(s.resource, genericapirequest.NamespaceValue(ctx), name, s.needs(byName))
 }
 
 func (s *storage) List(ctx context.Context, opts *metainternalversion.ListOptions) (runtime.Object, error) {
-	objs, err := s.store.list(s.resource.Resource, genericapirequest.NamespaceValue(ctx), s.matcher(opts))
+	objs, err := s.store.list(s.resource, genericapirequest.NamespaceValue(ctx), s.matcher(opts), s.needs(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -70,6 +73,13 @@ func (s *storage) List(ctx context.Context, opts *metainternalversion.ListOption
 		return nil, err
 	}
 	return list, nil
+}
+
+// needs returns whether a response to a request with opts needs a repository's artifacts.
+func (s *storage) needs(opts *metainternalversion.ListOptions) func(repository string) bool {
+	return func(repository string) bool {
+		return s.mayReturnArtifacts != nil && s.mayReturnArtifacts(opts, s.store.project, repository)
+	}
 }
 
 // matcher returns whether an object, in a namespace, matches the selectors of opts.
@@ -111,9 +121,9 @@ func age(t metav1.Time) string {
 	return duration.HumanDuration(time.Since(t.Time))
 }
 
-// errorKind describes a failed read of Harbor without Harbor's address or response.
+// errorKind describes why a poll failed, without Harbor's address or response.
 func errorKind(err error) error {
-	for _, kind := range []error{errSlowRead, errArtifactsRead, harbor.ErrUnavailable, harbor.ErrUnauthorized, harbor.ErrForbidden, harbor.ErrNotFound} {
+	for _, kind := range []error{errSlowRead, harbor.ErrUnavailable, harbor.ErrUnauthorized, harbor.ErrForbidden, harbor.ErrNotFound} {
 		if errors.Is(err, kind) {
 			return kind
 		}

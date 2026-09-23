@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -43,7 +44,29 @@ func NewArtifacts(s *Store) *Artifacts {
 		fields: func(o runtime.Object) fields.Set {
 			return fields.Set{"status.repository": o.(*v1alpha1.HarborArtifact).Status.Repository}
 		},
+		mayReturnArtifacts: mayReturn,
 	}}
+}
+
+// mayReturn returns whether a request with opts could return artifacts of repository in project.
+func mayReturn(opts *metainternalversion.ListOptions, project, repository string) bool {
+	if opts == nil {
+		return true
+	}
+	if opts.LabelSelector != nil {
+		if label, ok := opts.LabelSelector.RequiresExactMatch(v1alpha1.RepositoryLabel); ok && label != repositoryObjectName(repository) {
+			return false
+		}
+	}
+	if opts.FieldSelector != nil {
+		if full, ok := opts.FieldSelector.RequiresExactMatch("status.repository"); ok && full != project+"/"+repository {
+			return false
+		}
+		if name, ok := opts.FieldSelector.RequiresExactMatch("metadata.name"); ok && !namesArtifactOf(name, repository) {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *Artifacts) GetSingularName() string { return "harborartifact" }

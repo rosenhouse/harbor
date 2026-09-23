@@ -108,10 +108,10 @@ const stalenessLimit = time.Minute
 
 // newUnreadFixture returns a fixture that has not read Harbor yet.
 func newUnreadFixture(h *fakeHarbor) *fixture {
-	s := NewStore(stalenessLimit, fakeNamespaces{"ns1", "ns2"})
+	s := NewStore("proj", stalenessLimit, fakeNamespaces{"ns1", "ns2"})
 	c := testingclock.NewFakeClock(time.Now())
 	s.clock = c
-	return &fixture{harbor: h, clock: c, poller: NewPoller(h, "proj", s), repositories: NewRepositories(s), artifacts: NewArtifacts(s)}
+	return &fixture{harbor: h, clock: c, poller: NewPoller(h, s), repositories: NewRepositories(s), artifacts: NewArtifacts(s)}
 }
 
 func newFixture(t *testing.T, h *fakeHarbor) *fixture {

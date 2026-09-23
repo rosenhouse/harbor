@@ -51,6 +51,12 @@ func artifactObjectName(repository, digest string) string {
 	return repositoryObjectNameWithin(repository, validation.DNS1123SubdomainMaxLength-len(suffix)) + suffix
 }
 
+// namesArtifactOf returns whether the part of name before its last dot could name repository in artifactObjectName.
+func namesArtifactOf(name, repository string) bool {
+	i := strings.LastIndex(name, ".")
+	return i >= 0 && name[:i] == repositoryObjectNameWithin(repository, validation.DNS1123SubdomainMaxLength-len(name[i:]))
+}
+
 func isHashed(objectName string) bool {
 	return hashSuffix.MatchString(objectName)
 }

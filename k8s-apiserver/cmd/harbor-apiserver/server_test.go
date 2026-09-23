@@ -108,25 +108,22 @@ func TestServerIsReadyOnceNamespacesSync(t *testing.T) {
 	waitForOK(t, h, "/readyz?verbose")
 }
 
-func TestServerIsReadyOnceItHasTriedToReadHarbor(t *testing.T) {
-	kube := fake.NewClientset(namespace("labeled", map[string]string{namespaces.ProjectLabel: "proj"}))
-	release := make(chan struct{})
-	h := startServer(t, kube, fakeHarbor{release: release})
+func TestServerIsReadyOnceItsFirstPollEnds(t *testing.T) {
+	for _, err := range []error{nil, harbor.ErrUnavailable} {
+		kube := fake.NewClientset(namespace("labeled", map[string]string{namespaces.ProjectLabel: "proj"}))
+		release := make(chan struct{})
+		o := testHarborOptions
+		// Readiness waits for the first poll, even long past the timeout.
+		o.Timeout = time.Millisecond
+		h := startServerWithOptions(t, kube, fakeHarbor{err: err, release: release}, o)
 
-	time.Sleep(50 * time.Millisecond)
-	if code, body := serve(h, "/readyz?verbose"); code != http.StatusInternalServerError || !strings.Contains(body, "[-]harbor-read failed") {
-		t.Errorf("before reading Harbor: /readyz returned %d:\n%s", code, body)
+		time.Sleep(100 * time.Millisecond)
+		if code, body := serve(h, "/readyz?verbose"); code != http.StatusInternalServerError || !strings.Contains(body, "[-]harbor-read failed") {
+			t.Errorf("%v: during the first poll: /readyz returned %d:\n%s", err, code, body)
+		}
+		close(release)
+		waitForOK(t, h, "/readyz?verbose")
 	}
-	close(release)
-	waitForOK(t, h, "/readyz?verbose")
-}
-
-func TestServerIsReadyWithinTwiceTheHarborTimeout(t *testing.T) {
-	kube := fake.NewClientset()
-	o := testHarborOptions
-	o.Timeout = 50 * time.Millisecond
-	h := startServerWithOptions(t, kube, fakeHarbor{release: make(chan struct{})}, o)
-	waitForOK(t, h, "/readyz?verbose")
 }
 
 func TestReadinessDoesNotDependOnHarbor(t *testing.T) {

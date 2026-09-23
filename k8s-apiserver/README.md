@@ -2,7 +2,7 @@
 
 harbor-apiserver is a Kubernetes aggregated API server.
 It serves a read-only view of one Harbor project's repositories and artifacts as the namespaced kinds `HarborRepository` and `HarborArtifact` in `harbor.goharbor.io/v1alpha1`.
-It supports `get` and `list`, but not `watch`, because Harbor has no change feed ([issue 10](https://github.com/rosenhouse/harbor/issues/10)).
+It supports `get` and `list`, but not `watch`, because Harbor has no change feed.
 So `kubectl get --watch`, informers, controller-runtime caches, and Argo CD don't work with these kinds, but `kubectl get` and other clients that only get and list do.
 Each replica reads the project from Harbor as a project robot account every `--harbor-poll-interval`, and serves requests from that in-memory snapshot.
 Replicas read Harbor independently, so two requests can see different snapshots.
@@ -321,9 +321,9 @@ The Deployment sets only the required ones.
 | `--harbor-username-file` | File holding the robot account name. Required. |
 | `--harbor-password-file` | File holding the robot account secret. Required. |
 | `--harbor-ca-file` | PEM bundle of CAs to trust for Harbor, in addition to the system roots. |
-| `--harbor-timeout` | Timeout for each HTTP request to Harbor. It must be positive. A list makes one request per page of 100. When the item count drops during a list, the list starts over after 1 second, up to 3 tries in all. A pod waits at most twice this for its first read of Harbor before it becomes ready. Default `10s`. |
+| `--harbor-timeout` | Timeout for each HTTP request to Harbor. It must be positive. A list makes one request per page of 100. Default `10s`. |
 | `--harbor-poll-interval` | How long to wait between reads of the project from Harbor. Each wait adds up to 10% jitter. After a read fails, the replica retries once after 1 second, and then waits this interval until a read succeeds. Default `30s`. |
-| `--harbor-staleness-limit` | How old a replica's snapshot can be before requests fail with 503. A snapshot is as old as the start of the oldest read that it holds. A read that takes longer than this fails. Just before a read ends, the snapshot's age can reach the durations of two reads plus 1.1 times `--harbor-poll-interval`, so set this well above that. It must be longer than 2.2 times `--harbor-poll-interval` plus twice `--harbor-timeout`. Default `5m`. |
+| `--harbor-staleness-limit` | How old a replica's snapshot can be before requests fail with 503. A read that takes longer than this fails. It must be longer than 2.2 times `--harbor-poll-interval` plus twice `--harbor-timeout`. Default `5m`. |
 | `--kubeconfig` | Kubeconfig for reading namespaces. Defaults to the in-cluster configuration. |
 
 The other flags are the standard secure serving, delegated authentication and authorization, and logging flags of `k8s.io/apiserver`.
@@ -335,11 +335,10 @@ Keep `-v` below 8: from 8 up, client-go logs request bodies, including TokenRevi
 Read the server's logs with `kubectl -n harbor-apiserver logs -l app=harbor-apiserver --prefix`.
 When a read of Harbor fails, the server logs the error as `"Reading Harbor failed"`.
 A read that takes longer than `--harbor-poll-interval` logs `"Reading Harbor took longer than the poll interval"`.
-Some failures of one repository's artifact list, such as a timeout while the server reads Harbor's response, don't fail the whole read.
-The server then keeps that repository's artifacts from its last read, or none if the last read did not list the repository, and logs `"Reading a repository's artifacts failed, so they stay as last read"`.
-It schedules the next read as if this one had failed.
-Once the kept artifacts are older than `--harbor-staleness-limit`, all requests for labeled namespaces fail, and each read logs `"Requests fail, because a repository's artifacts were not read within the staleness limit"` with the repository's name.
-A pod's first read has nothing to keep, so the pod fails requests at once.
+When one repository's artifact list fails without failing the read, the server logs `"Listing a repository's artifacts failed, so the server keeps those it listed before"`.
+Once that repository's artifacts are older than `--harbor-staleness-limit`, each read logs `"Requests for a repository's artifacts fail, because they were not listed within the staleness limit"`.
+Both messages name the repository.
+The [threat model](docs/threat-model.md#harbor-outages) explains which requests fail.
 
 ### The APIService is not Available
 
@@ -353,7 +352,7 @@ While it is not Available, kubectl reports that it couldn't get the resource lis
   - `CrashLoopBackOff`: the logs name the problem, such as a missing flag, an invalid `--harbor-project`, a `--harbor-staleness-limit` that is too short, a missing or empty credentials file, or an unreadable CA file.
     `exec format error` means the image was built for another architecture.
     `unable to load configmap based request-header-client-ca-file` means the RoleBinding in `kube-system` is missing.
-  - `Running` but not ready means the server has not listed namespaces yet, or has waited less than twice `--harbor-timeout` for its first read of Harbor. Check the ClusterRoleBinding `harbor-apiserver`.
+  - `Running` but not ready means the server has not listed namespaces yet, which needs the ClusterRoleBinding `harbor-apiserver`, or its first read of Harbor has not ended. `--harbor-staleness-limit` bounds that read.
 - `FailedDiscoveryCheck` with a certificate error: the `caBundle` does not match the serving certificate.
   Rerun `hack/gen-serving-cert.sh`, or check that cert-manager's CA injector is running.
 - `FailedDiscoveryCheck` with a timeout or `dial tcp` error: kube-apiserver cannot reach the pods on TCP port 6443.
@@ -361,16 +360,14 @@ While it is not Available, kubectl reports that it couldn't get the resource lis
 
 ### 503 ServiceUnavailable
 
-A replica fails requests for labeled namespaces with 503 until it first reads Harbor successfully, and again once its snapshot is older than `--harbor-staleness-limit`.
-Until then, it serves its last snapshot, even while reads fail.
-The message gives the reason:
+A 503's message gives the reason:
 
 - `harbor has not been read yet`: the replica's first read has not ended.
 - `harbor is unavailable`: the server could not reach Harbor, timed out waiting for Harbor to respond, or got a 429 or 5xx response.
   A TLS error, such as an unknown certificate authority, also shows as unavailable; set `ca.crt` as above.
 - `reading harbor takes longer than the staleness limit`: a read ran longer than `--harbor-staleness-limit`, which cancelled it, or the snapshot passed the limit while a read was running.
   Harbor is slow, or the project is too large for the limit. Raise `--harbor-staleness-limit`.
-- `reading a repository's artifacts failed`: one repository's artifacts are older than `--harbor-staleness-limit`, or the pod's first read could not read them. The logs name the repository.
+- `reading a repository's artifacts failed`: the response could include artifacts of a repository that the server has not listed within `--harbor-staleness-limit`. The logs name the repository.
 - `harbor rejected the robot account credentials`: Harbor returned 401. The robot's name or secret is wrong, or the robot is expired or disabled.
 - `harbor denied the robot account access`: Harbor returned 403. The project does not exist, the robot lacks a permission above, or the robot belongs to another project.
 - `not found in harbor`: Harbor returned 404 when listing repositories. Check that `url` is Harbor's base URL, such as `https://harbor.example.com` without `/api/v2.0`, and that it reaches Harbor rather than another server.

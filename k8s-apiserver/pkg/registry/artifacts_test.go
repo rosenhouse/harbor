@@ -217,23 +217,34 @@ func TestListArtifactsInDisallowedNamespace(t *testing.T) {
 	}
 }
 
-func TestListArtifactsWithSelectors(t *testing.T) {
-	byLabel := func(value string) *metainternalversion.ListOptions {
-		return &metainternalversion.ListOptions{LabelSelector: labels.SelectorFromSet(labels.Set{v1alpha1.RepositoryLabel: value})}
-	}
-	byFields := func(set fields.Set) *metainternalversion.ListOptions {
-		return &metainternalversion.ListOptions{FieldSelector: fields.SelectorFromSet(set)}
-	}
-	byRepository := func(value string) *metainternalversion.ListOptions {
-		return byFields(fields.Set{"status.repository": value})
-	}
-	byName := func(value string) *metainternalversion.ListOptions {
-		return byFields(fields.Set{"metadata.name": value})
-	}
-	notTeamAPI, err := labels.Parse(v1alpha1.RepositoryLabel + "!=team.api")
+func byLabel(value string) *metainternalversion.ListOptions {
+	return &metainternalversion.ListOptions{LabelSelector: labels.SelectorFromSet(labels.Set{v1alpha1.RepositoryLabel: value})}
+}
+
+func byFields(set fields.Set) *metainternalversion.ListOptions {
+	return &metainternalversion.ListOptions{FieldSelector: fields.SelectorFromSet(set)}
+}
+
+func byRepository(value string) *metainternalversion.ListOptions {
+	return byFields(fields.Set{"status.repository": value})
+}
+
+func byName(value string) *metainternalversion.ListOptions {
+	return byFields(fields.Set{"metadata.name": value})
+}
+
+// byLabelSelector lists with a label selector such as "a!=b".
+func byLabelSelector(selector string) *metainternalversion.ListOptions {
+	s, err := labels.Parse(selector)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
+	return &metainternalversion.ListOptions{LabelSelector: s}
+}
+
+var notTeamAPI = byLabelSelector(v1alpha1.RepositoryLabel + "!=team.api")
+
+func TestListArtifactsWithSelectors(t *testing.T) {
 	a, _ := newArtifacts(t)
 	for _, tc := range []struct {
 		desc string
@@ -243,7 +254,7 @@ func TestListArtifactsWithSelectors(t *testing.T) {
 		{"label", byLabel("team.api"), []string{"team.api.sha256-aaaaaaaaaaaa"}},
 		{"hashed label", byLabel(repositoryObjectName("dotted.name")), []string{dottedArtifact}},
 		{"missing label", byLabel("missing"), nil},
-		{"label inequality", &metainternalversion.ListOptions{LabelSelector: notTeamAPI}, []string{dottedArtifact, "nginx.sha256-111111111111", "nginx.sha256-222222222222"}},
+		{"label inequality", notTeamAPI, []string{dottedArtifact, "nginx.sha256-111111111111", "nginx.sha256-222222222222"}},
 		{"repository", byRepository("proj/team/api"), []string{"team.api.sha256-aaaaaaaaaaaa"}},
 		{"dotted repository", byRepository("proj/dotted.name"), []string{dottedArtifact}},
 		{"repository and label", &metainternalversion.ListOptions{
