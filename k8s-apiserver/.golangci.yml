@@ -1,0 +1,14 @@
+version: "2"
+linters:
+  default: standard
+  enable:
+    - misspell
+    - unconvert
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/rosenhouse/harbor/k8s-apiserver

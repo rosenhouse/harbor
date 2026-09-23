@@ -1,0 +1,30 @@
+name: k8s-apiserver
+
+on:
+  push:
+    branches: [agg]
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: k8s-apiserver
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: k8s-apiserver/go.mod
+          cache-dependency-path: k8s-apiserver/go.sum
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: hack/verify-codegen.sh
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+          working-directory: k8s-apiserver
