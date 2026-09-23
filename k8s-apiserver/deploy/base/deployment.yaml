@@ -37,6 +37,8 @@ spec:
             - --harbor-project=$(HARBOR_PROJECT)
             - --harbor-username-file=/etc/harbor/username
             - --harbor-password-file=/etc/harbor/password
+            - --tls-cert-file=/etc/tls/tls.crt
+            - --tls-private-key-file=/etc/tls/tls.key
           env:
             - name: HARBOR_URL
               valueFrom:
@@ -76,7 +78,14 @@ spec:
             - name: harbor
               mountPath: /etc/harbor
               readOnly: true
+            - name: tls
+              mountPath: /etc/tls
+              readOnly: true
       volumes:
         - name: harbor
           secret:
             secretName: harbor-apiserver
+        # deploy/cert-manager or hack/gen-serving-cert.sh creates this Secret.
+        - name: tls
+          secret:
+            secretName: harbor-apiserver-tls

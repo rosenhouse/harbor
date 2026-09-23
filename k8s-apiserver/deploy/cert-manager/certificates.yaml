@@ -1,0 +1,50 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: harbor-apiserver-selfsigned
+  namespace: harbor-apiserver
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: harbor-apiserver-ca
+  namespace: harbor-apiserver
+spec:
+  isCA: true
+  commonName: harbor-apiserver-ca
+  duration: 87600h
+  secretName: harbor-apiserver-ca
+  privateKey:
+    algorithm: ECDSA
+    # Serving certificates signed before a CA renewal verify against the renewed CA.
+    rotationPolicy: Never
+  issuerRef:
+    kind: Issuer
+    name: harbor-apiserver-selfsigned
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: harbor-apiserver-ca
+  namespace: harbor-apiserver
+spec:
+  ca:
+    secretName: harbor-apiserver-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: harbor-apiserver
+  namespace: harbor-apiserver
+spec:
+  secretName: harbor-apiserver-tls
+  dnsNames:
+    - harbor-apiserver.harbor-apiserver.svc
+    - harbor-apiserver.harbor-apiserver.svc.cluster.local
+  privateKey:
+    algorithm: ECDSA
+  issuerRef:
+    kind: Issuer
+    name: harbor-apiserver-ca

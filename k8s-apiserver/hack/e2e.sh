@@ -56,6 +56,7 @@ docker save "$image" | kind load image-archive --name "$cluster" /dev/stdin
 
 existing=$(kubectl -n harbor-apiserver get deployment harbor-apiserver --ignore-not-found -o name)
 kubectl apply -k hack/e2e
+hack/gen-serving-cert.sh
 if [ -n "$existing" ]; then
   kubectl -n harbor-apiserver rollout restart deployment/harbor-apiserver
 fi

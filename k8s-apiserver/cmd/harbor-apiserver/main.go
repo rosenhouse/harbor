@@ -11,11 +11,10 @@ import (
 )
 
 func main() {
-	os.Exit(cli.Run(newCommand()))
+	os.Exit(cli.Run(newCommand(newOptions())))
 }
 
-func newCommand() *cobra.Command {
-	o := newOptions()
+func newCommand(o *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "harbor-apiserver",
 		Args:         cobra.NoArgs,
