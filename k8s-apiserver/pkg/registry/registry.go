@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/duration"
-	"k8s.io/apimachinery/pkg/watch"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
@@ -30,12 +29,19 @@ type Harbor interface {
 	ListArtifacts(ctx context.Context, project, repository string) ([]harbor.Artifact, error)
 }
 
+// Namespaces decides which namespaces see the project.
+type Namespaces interface {
+	Allows(namespace string) bool
+	Namespaces() []string
+}
+
 type object interface {
 	runtime.Object
 	metav1.Object
 }
 
 // storage serves one resource from a Store.
+// It ignores resourceVersion, since it serves only the last read of Harbor, and its objects have none.
 type storage struct {
 	store     *Store
 	resource  schema.GroupResource
@@ -50,12 +56,12 @@ func (s *storage) NewList() runtime.Object { return s.newList() }
 func (s *storage) Destroy()                {}
 func (s *storage) NamespaceScoped() bool   { return true }
 
-func (s *storage) Get(ctx context.Context, name string, opts *metav1.GetOptions) (runtime.Object, error) {
-	return s.store.get(s.resource, genericapirequest.NamespaceValue(ctx), name, opts)
+func (s *storage) Get(ctx context.Context, name string, _ *metav1.GetOptions) (runtime.Object, error) {
+	return s.store.get(s.resource, genericapirequest.NamespaceValue(ctx), name)
 }
 
 func (s *storage) List(ctx context.Context, opts *metainternalversion.ListOptions) (runtime.Object, error) {
-	objs, rv, err := s.store.list(s.resource.Resource, genericapirequest.NamespaceValue(ctx), opts, s.matcher(opts))
+	objs, err := s.store.list(s.resource.Resource, genericapirequest.NamespaceValue(ctx), s.matcher(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -63,12 +69,7 @@ func (s *storage) List(ctx context.Context, opts *metainternalversion.ListOption
 	if err := meta.SetList(list, objs); err != nil {
 		return nil, err
 	}
-	list.(metav1.ListInterface).SetResourceVersion(rv)
 	return list, nil
-}
-
-func (s *storage) Watch(ctx context.Context, opts *metainternalversion.ListOptions) (watch.Interface, error) {
-	return s.store.watch(ctx, s.resource.Resource, genericapirequest.NamespaceValue(ctx), s.matcher(opts), opts, s.newObject)
 }
 
 // matcher returns whether an object, in a namespace, matches the selectors of opts.

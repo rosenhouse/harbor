@@ -22,7 +22,6 @@ type Repositories struct {
 var (
 	_ rest.Getter               = &Repositories{}
 	_ rest.Lister               = &Repositories{}
-	_ rest.Watcher              = &Repositories{}
 	_ rest.Scoper               = &Repositories{}
 	_ rest.SingularNameProvider = &Repositories{}
 )

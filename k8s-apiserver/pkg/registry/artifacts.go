@@ -29,7 +29,6 @@ type Artifacts struct {
 var (
 	_ rest.Getter               = &Artifacts{}
 	_ rest.Lister               = &Artifacts{}
-	_ rest.Watcher              = &Artifacts{}
 	_ rest.Scoper               = &Artifacts{}
 	_ rest.SingularNameProvider = &Artifacts{}
 	_ rest.TableConvertor       = &Artifacts{}

@@ -49,14 +49,11 @@ func run(ctx context.Context, o *options) error {
 // newServer returns a server that polls Harbor.
 // It is ready once it has read the labeled namespaces from kube and has tried to read Harbor, waiting at most twice o.Timeout for Harbor.
 func newServer(c genericapiserver.CompletedConfig, kube kubernetes.Interface, h registry.Harbor, o *harborOptions) (*genericapiserver.GenericAPIServer, error) {
-	store := registry.NewStore(o.StalenessLimit)
 	factory := informers.NewSharedInformerFactoryWithOptions(kube, 0, informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
 		opts.LabelSelector = namespaces.ProjectLabel
 	}))
-	namespacesSeen, err := namespaces.Watch(factory.Core().V1().Namespaces().Informer(), o.Project, store.SetNamespace)
-	if err != nil {
-		return nil, err
-	}
+	namespaceInformer := factory.Core().V1().Namespaces()
+	store := registry.NewStore(o.StalenessLimit, namespaces.NewGate(namespaceInformer.Lister(), o.Project))
 	s, err := apiserver.New(c, store)
 	if err != nil {
 		return nil, err
@@ -80,7 +77,7 @@ func newServer(c genericapiserver.CompletedConfig, kube kubernetes.Interface, h 
 	}
 	err = s.AddReadyzChecks(
 		healthz.NamedCheck("namespaces-synced", func(*http.Request) error {
-			if !namespacesSeen.HasSynced() {
+			if !namespaceInformer.Informer().HasSynced() {
 				return errors.New("namespace informer has not synced")
 			}
 			return nil

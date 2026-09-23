@@ -59,19 +59,13 @@ var dottedRepository = repositoryObjectName("dotted.name")
 
 func TestListRepositories(t *testing.T) {
 	r, _ := newRepositories(t)
-	obj, err := r.List(inNamespace("ns1"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	list := obj.(*v1alpha1.HarborRepositoryList)
-	items := list.Items
+	items := listItems(t, r, "ns1", nil)
 
 	want := v1alpha1.HarborRepository{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "nginx",
 			Namespace:         "ns1",
 			UID:               "00574b18-6628-5e46-960b-b7011fb281e7",
-			ResourceVersion:   items[1].ResourceVersion,
 			CreationTimestamp: metav1.NewTime(created),
 		},
 		Status: v1alpha1.HarborRepositoryStatus{
@@ -90,11 +84,6 @@ func TestListRepositories(t *testing.T) {
 	}
 	if items[2].Status.UpdateTime != nil {
 		t.Errorf("team/api has update time %v, want none", items[2].Status.UpdateTime)
-	}
-	for _, item := range items {
-		if parseRV(t, item.ResourceVersion) > parseRV(t, list.ResourceVersion) {
-			t.Errorf("%s has resourceVersion %s, after the list's %s", item.Name, item.ResourceVersion, list.ResourceVersion)
-		}
 	}
 }
 
@@ -187,7 +176,6 @@ func TestRequestsDoNotCallHarbor(t *testing.T) {
 	if _, err := r.Get(inNamespace("ns1"), "nginx", &metav1.GetOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	startWatch(t, r, "", &metainternalversion.ListOptions{ResourceVersion: "0"})
 	if len(f.harbor.calls) > 0 {
 		t.Errorf("called Harbor: %v", f.harbor.calls)
 	}

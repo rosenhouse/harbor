@@ -87,8 +87,7 @@ func TestPollStopsAtFailureOfHarbor(t *testing.T) {
 	for _, err := range []error{harbor.ErrUnavailable, harbor.ErrUnauthorized, harbor.ErrForbidden} {
 		h := artifactHarbor()
 		f := failingArtifacts{h, err, make(chan string, len(h.repositories))}
-		s := NewStore(stalenessLimit)
-		s.SetNamespace("ns1", true)
+		s := NewStore(stalenessLimit, fakeNamespaces{"ns1"})
 		if got := NewPoller(f, "proj", s).Poll(t.Context()); !errors.Is(got, err) {
 			t.Errorf("poll returned %v, want %v", got, err)
 		}
@@ -206,8 +205,7 @@ func TestPollEndsAtTheStalenessLimit(t *testing.T) {
 		fmt.Errorf("%w: %w", harbor.ErrUnavailable, context.DeadlineExceeded),
 		fmt.Errorf("decoding a response: %w", context.DeadlineExceeded),
 	} {
-		s := NewStore(50 * time.Millisecond)
-		s.SetNamespace("ns1", true)
+		s := NewStore(50*time.Millisecond, fakeNamespaces{"ns1"})
 		if got := NewPoller(slowArtifacts{err}, "proj", s).Poll(t.Context()); !errors.Is(got, errSlowRead) {
 			t.Errorf("%v: poll returned %v, want %v", err, got, errSlowRead)
 		}

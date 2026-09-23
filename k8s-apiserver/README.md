@@ -2,10 +2,11 @@
 
 harbor-apiserver is a Kubernetes aggregated API server.
 It serves a read-only view of one Harbor project's repositories and artifacts as the namespaced kinds `HarborRepository` and `HarborArtifact` in `harbor.goharbor.io/v1alpha1`.
-It supports `get`, `list`, and `watch`.
+It supports `get` and `list`, but not `watch`, because Harbor has no change feed ([issue 10](https://github.com/rosenhouse/harbor/issues/10)).
+So `kubectl get --watch`, informers, controller-runtime caches, and Argo CD don't work with these kinds, but `kubectl get` and other clients that only get and list do.
 Each replica reads the project from Harbor as a project robot account every `--harbor-poll-interval`, and serves requests from that in-memory snapshot.
+Replicas read Harbor independently, so two requests can see different snapshots.
 Requests fail with 503 until a replica first reads Harbor successfully, and again once its snapshot is older than `--harbor-staleness-limit`.
-Open watches then end with an error.
 A namespace sees the project only when it has the label `harbor.goharbor.io/project=<project>`.
 
 Kubernetes RBAC and that label are the only access controls.
@@ -246,7 +247,7 @@ spec:
 
 ## Grant access
 
-The ClusterRole `harbor.goharbor.io:view` grants `get`, `list`, and `watch` on both kinds.
+The ClusterRole `harbor.goharbor.io:view` grants `get` and `list` on both kinds.
 It aggregates into the built-in `view` role, and so into `edit` and `admin`.
 Everyone who can view a labeled namespace can read the whole project there.
 
@@ -265,7 +266,7 @@ Then bind the role explicitly:
 kubectl -n my-namespace create rolebinding harbor-readers --clusterrole=harbor.goharbor.io:view --group=my-team
 ```
 
-Listing or watching across all namespaces needs cluster-wide `list` or `watch`, and returns a copy of the project for each labeled namespace.
+Listing across all namespaces needs cluster-wide `list`, and returns a copy of the project for each labeled namespace.
 
 ## Use
 
@@ -308,24 +309,6 @@ sha256:c78a0b5f2b067d7f1fce102453eac8a9f6a2a557ede231774cb293ed8b4c9308
 The label is missing when the `HarborRepository` name is longer than 63 characters.
 Select by field instead.
 
-A watch sees changes in Harbor within about `--harbor-poll-interval`:
-
-```console
-$ kubectl -n my-namespace get harborrepositories --watch
-NAME                      ARTIFACTS   PULLS   AGE
-app                       2           14      14d
-team.api                  1           3       5d
-web.frontend-bf9624cbaa   1           0       2h
-app                       3           14      14d
-```
-
-Each replica numbers its own resourceVersions, so a watch must reach the replica that served the list before it ([issue 25](https://github.com/rosenhouse/harbor/issues/25)).
-With kube-apiserver's default routing, the Service's `sessionAffinity: ClientIP` sends each kube-apiserver's requests to one replica.
-A watch can reach another replica when kube-apiserver runs with `--enable-aggregator-routing`, which picks a pod for each request, or when the client reconnects through another kube-apiserver.
-A watch from a resourceVersion of another replica, or of a pod before it restarted, fails with 410 Gone.
-Informers then list again, and `kubectl get --watch` exits.
-For the same reasons, a client can see resourceVersions go backwards.
-
 ## Flags
 
 These flags are specific to harbor-apiserver.
@@ -340,7 +323,7 @@ The Deployment sets only the required ones.
 | `--harbor-ca-file` | PEM bundle of CAs to trust for Harbor, in addition to the system roots. |
 | `--harbor-timeout` | Timeout for each HTTP request to Harbor. It must be positive. A list makes one request per page of 100. When the item count drops during a list, the list starts over after 1 second, up to 3 tries in all. A pod waits at most twice this for its first read of Harbor before it becomes ready. Default `10s`. |
 | `--harbor-poll-interval` | How long to wait between reads of the project from Harbor. Each wait adds up to 10% jitter. After a read fails, the replica retries once after 1 second, and then waits this interval until a read succeeds. Default `30s`. |
-| `--harbor-staleness-limit` | How old a replica's snapshot can be before requests fail with 503 and open watches end. A snapshot is as old as the start of the oldest read that it holds. A read that takes longer than this fails. Just before a read ends, the snapshot's age can reach the durations of two reads plus 1.1 times `--harbor-poll-interval`, so set this well above that. It must be longer than 2.2 times `--harbor-poll-interval` plus twice `--harbor-timeout`. Default `5m`. |
+| `--harbor-staleness-limit` | How old a replica's snapshot can be before requests fail with 503. A snapshot is as old as the start of the oldest read that it holds. A read that takes longer than this fails. Just before a read ends, the snapshot's age can reach the durations of two reads plus 1.1 times `--harbor-poll-interval`, so set this well above that. It must be longer than 2.2 times `--harbor-poll-interval` plus twice `--harbor-timeout`. Default `5m`. |
 | `--kubeconfig` | Kubeconfig for reading namespaces. Defaults to the in-cluster configuration. |
 
 The other flags are the standard secure serving, delegated authentication and authorization, and logging flags of `k8s.io/apiserver`.

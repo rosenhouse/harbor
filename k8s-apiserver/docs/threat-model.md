@@ -15,7 +15,7 @@ This model covers an install from `deploy/` as the [README](../README.md) descri
 
 ## Actors
 
-- **Namespace users** can get, list, or watch the two kinds in a namespace, usually through the `view`, `edit`, or `admin` role.
+- **Namespace users** can get or list the two kinds in a namespace, usually through the `view`, `edit`, or `admin` role.
 - **Namespace-label writers** can create namespaces or change their labels, directly or through a tool.
 - **Cluster admins** can read Secrets and change RBAC, the APIService, and the `harbor-apiserver` namespace.
 - **Harbor admins** manage the project, its visibility, and the robot account.
@@ -46,7 +46,7 @@ This model covers an install from `deploy/` as the [README](../README.md) descri
 ### Every authorized user sees what the robot sees
 
 The server does not filter by user or by repository.
-Anyone allowed to list or watch either kind in a labeled namespace sees every repository and artifact that the robot can list.
+Anyone allowed to list either kind in a labeled namespace sees every repository and artifact that the robot can list.
 `harbor.goharbor.io:view` aggregates into `view`, so this includes every user and ServiceAccount bound to `view`, `edit`, or `admin` there.
 Harbor project membership does not apply to Kubernetes users.
 
@@ -59,7 +59,7 @@ Residual risk: access is all or nothing per namespace, and a cluster can hold on
 
 ### Namespace-label writers grant visibility
 
-A namespace sees the project when it has `harbor.goharbor.io/project=<project>` ([watch.go](../pkg/namespaces/watch.go)).
+A namespace sees the project when it has `harbor.goharbor.io/project=<project>` ([gate.go](../pkg/namespaces/gate.go)).
 Anyone who can create namespaces or update their labels can grant that.
 The built-in `admin` and `edit` roles cannot change a Namespace object, but many clusters let tenants set namespace labels in other ways:
 
@@ -73,7 +73,7 @@ Mitigations:
 - Restrict the label with the ValidatingAdmissionPolicy in the [README](../README.md#label-namespaces), which lets only one group set, change, or remove it.
 
 Residual risk: visibility depends on cluster governance outside this server.
-Removing the label revokes visibility as soon as each replica's namespace informer sees the change, and open watches then see each object deleted.
+Removing the label revokes visibility as soon as each replica's namespace informer sees the change.
 
 ### Harbor cannot attribute reads to Kubernetes users
 
@@ -94,7 +94,6 @@ The e2e test `TestDelegatedAuthorization` checks this.
 They do bypass kube-apiserver's audit log and its API Priority and Fairness.
 harbor-apiserver caches authentication and authorization decisions for 10 seconds, so revoking a direct caller's access takes up to 10 seconds.
 kube-apiserver authorizes the requests that it proxies itself, so revocation applies to them at once.
-Either way, a watch that is already open continues until it ends.
 
 At `-v` 8 or higher, client-go logs request bodies, including the TokenReviews that carry direct callers' bearer tokens, so keep `-v` below 8.
 
@@ -193,7 +192,7 @@ Limits:
 - [client.go](../pkg/harbor/client.go) reads at most 1000 pages per list and 16 MiB per response, and fails the list beyond either.
 - `--harbor-timeout` (10s) bounds each Harbor request, and `--harbor-staleness-limit` (5m) bounds each poll.
 - Each replica has at most 4 Harbor requests in flight.
-- Each replica serves at most 400 read requests at once, but watches don't count toward this limit.
+- Each replica serves at most 400 read requests at once.
 - kube-apiserver's API Priority and Fairness applies to the requests it proxies, but not to direct calls to the Service.
 
 Residual risk: Harbor's load grows with the project's size and the number of replicas, but not with Kubernetes requests.
@@ -201,7 +200,7 @@ A poll that fails partway, such as on a 429 response, starts over from the repos
 The server ignores `limit` and `continue`.
 
 The page and size limits do not bound memory in practice.
-Each replica holds the project in memory, along with a log of about the last 10000 object changes, which watches resume from ([store.go](../pkg/registry/store.go)).
+Each replica holds the project in memory ([store.go](../pkg/registry/store.go)).
 A list holds every object in memory, once per labeled namespace, and then encodes the whole response.
 The pods request 64 MiB of memory, and have no memory limit and no priority class.
 So a list of a large project across all namespaces, such as from a monitoring or dashboard ServiceAccount with cluster-wide `list`, or a few concurrent lists, can grow a pod far beyond its request.
@@ -213,7 +212,7 @@ Not yet done: a memory limit with headroom, a cap on the objects or bytes in a r
 
 A failed poll leaves the replica's last good snapshot in place ([poll.go](../pkg/registry/poll.go)).
 The replica serves that snapshot until it is older than `--harbor-staleness-limit` (5m).
-Then it fails requests for labeled namespaces with 503, and ends open watches there with the same error ([store.go](../pkg/registry/store.go)).
+Then it fails requests for labeled namespaces with 503 ([store.go](../pkg/registry/store.go)).
 Connection errors, timeouts before Harbor responds, and 429 and 5xx responses give the message `harbor is unavailable`.
 A timeout or dropped connection while the server reads the repository list's response gives `unexpected error reading harbor` instead ([client.go](../pkg/harbor/client.go)).
 A poll that runs longer than `--harbor-staleness-limit` fails, and gives `reading harbor takes longer than the staleness limit`.

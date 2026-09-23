@@ -108,7 +108,6 @@ func TestListArtifacts(t *testing.T) {
 			Name:              "team.api.sha256-aaaaaaaaaaaa",
 			Namespace:         "ns1",
 			UID:               "7167cbdd-03b7-5234-aca1-8f6755c64a8a",
-			ResourceVersion:   items[3].ResourceVersion,
 			CreationTimestamp: metav1.NewTime(pushed),
 			Labels:            map[string]string{v1alpha1.RepositoryLabel: "team.api"},
 		},

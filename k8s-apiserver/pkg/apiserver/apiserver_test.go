@@ -10,15 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/dynamicinformer"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 
-	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apis/harbor/v1alpha1"
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apiserver"
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/registry"
@@ -29,37 +23,31 @@ var kinds = []struct{ resource, kind string }{
 	{"harborartifacts", "HarborArtifact"},
 }
 
-// fakeHarbor serves repositories, of which team/api has an artifact.
-type fakeHarbor struct {
-	repositories []harbor.Repository
+type fakeHarbor struct{}
+
+func (fakeHarbor) ListRepositories(context.Context, string) ([]harbor.Repository, error) {
+	return []harbor.Repository{{ID: 1, Name: "proj/team/api", ArtifactCount: 2, PullCount: 3}}, nil
 }
 
-func (h *fakeHarbor) ListRepositories(context.Context, string) ([]harbor.Repository, error) {
-	return h.repositories, nil
-}
-
-func (h *fakeHarbor) ListArtifacts(_ context.Context, _, repository string) ([]harbor.Artifact, error) {
+func (fakeHarbor) ListArtifacts(_ context.Context, _, repository string) ([]harbor.Artifact, error) {
 	if repository != "team/api" {
-		return nil, nil
+		return nil, harbor.ErrNotFound
 	}
 	return []harbor.Artifact{{ID: 1, Digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Type: "IMAGE"}}, nil
 }
 
-// server serves project "proj" to the namespace "allowed".
-type server struct {
-	http.Handler
-	harbor *fakeHarbor
-	poller *registry.Poller
-}
+// allowed lets only the "allowed" namespace see the project.
+type allowed struct{}
 
-func newServer(t *testing.T) *server {
+func (allowed) Allows(ns string) bool { return ns == "allowed" }
+func (allowed) Namespaces() []string  { return []string{"allowed"} }
+
+func newHandler(t *testing.T) http.Handler {
 	t.Helper()
-	h := &fakeHarbor{repositories: []harbor.Repository{{ID: 1, Name: "proj/team/api", ArtifactCount: 1, PullCount: 3}}}
-	store := registry.NewStore(time.Minute)
-	store.SetNamespace("allowed", true)
-	poller := registry.NewPoller(h, "proj", store)
-	_ = poller.Poll(t.Context())
-
+	store := registry.NewStore(time.Minute, allowed{})
+	if err := registry.NewPoller(fakeHarbor{}, "proj", store).Poll(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	c := apiserver.NewConfig()
 	c.ExternalAddress = "localhost:443"
 	c.LoopbackClientConfig = &restclient.Config{}
@@ -67,7 +55,7 @@ func newServer(t *testing.T) *server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &server{Handler: s.PrepareRun().Handler, harbor: h, poller: poller}
+	return s.PrepareRun().Handler
 }
 
 func get(t *testing.T, h http.Handler, path string, accept ...string) *httptest.ResponseRecorder {
@@ -93,7 +81,7 @@ func decode(t *testing.T, rec *httptest.ResponseRecorder, wantCode int, into any
 
 func TestDiscovery(t *testing.T) {
 	var list metav1.APIResourceList
-	decode(t, get(t, newServer(t), "/apis/harbor.goharbor.io/v1alpha1"), http.StatusOK, &list)
+	decode(t, get(t, newHandler(t), "/apis/harbor.goharbor.io/v1alpha1"), http.StatusOK, &list)
 
 	if len(list.APIResources) != len(kinds) {
 		t.Fatalf("got %d resources, want %d: %+v", len(list.APIResources), len(kinds), list.APIResources)
@@ -108,14 +96,14 @@ func TestDiscovery(t *testing.T) {
 		if r.Kind != k.kind || !r.Namespaced || r.SingularName != strings.ToLower(k.kind) {
 			t.Errorf("resource %q: kind %q, namespaced %v, singular %q", r.Name, r.Kind, r.Namespaced, r.SingularName)
 		}
-		if verbs := slices.Sorted(slices.Values(r.Verbs)); !slices.Equal(verbs, []string{"get", "list", "watch"}) {
-			t.Errorf("resource %q has verbs %v, want [get list watch]", r.Name, verbs)
+		if verbs := slices.Sorted(slices.Values(r.Verbs)); !slices.Equal(verbs, []string{"get", "list"}) {
+			t.Errorf("resource %q has verbs %v, want [get list]", r.Name, verbs)
 		}
 	}
 }
 
 func TestListIsEmptyOutsideAllowedNamespaces(t *testing.T) {
-	h := newServer(t)
+	h := newHandler(t)
 	for _, k := range kinds {
 		var list struct {
 			Kind  string
@@ -128,8 +116,21 @@ func TestListIsEmptyOutsideAllowedNamespaces(t *testing.T) {
 	}
 }
 
+func TestWatchIsNotSupported(t *testing.T) {
+	h := newHandler(t)
+	for _, k := range kinds {
+		for _, path := range []string{"/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/", "/apis/harbor.goharbor.io/v1alpha1/"} {
+			var status metav1.Status
+			decode(t, get(t, h, path+k.resource+"?watch=true"), http.StatusMethodNotAllowed, &status)
+			if status.Reason != metav1.StatusReasonMethodNotAllowed {
+				t.Errorf("%s: reason %q", path+k.resource, status.Reason)
+			}
+		}
+	}
+}
+
 func TestGetIsNotFound(t *testing.T) {
-	h := newServer(t)
+	h := newHandler(t)
 	for _, k := range kinds {
 		var status metav1.Status
 		decode(t, get(t, h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/default/"+k.resource+"/x"), http.StatusNotFound, &status)
@@ -141,7 +142,7 @@ func TestGetIsNotFound(t *testing.T) {
 
 func TestRepositoryTable(t *testing.T) {
 	var table metav1.Table
-	decode(t, get(t, newServer(t), "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborrepositories",
+	decode(t, get(t, newHandler(t), "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborrepositories",
 		"application/json;as=Table;v=v1;g=meta.k8s.io"), http.StatusOK, &table)
 	if len(table.Rows) != 1 || table.Rows[0].Cells[0] != "team.api" {
 		t.Errorf("rows %+v", table.Rows)
@@ -149,7 +150,7 @@ func TestRepositoryTable(t *testing.T) {
 }
 
 func TestArtifactTable(t *testing.T) {
-	h := newServer(t)
+	h := newHandler(t)
 	var table metav1.Table
 	decode(t, get(t, h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborartifacts",
 		"application/json;as=Table;v=v1;g=meta.k8s.io"), http.StatusOK, &table)
@@ -165,7 +166,7 @@ func TestArtifactTable(t *testing.T) {
 }
 
 func TestFieldSelectors(t *testing.T) {
-	h := newServer(t)
+	h := newHandler(t)
 	for _, tc := range []struct {
 		resource, selector  string
 		wantCode, wantItems int
@@ -195,7 +196,7 @@ func TestFieldSelectors(t *testing.T) {
 }
 
 func TestProtobufFallsBackToJSON(t *testing.T) {
-	rec := get(t, newServer(t), "/apis/harbor.goharbor.io/v1alpha1/harborrepositories",
+	rec := get(t, newHandler(t), "/apis/harbor.goharbor.io/v1alpha1/harborrepositories",
 		"application/vnd.kubernetes.protobuf", "application/json")
 	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/json" {
 		t.Errorf("status %d, content type %q", rec.Code, rec.Header().Get("Content-Type"))
@@ -203,7 +204,7 @@ func TestProtobufFallsBackToJSON(t *testing.T) {
 }
 
 func TestOpenAPI(t *testing.T) {
-	h := newServer(t)
+	h := newHandler(t)
 	for _, tc := range []struct{ path, definitions string }{
 		{"/openapi/v2", "definitions"},
 		{"/openapi/v3/apis/harbor.goharbor.io/v1alpha1", "components.schemas"},
@@ -222,105 +223,5 @@ func TestOpenAPI(t *testing.T) {
 				t.Errorf("%s: %s has GVKs %s, want %s", tc.path, k.kind, gvks, want)
 			}
 		}
-	}
-}
-
-// startWatch requests a watch and returns a decoder of its events.
-func startWatch(t *testing.T, s *server, query string, accept ...string) *json.Decoder {
-	t.Helper()
-	ts := httptest.NewServer(s)
-	t.Cleanup(ts.Close)
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	t.Cleanup(cancel)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborrepositories?watch=true&"+query, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(accept) > 0 {
-		req.Header.Set("Accept", strings.Join(accept, ","))
-	}
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = resp.Body.Close() })
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status %d", resp.StatusCode)
-	}
-	return json.NewDecoder(resp.Body)
-}
-
-func TestWatchStreamsEvents(t *testing.T) {
-	s := newServer(t)
-	var list v1alpha1.HarborRepositoryList
-	decode(t, get(t, s, "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborrepositories"), http.StatusOK, &list)
-	events := startWatch(t, s, "resourceVersion="+list.ResourceVersion)
-
-	s.harbor.repositories[0].PullCount++
-	_ = s.poller.Poll(t.Context())
-
-	var event struct {
-		Type   string
-		Object v1alpha1.HarborRepository
-	}
-	if err := events.Decode(&event); err != nil {
-		t.Fatal(err)
-	}
-	if event.Type != "MODIFIED" || event.Object.Namespace != "allowed" || event.Object.Name != "team.api" || event.Object.Status.PullCount != 4 {
-		t.Errorf("got %s %s/%s with %d pulls", event.Type, event.Object.Namespace, event.Object.Name, event.Object.Status.PullCount)
-	}
-}
-
-func TestInformer(t *testing.T) {
-	s := newServer(t)
-	ts := httptest.NewServer(s)
-	t.Cleanup(ts.Close)
-	client, err := dynamic.NewForConfig(&restclient.Config{Host: ts.URL})
-	if err != nil {
-		t.Fatal(err)
-	}
-	gvr := v1alpha1.SchemeGroupVersion.WithResource("harborrepositories")
-	informer := dynamicinformer.NewFilteredDynamicInformer(client, gvr, "allowed", 0, cache.Indexers{}, nil).Informer()
-	added := make(chan string, 10)
-	_, err = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) { added <- obj.(*unstructured.Unstructured).GetName() },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	go informer.RunWithContext(t.Context())
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
-		t.Fatal("informer did not sync")
-	}
-
-	s.harbor.repositories = append(s.harbor.repositories, harbor.Repository{ID: 2, Name: "proj/new"})
-	_ = s.poller.Poll(t.Context())
-	var got []string
-	for len(got) < 2 {
-		select {
-		case name := <-added:
-			got = append(got, name)
-		case <-ctx.Done():
-			t.Fatalf("informer added only %v", got)
-		}
-	}
-	if diff := cmp.Diff([]string{"team.api", "new"}, got); diff != "" {
-		t.Errorf("added (-want +got):\n%s", diff)
-	}
-}
-
-func TestWatchTable(t *testing.T) {
-	events := startWatch(t, newServer(t), "resourceVersion=0", "application/json;as=Table;v=v1;g=meta.k8s.io")
-	var event struct {
-		Type   string
-		Object metav1.Table
-	}
-	if err := events.Decode(&event); err != nil {
-		t.Fatal(err)
-	}
-	if event.Type != "ADDED" || len(event.Object.Rows) != 1 || event.Object.Rows[0].Cells[0] != "team.api" {
-		t.Errorf("got %s %+v", event.Type, event.Object.Rows)
 	}
 }

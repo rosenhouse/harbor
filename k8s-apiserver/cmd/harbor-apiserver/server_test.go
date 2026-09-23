@@ -48,7 +48,7 @@ func namespace(name string, labels map[string]string) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
 }
 
-var testHarborOptions = harborOptions{Project: "proj", PollInterval: 10 * time.Millisecond, StalenessLimit: time.Minute}
+var testHarborOptions = harborOptions{Project: "proj", Timeout: time.Minute, PollInterval: 10 * time.Millisecond, StalenessLimit: time.Minute}
 
 // startServer runs the post-start hooks of a server for project "proj" and returns its handler.
 func startServer(t *testing.T, kube *fake.Clientset, h fakeHarbor) http.Handler {
@@ -111,9 +111,7 @@ func TestServerIsReadyOnceNamespacesSync(t *testing.T) {
 func TestServerIsReadyOnceItHasTriedToReadHarbor(t *testing.T) {
 	kube := fake.NewClientset(namespace("labeled", map[string]string{namespaces.ProjectLabel: "proj"}))
 	release := make(chan struct{})
-	o := testHarborOptions
-	o.Timeout = time.Minute
-	h := startServerWithOptions(t, kube, fakeHarbor{release: release}, o)
+	h := startServer(t, kube, fakeHarbor{release: release})
 
 	time.Sleep(50 * time.Millisecond)
 	if code, body := serve(h, "/readyz?verbose"); code != http.StatusInternalServerError || !strings.Contains(body, "[-]harbor-read failed") {
@@ -149,20 +147,14 @@ func TestServerWatchesOnlyLabeledNamespaces(t *testing.T) {
 	h := startServer(t, kube, fakeHarbor{})
 	waitForOK(t, h, "/readyz")
 
+	code, body := serve(h, "/apis/harbor.goharbor.io/v1alpha1/harborrepositories")
+	var list v1alpha1.HarborRepositoryList
+	if err := json.Unmarshal([]byte(body), &list); code != http.StatusOK || err != nil {
+		t.Fatalf("list returned %d, %v: %s", code, err, body)
+	}
 	var visible []string
-	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		code, body := serve(h, "/apis/harbor.goharbor.io/v1alpha1/harborrepositories")
-		var list v1alpha1.HarborRepositoryList
-		if err := json.Unmarshal([]byte(body), &list); code == http.StatusOK && err == nil {
-			visible = nil
-			for _, r := range list.Items {
-				visible = append(visible, r.Namespace+"/"+r.Name)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("list returned %d: %s", code, body)
-		}
+	for _, r := range list.Items {
+		visible = append(visible, r.Namespace+"/"+r.Name)
 	}
 	if diff := cmp.Diff([]string{"labeled/app"}, visible); diff != "" {
 		t.Errorf("repositories (-want +got):\n%s", diff)
