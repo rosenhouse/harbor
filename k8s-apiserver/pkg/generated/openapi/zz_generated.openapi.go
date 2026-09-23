@@ -186,7 +186,7 @@ func schema_pkg_apis_harbor_v1alpha1_HarborRepository(ref common.ReferenceCallba
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "HarborRepository is a Harbor repository in the project that the namespace is labeled with.",
+				Description: "HarborRepository is a Harbor repository in the project that the namespace is labeled with. Its name is the repository's name within the project with slashes replaced by dots. A repository name that contains dots, or whose dotted form is not a valid name or ends in \"-\" and 10 hex digits, instead gets a sanitized name with a suffix of \"-\" and 10 hex digits from a hash.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -280,8 +280,48 @@ func schema_pkg_apis_harbor_v1alpha1_HarborRepositoryStatus(ref common.Reference
 			SchemaProps: spec.SchemaProps{
 				Description: "HarborRepositoryStatus is the repository as observed in Harbor.",
 				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name is the repository's full name in Harbor, starting with the project.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"description": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"artifactCount": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int64",
+						},
+					},
+					"pullCount": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PullCount is the number of pulls of all artifacts in the repository.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"updateTime": {
+						SchemaProps: spec.SchemaProps{
+							Description: "UpdateTime is when Harbor last changed the repository.",
+							Ref:         ref(v1.Time{}.OpenAPIModelName()),
+						},
+					},
+				},
+				Required: []string{"name", "artifactCount", "pullCount"},
 			},
 		},
+		Dependencies: []string{
+			v1.Time{}.OpenAPIModelName()},
 	}
 }
 

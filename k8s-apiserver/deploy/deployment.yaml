@@ -31,6 +31,23 @@ spec:
       containers:
         - name: harbor-apiserver
           image: harbor-apiserver:dev
+          # The harbor-apiserver Secret holds url, project, username, and password.
+          args:
+            - --harbor-url=$(HARBOR_URL)
+            - --harbor-project=$(HARBOR_PROJECT)
+            - --harbor-username-file=/etc/harbor/username
+            - --harbor-password-file=/etc/harbor/password
+          env:
+            - name: HARBOR_URL
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-apiserver
+                  key: url
+            - name: HARBOR_PROJECT
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-apiserver
+                  key: project
           ports:
             - name: https
               containerPort: 6443
@@ -39,6 +56,8 @@ spec:
               path: /readyz
               port: https
               scheme: HTTPS
+            periodSeconds: 10
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /livez
@@ -53,3 +72,11 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
+          volumeMounts:
+            - name: harbor
+              mountPath: /etc/harbor
+              readOnly: true
+      volumes:
+        - name: harbor
+          secret:
+            secretName: harbor-apiserver

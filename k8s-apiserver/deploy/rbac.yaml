@@ -31,6 +31,28 @@ subjects:
     name: harbor-apiserver
     namespace: harbor-apiserver
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: harbor-apiserver
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: harbor-apiserver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: harbor-apiserver
+subjects:
+  - kind: ServiceAccount
+    name: harbor-apiserver
+    namespace: harbor-apiserver
+---
 # Grants read access to everyone bound to the built-in view, edit, or admin roles.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

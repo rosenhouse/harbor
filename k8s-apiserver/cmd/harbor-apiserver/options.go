@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"net"
 
 	genericapiserver "k8s.io/apiserver/pkg/server"
@@ -19,6 +18,8 @@ type options struct {
 	Authentication *genericoptions.DelegatingAuthenticationOptions
 	Authorization  *genericoptions.DelegatingAuthorizationOptions
 	Logging        *logs.Options
+	Harbor         *harborOptions
+	Kubeconfig     string
 }
 
 func newOptions() *options {
@@ -27,6 +28,7 @@ func newOptions() *options {
 		Authentication: genericoptions.NewDelegatingAuthenticationOptions(),
 		Authorization:  genericoptions.NewDelegatingAuthorizationOptions(),
 		Logging:        logs.NewOptions(),
+		Harbor:         &harborOptions{},
 	}
 	o.SecureServing.BindPort = 6443
 	o.SecureServing.ServerCert.CertDirectory = ""
@@ -39,6 +41,8 @@ func (o *options) flags() cliflag.NamedFlagSets {
 	o.Authentication.AddFlags(fss.FlagSet("authentication"))
 	o.Authorization.AddFlags(fss.FlagSet("authorization"))
 	logsapi.AddFlags(o.Logging, fss.FlagSet("logging"))
+	o.Harbor.addFlags(fss.FlagSet("harbor"))
+	fss.FlagSet("namespaces").StringVar(&o.Kubeconfig, "kubeconfig", o.Kubeconfig, "Kubeconfig for reading namespaces. Defaults to the in-cluster configuration.")
 	return fss
 }
 
@@ -57,16 +61,4 @@ func (o *options) config() (*genericapiserver.Config, error) {
 		return nil, err
 	}
 	return c, nil
-}
-
-func run(ctx context.Context, o *options) error {
-	c, err := o.config()
-	if err != nil {
-		return err
-	}
-	s, err := apiserver.New(c.Complete(nil))
-	if err != nil {
-		return err
-	}
-	return s.PrepareRun().RunWithContext(ctx)
 }

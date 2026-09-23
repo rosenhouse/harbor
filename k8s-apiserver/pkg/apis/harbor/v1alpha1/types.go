@@ -7,6 +7,9 @@ import (
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // HarborRepository is a Harbor repository in the project that the namespace is labeled with.
+// Its name is the repository's name within the project with slashes replaced by dots.
+// A repository name that contains dots, or whose dotted form is not a valid name or ends in "-" and 10 hex digits,
+// instead gets a sanitized name with a suffix of "-" and 10 hex digits from a hash.
 type HarborRepository struct {
 	metav1.TypeMeta `json:",inline"`
 	// Standard object metadata.
@@ -17,7 +20,18 @@ type HarborRepository struct {
 }
 
 // HarborRepositoryStatus is the repository as observed in Harbor.
-type HarborRepositoryStatus struct{}
+type HarborRepositoryStatus struct {
+	// Name is the repository's full name in Harbor, starting with the project.
+	Name string `json:"name"`
+	// +optional
+	Description   string `json:"description,omitempty"`
+	ArtifactCount int64  `json:"artifactCount"`
+	// PullCount is the number of pulls of all artifacts in the repository.
+	PullCount int64 `json:"pullCount"`
+	// UpdateTime is when Harbor last changed the repository.
+	// +optional
+	UpdateTime *metav1.Time `json:"updateTime,omitempty"`
+}
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 

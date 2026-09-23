@@ -21,9 +21,13 @@ func robotClient(t *testing.T) *harbor.Client {
 	return clientAs(t, secretValue(t, "username"), secretValue(t, "password"))
 }
 
+// seededRepositories are the full names of the repositories that Seed.Push creates, sorted.
+var seededRepositories = []string{"e2e/app", "e2e/dotted.name_x", "e2e/multi", "e2e/team/api"}
+
 func clientAs(t *testing.T, username, password string) *harbor.Client {
 	t.Helper()
-	c, err := harbor.NewClient(HarborURL, username, password, &http.Client{Timeout: 10 * time.Second})
+	credentials := func() (string, string, error) { return username, password, nil }
+	c, err := harbor.NewClient(HarborURL, credentials, &http.Client{Timeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

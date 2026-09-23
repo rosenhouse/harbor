@@ -25,6 +25,11 @@ docker build ${ca_bundle:+--secret "id=ca-bundle,src=$ca_bundle"} -t "$image" . 
 build=$!
 trap 'kill "$build" 2>/dev/null || true; rm -f "$build_log"' EXIT
 
+# An interrupted TestHarborOutageIsServiceUnavailable leaves Harbor scaled down.
+if kubectl -n harbor get deployment harbor-nginx >/dev/null 2>&1; then
+  kubectl -n harbor scale deployment/harbor-nginx --replicas=1
+fi
+
 # Every upgrade regenerates Harbor's token CA and restarts it, so upgrade only when the chart or values change.
 harbor_release="harbor-$harbor_version values $(cksum <hack/e2e/harbor-values.yaml)"
 if ! helm history harbor --namespace harbor --max 1 -o json 2>/dev/null | grep -F "\"description\":\"$harbor_release\"" >/dev/null; then
@@ -57,4 +62,4 @@ fi
 kubectl -n harbor-apiserver rollout status deployment/harbor-apiserver --timeout=2m
 kubectl wait --for=condition=Available apiservice/v1alpha1.harbor.goharbor.io --timeout=2m
 
-go test -tags e2e -count=1 -v ./test/e2e/...
+go test -tags e2e -count=1 -timeout 20m -v ./test/e2e/...
