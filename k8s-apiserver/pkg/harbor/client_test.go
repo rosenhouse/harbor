@@ -2,6 +2,7 @@ package harbor_test
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,82 +40,119 @@ func newFakeHarbor(t *testing.T, handler http.HandlerFunc) *fakeHarbor {
 	return f
 }
 
-func newClient(t *testing.T, f *fakeHarbor, opts ...harbor.Option) *harbor.Client {
+func newClient(t *testing.T, f *fakeHarbor) *harbor.Client {
 	t.Helper()
-	c, err := harbor.NewClient(f.URL+"/", "robot$proj+k8s", "secret", f.Client(), opts...)
+	c, err := harbor.NewClient(f.URL+"/", "robot$proj+k8s", "secret", f.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
 	return c
 }
 
+// repositories returns n repositories with IDs from first.
+func repositories(first, n int) []harbor.Repository {
+	var r []harbor.Repository
+	for i := first; i < first+n; i++ {
+		r = append(r, harbor.Repository{ID: int64(i), Name: fmt.Sprintf("proj/r%d", i)})
+	}
+	return r
+}
+
+func writeJSON(t *testing.T, w http.ResponseWriter, v any) {
+	t.Helper()
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestListRepositoriesPages(t *testing.T) {
 	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Total-Count", "3")
+		w.Header().Set("X-Total-Count", "150")
 		switch r.URL.Query().Get("page") {
 		case "1":
-			_, _ = io.WriteString(w, `[{"name":"proj/a","artifact_count":2,"pull_count":7,"creation_time":"2026-01-02T03:04:05Z"},{"name":"proj/b"}]`)
+			writeJSON(t, w, repositories(1, 100))
 		case "2":
-			_, _ = io.WriteString(w, `[{"name":"proj/team/c","description":"d"}]`)
+			// A repository created during the list shifted page 2 by one.
+			writeJSON(t, w, repositories(100, 51))
 		default:
-			_, _ = io.WriteString(w, `[]`)
+			t.Errorf("requested %s", r.RequestURI)
 		}
 	})
 
-	repos, err := newClient(t, f, harbor.WithPageSize(2)).ListRepositories(context.Background(), "proj")
+	repos, err := newClient(t, f).ListRepositories(context.Background(), "proj")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	wantRequests := []string{
-		"/api/v2.0/projects/proj/repositories?page=1&page_size=2",
-		"/api/v2.0/projects/proj/repositories?page=2&page_size=2",
+		"/api/v2.0/projects/proj/repositories?page=1&page_size=100&sort=repository_id",
+		"/api/v2.0/projects/proj/repositories?page=2&page_size=100&sort=repository_id",
 	}
 	if diff := cmp.Diff(wantRequests, f.requests); diff != "" {
 		t.Errorf("requests (-want +got):\n%s", diff)
 	}
-	want := []harbor.Repository{
-		{Name: "proj/a", ArtifactCount: 2, PullCount: 7, CreationTime: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)},
-		{Name: "proj/b"},
-		{Name: "proj/team/c", Description: "d"},
-	}
-	if diff := cmp.Diff(want, repos); diff != "" {
+	if diff := cmp.Diff(repositories(1, 150), repos); diff != "" {
 		t.Errorf("repositories (-want +got):\n%s", diff)
 	}
 }
 
 func TestListStopsAfterLastPage(t *testing.T) {
-	for name, totalCount := range map[string]string{
-		"full page reaching X-Total-Count": "2",
-		"short page without X-Total-Count": "",
+	for name, tc := range map[string]struct {
+		totalCount string
+		n          int
+	}{
+		"full page reaching X-Total-Count": {"100", 100},
+		"short page without X-Total-Count": {"", 99},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
-				if totalCount != "" {
-					w.Header().Set("X-Total-Count", totalCount)
-					_, _ = io.WriteString(w, `[{"name":"proj/a"},{"name":"proj/b"}]`)
+				if r.URL.Query().Get("page") != "1" {
+					t.Errorf("requested %s", r.RequestURI)
+					writeJSON(t, w, []any{})
 					return
 				}
-				_, _ = io.WriteString(w, `[{"name":"proj/a"}]`)
+				if tc.totalCount != "" {
+					w.Header().Set("X-Total-Count", tc.totalCount)
+				}
+				writeJSON(t, w, repositories(1, tc.n))
 			})
-			if _, err := newClient(t, f, harbor.WithPageSize(2)).ListRepositories(context.Background(), "proj"); err != nil {
-				t.Fatal(err)
-			}
-			if len(f.requests) != 1 {
-				t.Errorf("made %d requests, want 1", len(f.requests))
+			repos, err := newClient(t, f).ListRepositories(context.Background(), "proj")
+			if err != nil || len(repos) != tc.n {
+				t.Errorf("got %d repositories, %v", len(repos), err)
 			}
 		})
 	}
 }
 
+func TestListGivesUpOnEndlessPages(t *testing.T) {
+	defer harbor.SetLimits(3, 1<<20)()
+	page := 0
+	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
+		page++
+		writeJSON(t, w, repositories(page*100, 100))
+	})
+	if _, err := newClient(t, f).ListRepositories(context.Background(), "proj"); err == nil || len(f.requests) != 3 {
+		t.Errorf("got %v after %d requests", err, len(f.requests))
+	}
+}
+
+func TestResponseSizeLimit(t *testing.T) {
+	defer harbor.SetLimits(1000, 100)()
+	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, harbor.Repository{Name: strings.Repeat("x", 200)})
+	})
+	if _, err := newClient(t, f).GetRepository(context.Background(), "proj", "x"); err == nil {
+		t.Error("decoded a response over the size limit")
+	}
+}
+
 func TestPathsEncodeNestedRepositoryNamesTwice(t *testing.T) {
 	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Total-Count", "0")
 		_, _ = io.WriteString(w, `{}`)
 	})
 	c := newClient(t, f)
 	ctx := context.Background()
-	digest := "sha256:" + fmt.Sprintf("%064d", 1)
+	digest := "sha256:" + strings.Repeat("0", 64)
 
 	_, _ = c.GetRepository(ctx, "proj", "team/app")
 	_, _ = c.GetArtifact(ctx, "proj", "team/app", digest)
@@ -131,16 +170,18 @@ func TestListArtifacts(t *testing.T) {
 	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Total-Count", "1")
 		_, _ = io.WriteString(w, `[{
+			"id": 7,
 			"digest": "sha256:abc",
 			"repository_name": "proj/team/app",
 			"type": "IMAGE",
 			"media_type": "application/vnd.oci.image.config.v1+json",
 			"manifest_media_type": "application/vnd.oci.image.index.v1+json",
 			"size": 1024,
-			"push_time": "2026-01-02T03:04:05Z",
+			"push_time": "2026-01-02T03:04:05.000Z",
+			"pull_time": "0001-01-01T00:00:00.000Z",
 			"annotations": {"org.opencontainers.image.source": "https://example.com"},
 			"references": [{"child_digest": "sha256:def", "platform": {"architecture": "arm64", "os": "linux"}}],
-			"tags": [{"name": "v1", "push_time": "2026-01-02T03:04:05Z", "immutable": true}]
+			"tags": [{"name": "v1", "push_time": "2026-01-02T03:04:05.000Z"}]
 		}]`)
 	})
 
@@ -149,11 +190,12 @@ func TestListArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if want := "/api/v2.0/projects/proj/repositories/team%252Fapp/artifacts?page=1&page_size=100&with_tag=true"; f.requests[0] != want {
+	if want := "/api/v2.0/projects/proj/repositories/team%252Fapp/artifacts?page=1&page_size=100&sort=id&with_tag=true"; f.requests[0] != want {
 		t.Errorf("request %s, want %s", f.requests[0], want)
 	}
 	pushed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	want := []harbor.Artifact{{
+		ID:                7,
 		Digest:            "sha256:abc",
 		RepositoryName:    "proj/team/app",
 		Type:              "IMAGE",
@@ -163,7 +205,7 @@ func TestListArtifacts(t *testing.T) {
 		PushTime:          pushed,
 		Annotations:       map[string]string{"org.opencontainers.image.source": "https://example.com"},
 		References:        []harbor.Reference{{ChildDigest: "sha256:def", Platform: &harbor.Platform{Architecture: "arm64", OS: "linux"}}},
-		Tags:              []harbor.Tag{{Name: "v1", PushTime: pushed, Immutable: true}},
+		Tags:              []harbor.Tag{{Name: "v1", PushTime: pushed}},
 	}}
 	if diff := cmp.Diff(want, artifacts); diff != "" {
 		t.Errorf("artifacts (-want +got):\n%s", diff)
@@ -172,49 +214,57 @@ func TestListArtifacts(t *testing.T) {
 
 func TestErrors(t *testing.T) {
 	for _, tc := range []struct {
-		status int
-		want   error
+		status  int
+		body    string
+		want    error
+		wantMsg string
 	}{
-		{http.StatusNotFound, harbor.ErrNotFound},
-		{http.StatusUnauthorized, harbor.ErrCredentialsRejected},
-		{http.StatusForbidden, harbor.ErrCredentialsRejected},
-		{http.StatusInternalServerError, harbor.ErrUnavailable},
-		{http.StatusServiceUnavailable, harbor.ErrUnavailable},
-		{http.StatusTooManyRequests, harbor.ErrUnavailable},
+		{http.StatusNotFound, `{"errors":[{"code":"NOT_FOUND","message":"no repo"}]}`, harbor.ErrNotFound, "no repo"},
+		{http.StatusUnauthorized, `{"errors":[{"message":"bad creds"}]}`, harbor.ErrUnauthorized, "bad creds"},
+		{http.StatusForbidden, `{"errors":[{"message":"no access"}]}`, harbor.ErrForbidden, "no access"},
+		{http.StatusInternalServerError, `{"errors":[{"message":"internal server error"}]}`, harbor.ErrUnavailable, "internal server error"},
+		{http.StatusServiceUnavailable, "<html>" + strings.Repeat("x", 1000), harbor.ErrUnavailable, "<html>" + strings.Repeat("x", 250)},
+		{http.StatusTooManyRequests, "slow down", harbor.ErrUnavailable, "slow down"},
+		{http.StatusFound, "", nil, ""},
 	} {
 		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
 			f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(tc.status)
-				_, _ = io.WriteString(w, `{"errors":[{"code":"X","message":"harbor says no"}]}`)
+				_, _ = io.WriteString(w, tc.body)
 			})
-			_, err := newClient(t, f).GetRepository(context.Background(), "proj", "a")
-			if !errors.Is(err, tc.want) {
+			repo, err := newClient(t, f).GetRepository(context.Background(), "proj", "a")
+			if err == nil || repo != nil {
+				t.Fatalf("got %v, %v; want only an error", repo, err)
+			}
+			if tc.want != nil && !errors.Is(err, tc.want) {
 				t.Errorf("got %v, want %v", err, tc.want)
 			}
-			want := fmt.Sprintf("%v: GET /api/v2.0/projects/proj/repositories/a: %d %s: harbor says no", tc.want, tc.status, http.StatusText(tc.status))
-			if err == nil || err.Error() != want {
-				t.Errorf("error %q, want %q", err, want)
+			wantMsg := fmt.Sprintf("GET /api/v2.0/projects/proj/repositories/a: %d %s", tc.status, http.StatusText(tc.status))
+			if tc.wantMsg != "" {
+				wantMsg += ": " + tc.wantMsg
+			}
+			if !strings.HasSuffix(err.Error(), wantMsg) {
+				t.Errorf("error %q, want suffix %q", err, wantMsg)
 			}
 		})
 	}
 }
 
-func TestNewClientRequiresHTTPURL(t *testing.T) {
-	for _, u := range []string{"harbor.example.com", "ftp://harbor.example.com", "://"} {
-		if _, err := harbor.NewClient(u, "u", "p", http.DefaultClient); err == nil {
-			t.Errorf("accepted %q", u)
-		}
-	}
-}
+func TestRedirectsAreNotFollowed(t *testing.T) {
+	var elsewhere []string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		elsewhere = append(elsewhere, r.Header.Get("Authorization"))
+	}))
+	t.Cleanup(other.Close)
+	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL, http.StatusFound)
+	})
 
-func TestWrongCredentials(t *testing.T) {
-	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {})
-	c, err := harbor.NewClient(f.URL, "robot$proj+k8s", "wrong", f.Client())
-	if err != nil {
-		t.Fatal(err)
+	if _, err := newClient(t, f).ListRepositories(context.Background(), "proj"); err == nil {
+		t.Error("followed a redirect as success")
 	}
-	if _, err := c.ListRepositories(context.Background(), "proj"); !errors.Is(err, harbor.ErrCredentialsRejected) {
-		t.Errorf("got %v", err)
+	if len(elsewhere) != 0 {
+		t.Errorf("sent requests to the redirect target: %v", elsewhere)
 	}
 }
 
@@ -227,6 +277,27 @@ func TestUnreachableIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestContextDeadline(t *testing.T) {
+	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := newClient(t, f).ListRepositories(ctx, "proj")
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, harbor.ErrUnavailable) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestNewClientValidation(t *testing.T) {
+	for _, u := range []string{"harbor.example.com", "ftp://harbor.example.com", "https://", "https://h/harbor?x=1", "://"} {
+		if _, err := harbor.NewClient(u, "u", "p", http.DefaultClient); err == nil {
+			t.Errorf("accepted %q", u)
+		}
+	}
+	if _, err := harbor.NewClient("https://h", "u", "p", nil); err == nil {
+		t.Error("accepted a nil HTTP client")
+	}
+}
+
 func TestHTTPClientTrustsCABundle(t *testing.T) {
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	t.Cleanup(s.Close)
@@ -236,15 +307,19 @@ func TestHTTPClientTrustsCABundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := trusting.Get(s.URL); err != nil {
+	resp, err := trusting.Get(s.URL)
+	if err != nil {
 		t.Errorf("with CA bundle: %v", err)
+	} else {
+		_ = resp.Body.Close()
 	}
 
 	system, err := harbor.NewHTTPClient(nil, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := system.Get(s.URL); err == nil {
+	if resp, err := system.Get(s.URL); err == nil {
+		_ = resp.Body.Close()
 		t.Error("without CA bundle: trusted a self-signed certificate")
 	}
 	if system.Timeout != time.Second {

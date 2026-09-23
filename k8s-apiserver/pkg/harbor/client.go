@@ -17,12 +17,23 @@ import (
 )
 
 var (
-	ErrNotFound            = errors.New("not found in harbor")
-	ErrCredentialsRejected = errors.New("harbor rejected the robot account credentials")
-	ErrUnavailable         = errors.New("harbor is unavailable")
+	ErrNotFound     = errors.New("not found in harbor")
+	ErrUnauthorized = errors.New("harbor rejected the robot account credentials")
+	ErrForbidden    = errors.New("harbor denied the robot account access")
+	ErrUnavailable  = errors.New("harbor is unavailable")
+)
+
+const pageSize = 100
+
+// Limits that stop a misbehaving server from exhausting memory.
+var (
+	maxPages         = 1000
+	maxResponseBytes = int64(16 << 20)
 )
 
 type Repository struct {
+	ID int64 `json:"id"`
+	// Name is the full name, starting with the project.
 	Name          string    `json:"name"`
 	Description   string    `json:"description"`
 	ArtifactCount int64     `json:"artifact_count"`
@@ -32,7 +43,9 @@ type Repository struct {
 }
 
 type Artifact struct {
-	Digest            string            `json:"digest"`
+	ID     int64  `json:"id"`
+	Digest string `json:"digest"`
+	// RepositoryName is the full name, starting with the project.
 	RepositoryName    string            `json:"repository_name"`
 	Type              string            `json:"type"`
 	MediaType         string            `json:"media_type"`
@@ -58,45 +71,38 @@ type Platform struct {
 }
 
 type Tag struct {
-	Name      string    `json:"name"`
-	PushTime  time.Time `json:"push_time"`
-	PullTime  time.Time `json:"pull_time"`
-	Immutable bool      `json:"immutable"`
+	Name     string    `json:"name"`
+	PushTime time.Time `json:"push_time"`
+	PullTime time.Time `json:"pull_time"`
 }
 
 type Client struct {
 	baseURL            string
 	username, password string
 	http               *http.Client
-	pageSize           int
 }
 
-type Option func(*Client)
-
-// WithPageSize sets how many items each list request asks for. Harbor allows at most 100.
-func WithPageSize(n int) Option {
-	return func(c *Client) { c.pageSize = n }
-}
-
-func NewClient(baseURL, username, password string, httpClient *http.Client, opts ...Option) (*Client, error) {
+// NewClient returns a client that authenticates as a robot account.
+// It refuses redirects, so the credentials go only to baseURL.
+func NewClient(baseURL, username, password string, httpClient *http.Client) (*Client, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("harbor URL %q must use http or https", baseURL)
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("harbor URL %q must be http or https with a host and no query", baseURL)
 	}
-	c := &Client{
+	if httpClient == nil {
+		return nil, errors.New("harbor client needs an HTTP client")
+	}
+	noRedirects := *httpClient
+	noRedirects.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &Client{
 		baseURL:  strings.TrimSuffix(baseURL, "/") + "/api/v2.0",
 		username: username,
 		password: password,
-		http:     httpClient,
-		pageSize: 100,
-	}
-	for _, o := range opts {
-		o(c)
-	}
-	return c, nil
+		http:     &noRedirects,
+	}, nil
 }
 
 // NewHTTPClient returns a client that trusts caBundle (PEM) in addition to the system roots.
@@ -116,25 +122,31 @@ func NewHTTPClient(caBundle []byte, timeout time.Duration) (*http.Client, error)
 }
 
 func (c *Client) ListRepositories(ctx context.Context, project string) ([]Repository, error) {
-	return list[Repository](ctx, c, projectPath(project)+"/repositories", nil)
+	return list(ctx, c, projectPath(project)+"/repositories", url.Values{"sort": {"repository_id"}},
+		func(r Repository) int64 { return r.ID })
 }
 
 // GetRepository gets a repository by its name within the project, such as "team/app".
 func (c *Client) GetRepository(ctx context.Context, project, repository string) (*Repository, error) {
 	var r Repository
-	return &r, c.get(ctx, repositoryPath(project, repository), nil, &r)
+	if _, err := c.get(ctx, repositoryPath(project, repository), nil, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
 }
 
 func (c *Client) ListArtifacts(ctx context.Context, project, repository string) ([]Artifact, error) {
-	return list[Artifact](ctx, c, repositoryPath(project, repository)+"/artifacts", withTags)
+	return list(ctx, c, repositoryPath(project, repository)+"/artifacts", url.Values{"sort": {"id"}, "with_tag": {"true"}},
+		func(a Artifact) int64 { return a.ID })
 }
 
 func (c *Client) GetArtifact(ctx context.Context, project, repository, digest string) (*Artifact, error) {
 	var a Artifact
-	return &a, c.get(ctx, repositoryPath(project, repository)+"/artifacts/"+url.PathEscape(digest), withTags, &a)
+	if _, err := c.get(ctx, repositoryPath(project, repository)+"/artifacts/"+url.PathEscape(digest), url.Values{"with_tag": {"true"}}, &a); err != nil {
+		return nil, err
+	}
+	return &a, nil
 }
-
-var withTags = url.Values{"with_tag": {"true"}}
 
 func projectPath(project string) string {
 	return "/projects/" + url.PathEscape(project)
@@ -145,56 +157,64 @@ func repositoryPath(project, repository string) string {
 	return projectPath(project) + "/repositories/" + url.PathEscape(url.PathEscape(repository))
 }
 
-func list[T any](ctx context.Context, c *Client, path string, query url.Values) ([]T, error) {
+// list gets every page, sorted by ID so that concurrent changes shift pages as little as possible.
+// It drops items that a shift repeated.
+func list[T any](ctx context.Context, c *Client, path string, query url.Values, id func(T) int64) ([]T, error) {
 	var all []T
-	for page := 1; ; page++ {
-		q := url.Values{"page": {strconv.Itoa(page)}, "page_size": {strconv.Itoa(c.pageSize)}}
+	seen := map[int64]bool{}
+	for page := 1; page <= maxPages; page++ {
+		q := url.Values{"page": {strconv.Itoa(page)}, "page_size": {strconv.Itoa(pageSize)}}
 		for k, v := range query {
 			q[k] = v
 		}
 		var items []T
-		resp, err := c.do(ctx, path, q, &items)
+		total, err := c.get(ctx, path, q, &items)
 		if err != nil {
 			return nil, err
 		}
-		all = append(all, items...)
-		total, err := strconv.Atoi(resp.Header.Get("X-Total-Count"))
-		if len(items) < c.pageSize || (err == nil && len(all) >= total) {
+		for _, item := range items {
+			if !seen[id(item)] {
+				seen[id(item)] = true
+				all = append(all, item)
+			}
+		}
+		if len(items) < pageSize || (total >= 0 && page*pageSize >= total) {
 			return all, nil
 		}
 	}
+	return nil, fmt.Errorf("GET %s: more than %d pages", path, maxPages)
 }
 
-func (c *Client) get(ctx context.Context, path string, query url.Values, into any) error {
-	_, err := c.do(ctx, path, query, into)
-	return err
-}
-
-func (c *Client) do(ctx context.Context, path string, query url.Values, into any) (*http.Response, error) {
+// get decodes the response into `into` and returns its X-Total-Count header, or -1 if it has none.
+func (c *Client) get(ctx context.Context, path string, query url.Values, into any) (int, error) {
 	u := c.baseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	req.SetBasicAuth(c.username, c.password)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		return 0, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, responseError(req, resp)
+		return 0, responseError(req, resp)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
-		return nil, fmt.Errorf("decoding GET %s: %w", req.URL.Path, err)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(into); err != nil {
+		return 0, fmt.Errorf("decoding GET %s: %w", req.URL.Path, err)
 	}
-	return resp, nil
+	total, err := strconv.Atoi(resp.Header.Get("X-Total-Count"))
+	if err != nil {
+		return -1, nil
+	}
+	return total, nil
 }
 
 func responseError(req *http.Request, resp *http.Response) error {
@@ -202,23 +222,29 @@ func responseError(req *http.Request, resp *http.Response) error {
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		kind = ErrNotFound
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		kind = ErrCredentialsRejected
+	case resp.StatusCode == http.StatusUnauthorized:
+		kind = ErrUnauthorized
+	case resp.StatusCode == http.StatusForbidden:
+		kind = ErrForbidden
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 		kind = ErrUnavailable
 	default:
 		kind = errors.New("unexpected response from harbor")
 	}
 
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	var body struct {
 		Errors []struct {
 			Message string `json:"message"`
 		} `json:"errors"`
 	}
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	msg := strings.TrimSpace(string(raw))
+	msg := strings.ToValidUTF8(string(raw[:min(len(raw), 256)]), "")
 	if json.Unmarshal(raw, &body) == nil && len(body.Errors) > 0 {
 		msg = body.Errors[0].Message
 	}
-	return fmt.Errorf("%w: GET %s: %s: %s", kind, req.URL.Path, resp.Status, msg)
+	err := fmt.Errorf("%w: GET %s: %s", kind, req.URL.Path, resp.Status)
+	if msg = strings.TrimSpace(msg); msg != "" {
+		err = fmt.Errorf("%w: %s", err, msg)
+	}
+	return err
 }
