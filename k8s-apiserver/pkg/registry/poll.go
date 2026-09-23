@@ -15,7 +15,7 @@ import (
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 )
 
-// listConcurrency is how many repositories a poll reads from Harbor at once.
+// listConcurrency is how many requests a poll or list sends to Harbor at once.
 const listConcurrency = 4
 
 // retryDelay is how long a poller waits to retry a poll that fails after one that did not.
@@ -24,12 +24,16 @@ const retryDelay = time.Second
 var (
 	errSlowRead      = errors.New("reading harbor takes longer than the staleness limit")
 	errArtifactsRead = errors.New("reading a repository's artifacts failed")
+	errLinksRead     = errors.New("listing replication policies failed")
 )
 
 // Poller polls a Harbor project into a Store.
 type Poller struct {
 	harbor Harbor
 	store  *Store
+	// replications lists the policies of replicationConfig. It is nil when replications are disabled.
+	replications      ReplicationPolicyLister
+	replicationConfig ReplicationConfig
 	// jitter lengthens a wait between polls.
 	jitter func(time.Duration) time.Duration
 
@@ -49,6 +53,11 @@ type listedArtifacts struct {
 	started time.Time
 }
 
+// ReplicationPolicyLister lists replication policies.
+type ReplicationPolicyLister interface {
+	ListReplicationPolicies(ctx context.Context, namePrefix string) ([]harbor.ReplicationPolicy, error)
+}
+
 func NewPoller(h Harbor, s *Store) *Poller {
 	return &Poller{
 		harbor:    h,
@@ -56,6 +65,13 @@ func NewPoller(h Harbor, s *Store) *Poller {
 		jitter:    func(d time.Duration) time.Duration { return wait.Jitter(d, 0.1) },
 		attempted: make(chan struct{}),
 	}
+}
+
+// LinkReplications makes each poll also list the replication policies of c through h,
+// so that the artifacts that a replication copied link to it. Call it before polling.
+// Poll only once the namespace informer has synced, since a poll links only replications in namespaces that see the project.
+func (p *Poller) LinkReplications(h ReplicationPolicyLister, c ReplicationConfig) {
+	p.replications, p.replicationConfig = h, c
 }
 
 // Attempted is closed once the first poll ends.
@@ -86,6 +102,7 @@ func (p *Poller) Run(ctx context.Context, interval time.Duration) {
 }
 
 // Poll lists the project's repositories and their artifacts into the store. A failed poll leaves the store's items in place.
+// Meanwhile, it lists the replication policies. If only that list fails, the poll updates the items and keeps the links.
 // A poll fails once it takes longer than the staleness limit, since its result would be stale.
 // A poll that keeps a repository's artifacts from an earlier poll updates the store, and returns errArtifactsRead.
 func (p *Poller) Poll(ctx context.Context) error {
@@ -95,7 +112,17 @@ func (p *Poller) Poll(ctx context.Context) error {
 	start := p.store.clock.Now()
 	pollCtx, cancel := context.WithTimeout(ctx, p.store.stalenessLimit)
 	defer cancel()
+	linksCtx, cancelLinks := context.WithCancel(pollCtx)
+	defer cancelLinks()
+	var links []replicationLink
+	var linksErr error
+	var linking sync.WaitGroup
+	linking.Go(func() { links, linksErr = p.readLinks(linksCtx) })
 	items, err := p.read(pollCtx, start)
+	if err != nil {
+		cancelLinks()
+	}
+	linking.Wait()
 	if ctx.Err() != nil {
 		// The server is shutting down.
 		return err
@@ -114,7 +141,10 @@ func (p *Poller) Poll(ctx context.Context) error {
 			older[repository] = a.started
 		}
 	}
-	p.store.update(items, start, older)
+	if linksErr != nil {
+		klog.ErrorS(linksErr, "Listing replication policies failed, so artifacts keep the replications that they were linked to before until the staleness limit", "project", p.store.project)
+	}
+	p.store.update(items, start, older, links, linksErr)
 	for repository, started := range older {
 		if p.store.clock.Since(started) > p.store.stalenessLimit {
 			klog.ErrorS(errArtifactsRead, "Requests for a repository's artifacts fail, because they were not listed within the staleness limit", "project", p.store.project, "repository", repository, "listed", started)
@@ -163,6 +193,30 @@ func (p *Poller) read(ctx context.Context, start time.Time) (map[key]*item, erro
 		}
 	}
 	return items, nil
+}
+
+// readLinks lists the replication policies, and returns the links of the visible ones to their artifacts.
+func (p *Poller) readLinks(ctx context.Context) ([]replicationLink, error) {
+	if p.replications == nil {
+		return nil, nil
+	}
+	c := p.replicationConfig
+	policies, err := p.replications.ListReplicationPolicies(ctx, c.policyPrefix())
+	if err != nil {
+		return nil, err
+	}
+	var links []replicationLink
+	for i := range policies {
+		if d, ok := c.visible(&policies[i], p.store.namespaces); ok {
+			links = append(links, replicationLink{
+				namespaceUID:     d.NamespaceUID,
+				name:             d.Name,
+				uid:              d.UID,
+				repositoryPrefix: c.repositoryPrefix(d.Namespace, d.Name),
+			})
+		}
+	}
+	return links, nil
 }
 
 // listArtifacts lists a repository's artifacts in the poll that started at start. A missing repository has none.

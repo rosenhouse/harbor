@@ -407,3 +407,189 @@ func TestJitterAddsUpToATenth(t *testing.T) {
 		t.Error("jitter never lengthened a minute")
 	}
 }
+
+func TestPollUpdatesReplicationLinks(t *testing.T) {
+	f := newReplicationFixture(t)
+	f.replications.policies = nil
+	f.poll(t)
+	if names := artifactNames(artifactItems(t, f.artifacts, "ns1", byReplication("nginx"))); names != nil {
+		t.Errorf("deleted replication links %v", names)
+	}
+
+	hidden := storedPolicy()
+	withDescription(hidden, func(d *policyDescription) { d.ManagedBy = "someone" })
+	f.replications.put(*hidden)
+	f.poll(t)
+	if names := artifactNames(artifactItems(t, f.artifacts, "ns1", byReplication("nginx"))); names != nil {
+		t.Errorf("hidden replication links %v", names)
+	}
+
+	f.replications.put(*storedPolicy())
+	f.poll(t)
+	if diff := cmp.Diff([]string{"ns1/" + replicatedArtifact}, artifactNames(artifactItems(t, f.artifacts, "ns1", byReplication("nginx")))); diff != "" {
+		t.Errorf("names (-want +got):\n%s", diff)
+	}
+}
+
+// replicationSelectors are label selectors of artifacts in ns1 that depend on which replications copied them.
+var replicationSelectors = []*metainternalversion.ListOptions{
+	byReplication("nginx"),
+	byLabelSelector(v1alpha1.ReplicationLabel),
+	byLabelSelector("!" + v1alpha1.ReplicationLabel),
+	byLabelSelector(v1alpha1.ReplicationLabel + " in (nginx, web)"),
+	byLabelSelector(v1alpha1.ReplicationLabel + "=nginx," + v1alpha1.RepositoryLabel + "=k8s.ns1.nginx.library.nginx"),
+}
+
+// expectReplicationSelectors checks that lists by the replication label fail with message, or succeed if it is empty, and that other requests succeed.
+func expectReplicationSelectors(t *testing.T, f *replicationFixture, message string) {
+	t.Helper()
+	for _, opts := range replicationSelectors {
+		_, err := f.artifacts.List(inNamespace("ns1"), opts)
+		if message == "" && err != nil || message != "" && (!apierrors.IsServiceUnavailable(err) || !strings.Contains(err.Error(), message)) {
+			t.Errorf("list by %s: got %v, want ServiceUnavailable %q", opts.LabelSelector, err, message)
+		}
+	}
+	for _, send := range []func(*Artifacts) error{listArtifacts(nil), listArtifacts(byLabel("k8s.ns1.nginx.library.nginx")), getArtifact(replicatedArtifact)} {
+		if err := send(f.artifacts); err != nil {
+			t.Error(err)
+		}
+	}
+	expectAvailable(t, f.fixture, "ns1")
+}
+
+func TestPollKeepsReplicationLinksWhenListingPoliciesFailsUntilStale(t *testing.T) {
+	f := newReplicationFixture(t)
+	f.replications.errs = map[string]error{"ListReplicationPolicies": fmt.Errorf("%w: GET https://10.0.0.1/api/v2.0/replication/policies: 401", harbor.ErrUnauthorized)}
+	f.replications.policies = nil
+	for range 2 {
+		f.clock.Step(stalenessLimit / 2)
+		if err := f.poller.Poll(t.Context()); err != nil {
+			t.Errorf("poll returned %v", err)
+		}
+	}
+	if diff := cmp.Diff([]string{"ns1/" + replicatedArtifact}, artifactNames(artifactItems(t, f.artifacts, "ns1", byReplication("nginx")))); diff != "" {
+		t.Errorf("names (-want +got):\n%s", diff)
+	}
+	expectReplicationSelectors(t, f, "")
+
+	f.clock.Step(time.Nanosecond)
+	expectReplicationSelectors(t, f, "listing replication policies failed: harbor rejected the robot account credentials")
+	if _, err := f.artifacts.List(inNamespace("ns1"), byReplication("nginx")); err == nil || strings.Contains(err.Error(), "10.0.0.1") {
+		t.Errorf("got %v", err)
+	}
+
+	f.replications.errs = nil
+	f.poll(t)
+	expectReplicationSelectors(t, f, "")
+}
+
+func TestWithoutReplicationsTheReplicationLabelSelectsNoArtifacts(t *testing.T) {
+	f := newFixture(t, replicatedHarbor())
+	f.clock.Step(stalenessLimit)
+	if names := artifactNames(artifactItems(t, f.artifacts, "ns1", byReplication("nginx"))); names != nil {
+		t.Errorf("listed %v", names)
+	}
+	if names := artifactNames(artifactItems(t, f.artifacts, "ns1", byLabelSelector("!"+v1alpha1.ReplicationLabel))); len(names) != 3 {
+		t.Errorf("listed %v", names)
+	}
+}
+
+func TestFirstPollWithoutPoliciesServesArtifactsWithoutLinks(t *testing.T) {
+	f := newUnreadReplicationFixture()
+	f.replications.errs = map[string]error{"ListReplicationPolicies": harbor.ErrUnauthorized}
+	if err := f.poller.Poll(t.Context()); err != nil {
+		t.Errorf("poll returned %v", err)
+	}
+	items := artifactItems(t, f.artifacts, "", nil)
+	if len(items) != 6 {
+		t.Errorf("listed %v", artifactNames(items))
+	}
+	if diff := cmp.Diff(artifactNames(items), replicationLinks(items)); diff != "" {
+		t.Errorf("links (-none +got):\n%s", diff)
+	}
+	expectReplicationSelectors(t, f, "listing replication policies failed: harbor rejected the robot account credentials")
+}
+
+// policiesUntilCancelled lists the policies only once the poll is cancelled, and records that it was.
+type policiesUntilCancelled struct {
+	ReplicationPolicyLister
+	cancelled chan struct{}
+}
+
+func (p policiesUntilCancelled) ListReplicationPolicies(ctx context.Context, namePrefix string) ([]harbor.ReplicationPolicy, error) {
+	select {
+	case <-ctx.Done():
+		close(p.cancelled)
+	case <-time.After(5 * time.Second):
+	}
+	return p.ReplicationPolicyLister.ListReplicationPolicies(context.Background(), namePrefix)
+}
+
+func TestFailedPollCancelsListingPoliciesAndKeepsLinks(t *testing.T) {
+	f := newReplicationFixture(t)
+	cancelled := make(chan struct{})
+	f.poller.LinkReplications(policiesUntilCancelled{f.replications, cancelled}, replicationConfig)
+	f.replications.policies = nil
+	f.harbor.setErr(harbor.ErrUnavailable)
+	f.poll(t)
+	select {
+	case <-cancelled:
+	default:
+		t.Error("the failed poll did not cancel listing policies")
+	}
+	if diff := cmp.Diff([]string{"ns1/" + replicatedArtifact}, artifactNames(artifactItems(t, f.artifacts, "ns1", byReplication("nginx")))); diff != "" {
+		t.Errorf("names (-want +got):\n%s", diff)
+	}
+}
+
+func TestStaleReplicatedArtifactsFailRequestsThatCouldReturnThem(t *testing.T) {
+	f := newReplicationFixture(t)
+	f.harbor.artifactErrs = map[string]error{"proj/k8s/ns1/nginx/library/nginx": errors.New("unexpected response from harbor")}
+	f.clock.Step(stalenessLimit / 2)
+	f.poll(t)
+	f.clock.Step(stalenessLimit/2 + time.Nanosecond)
+	for _, tc := range []struct {
+		desc, namespace string
+		opts            *metainternalversion.ListOptions
+		unavailable     bool
+	}{
+		{"replication", "ns1", byReplication("nginx"), true},
+		{"replication set", "ns1", byLabelSelector(v1alpha1.ReplicationLabel + " in (nginx, web)"), true},
+		{"another replication", "ns1", byReplication("web"), false},
+		{"no replication", "", byLabelSelector("!" + v1alpha1.ReplicationLabel), true},
+		{"another repository", "ns1", byLabel("nginx"), false},
+	} {
+		_, err := f.artifacts.List(inNamespace(tc.namespace), tc.opts)
+		if tc.unavailable != apierrors.IsServiceUnavailable(err) || !tc.unavailable && err != nil {
+			t.Errorf("%s: got %v, want unavailable %v", tc.desc, err, tc.unavailable)
+		}
+	}
+}
+
+// beforeListing runs before each list of replication policies.
+type beforeListing struct {
+	ReplicationPolicyLister
+	before func()
+}
+
+func (b beforeListing) ListReplicationPolicies(ctx context.Context, namePrefix string) ([]harbor.ReplicationPolicy, error) {
+	b.before()
+	return b.ReplicationPolicyLister.ListReplicationPolicies(ctx, namePrefix)
+}
+
+func TestPollListsPoliciesWhileReadingTheProject(t *testing.T) {
+	f := newUnreadReplicationFixture()
+	listing := make(chan struct{})
+	f.poller.LinkReplications(beforeListing{f.replications, func() { close(listing) }}, replicationConfig)
+	f.harbor.onList = func() {
+		select {
+		case <-listing:
+		case <-time.After(5 * time.Second):
+			t.Error("did not list policies while listing repositories")
+		}
+	}
+	f.poll(t)
+	if diff := cmp.Diff([]string{"ns1/" + replicatedArtifact}, artifactNames(artifactItems(t, f.artifacts, "ns1", byReplication("nginx")))); diff != "" {
+		t.Errorf("names (-want +got):\n%s", diff)
+	}
+}

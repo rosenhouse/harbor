@@ -3,16 +3,19 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	testingclock "k8s.io/utils/clock/testing"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apis/harbor/v1alpha1"
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
@@ -414,6 +417,180 @@ func TestHumanSize(t *testing.T) {
 	} {
 		if got := humanSize(size); got != want {
 			t.Errorf("%d: got %q, want %q", size, got, want)
+		}
+	}
+}
+
+// replicatedArtifact is an artifact that replication ns1/nginx copied.
+const replicatedArtifact = "k8s.ns1.nginx.library.nginx.sha256-aaaaaaaaaaaa"
+
+// replicatedHarbor holds an artifact that replication ns1/nginx copied, and others.
+func replicatedHarbor() *fakeHarbor {
+	return &fakeHarbor{
+		repositories: []harbor.Repository{
+			{ID: 1, Name: "proj/k8s/ns1/nginx/library/nginx"},
+			{ID: 2, Name: "proj/k8s/ns1/nginx-old/library/nginx"},
+			{ID: 3, Name: "proj/nginx"},
+		},
+		artifacts: map[string][]harbor.Artifact{
+			"proj/k8s/ns1/nginx/library/nginx":     {{ID: 1, Digest: digest("aaaaaaaaaaaa")}},
+			"proj/k8s/ns1/nginx-old/library/nginx": {{ID: 2, Digest: digest("bbbbbbbbbbbb")}},
+			"proj/nginx":                           {{ID: 3, Digest: digest("cccccccccccc")}},
+		},
+	}
+}
+
+// replicationFixture serves replicatedHarbor to namespaces ns1 and ns2, and links its artifacts to the replications in replications.
+type replicationFixture struct {
+	*fixture
+	replications *fakeReplicationHarbor
+	namespaces   namespaceObjects
+}
+
+// newUnreadReplicationFixture returns a fixture that has not read Harbor yet, whose replications hold ns1/nginx.
+func newUnreadReplicationFixture() *replicationFixture {
+	h, r := replicatedHarbor(), &fakeReplicationHarbor{}
+	r.put(*storedPolicy())
+	n := namespaceObjects{"ns1": namespace("ns1"), "ns2": namespace("ns2")}
+	s := NewStore("proj", stalenessLimit, n)
+	c := testingclock.NewFakeClock(time.Now())
+	s.clock = c
+	p := NewPoller(h, s)
+	p.LinkReplications(r, replicationConfig)
+	return &replicationFixture{&fixture{harbor: h, clock: c, poller: p, repositories: NewRepositories(s), artifacts: NewArtifacts(s)}, r, n}
+}
+
+func newReplicationFixture(t *testing.T) *replicationFixture {
+	t.Helper()
+	f := newUnreadReplicationFixture()
+	f.poll(t)
+	return f
+}
+
+// replicationLinks describes each artifact's replication label and ownerReferences.
+func replicationLinks(items []v1alpha1.HarborArtifact) []string {
+	var out []string
+	for _, a := range items {
+		link := a.Namespace + "/" + a.Name
+		if label, ok := a.Labels[v1alpha1.ReplicationLabel]; ok {
+			link += " label " + label
+		}
+		for _, o := range a.OwnerReferences {
+			link += fmt.Sprintf(" owner %s %s %s %s", o.APIVersion, o.Kind, o.Name, o.UID)
+		}
+		out = append(out, link)
+	}
+	return out
+}
+
+func byReplication(name string) *metainternalversion.ListOptions {
+	return &metainternalversion.ListOptions{LabelSelector: labels.SelectorFromSet(labels.Set{v1alpha1.ReplicationLabel: name})}
+}
+
+func TestReplicatedArtifactsLinkToTheirReplicationInItsNamespace(t *testing.T) {
+	f := newReplicationFixture(t)
+	want := []string{
+		"ns1/k8s.ns1.nginx-old.library.nginx.sha256-bbbbbbbbbbbb",
+		"ns1/" + replicatedArtifact + " label nginx owner harbor.goharbor.io/v1alpha1 HarborReplication nginx nginx-uid",
+		"ns1/nginx.sha256-cccccccccccc",
+		"ns2/k8s.ns1.nginx-old.library.nginx.sha256-bbbbbbbbbbbb",
+		"ns2/" + replicatedArtifact,
+		"ns2/nginx.sha256-cccccccccccc",
+	}
+	items := artifactItems(t, f.artifacts, "", nil)
+	if diff := cmp.Diff(want, replicationLinks(items)); diff != "" {
+		t.Errorf("links (-want +got):\n%s", diff)
+	}
+
+	wantMeta := metav1.ObjectMeta{
+		Name:      replicatedArtifact,
+		Namespace: "ns1",
+		UID:       uid("ns1", "harborartifacts", 1),
+		Labels:    map[string]string{v1alpha1.RepositoryLabel: "k8s.ns1.nginx.library.nginx", v1alpha1.ReplicationLabel: "nginx"},
+		OwnerReferences: []metav1.OwnerReference{
+			{APIVersion: "harbor.goharbor.io/v1alpha1", Kind: "HarborReplication", Name: "nginx", UID: "nginx-uid"},
+		},
+	}
+	if diff := cmp.Diff(wantMeta, items[1].ObjectMeta); diff != "" {
+		t.Errorf("metadata (-want +got):\n%s", diff)
+	}
+	for _, want := range items {
+		got, err := f.artifacts.Get(inNamespace(want.Namespace), want.Name, &metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diff := cmp.Diff(&want, got); diff != "" {
+			t.Errorf("%s/%s: get differs from list (-list +get):\n%s", want.Namespace, want.Name, diff)
+		}
+	}
+	if diff := cmp.Diff([]string{"ListReplicationPolicies k8s.proj."}, f.replications.calls); diff != "" {
+		t.Errorf("replication calls (-want +got):\n%s", diff)
+	}
+}
+
+func TestReplicatedArtifactsAreCopies(t *testing.T) {
+	f := newReplicationFixture(t)
+	obj, err := f.artifacts.Get(inNamespace("ns1"), replicatedArtifact, &metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := obj.(*v1alpha1.HarborArtifact)
+	if len(a.OwnerReferences) != 1 {
+		t.Fatalf("got ownerReferences %v", a.OwnerReferences)
+	}
+	a.Labels[v1alpha1.RepositoryLabel] = "changed"
+	a.OwnerReferences[0].Name = "changed"
+	if diff := cmp.Diff([]string{"ns1/" + replicatedArtifact + " label nginx owner harbor.goharbor.io/v1alpha1 HarborReplication nginx nginx-uid"}, replicationLinks(artifactItems(t, f.artifacts, "ns1", byReplication("nginx")))); diff != "" {
+		t.Errorf("links (-want +got):\n%s", diff)
+	}
+	for _, item := range artifactItems(t, f.artifacts, "", nil) {
+		if label := item.Labels[v1alpha1.RepositoryLabel]; label == "changed" {
+			t.Errorf("%s/%s has repository label %q", item.Namespace, item.Name, label)
+		}
+	}
+}
+
+func TestRecreatedNamespaceSeesNoReplicationLinks(t *testing.T) {
+	f := newReplicationFixture(t)
+	f.namespaces["ns1"] = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns1", UID: "recreated"}}
+	items := artifactItems(t, f.artifacts, "ns1", nil)
+	if diff := cmp.Diff(artifactNames(items), replicationLinks(items)); diff != "" {
+		t.Errorf("links (-none +got):\n%s", diff)
+	}
+	obj, err := f.artifacts.Get(inNamespace("ns1"), replicatedArtifact, &metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := obj.(*v1alpha1.HarborArtifact); a.Labels[v1alpha1.ReplicationLabel] != "" || a.OwnerReferences != nil {
+		t.Errorf("get has labels %v and ownerReferences %v", a.Labels, a.OwnerReferences)
+	}
+	if names := artifactNames(artifactItems(t, f.artifacts, "", byReplication("nginx"))); names != nil {
+		t.Errorf("listed %v by the replication label", names)
+	}
+}
+
+func TestListArtifactsByReplicationLabel(t *testing.T) {
+	f := newReplicationFixture(t)
+	for _, tc := range []struct {
+		desc, namespace string
+		opts            *metainternalversion.ListOptions
+		want            []string
+	}{
+		{"replication", "ns1", byReplication("nginx"), []string{"ns1/" + replicatedArtifact}},
+		{"replication across namespaces", "", byReplication("nginx"), []string{"ns1/" + replicatedArtifact}},
+		{"replication from another namespace", "ns2", byReplication("nginx"), nil},
+		{"another replication", "ns1", byReplication("nginx-old"), nil},
+		{"replication and repository", "ns1", byLabelSelector(v1alpha1.ReplicationLabel + "=nginx," + v1alpha1.RepositoryLabel + "=k8s.ns1.nginx.library.nginx"), []string{"ns1/" + replicatedArtifact}},
+		{"no replication", "", byLabelSelector("!" + v1alpha1.ReplicationLabel), []string{
+			"ns1/k8s.ns1.nginx-old.library.nginx.sha256-bbbbbbbbbbbb",
+			"ns1/nginx.sha256-cccccccccccc",
+			"ns2/k8s.ns1.nginx-old.library.nginx.sha256-bbbbbbbbbbbb",
+			"ns2/" + replicatedArtifact,
+			"ns2/nginx.sha256-cccccccccccc",
+		}},
+	} {
+		if diff := cmp.Diff(tc.want, artifactNames(artifactItems(t, f.artifacts, tc.namespace, tc.opts))); diff != "" {
+			t.Errorf("%s: names (-want +got):\n%s", tc.desc, diff)
 		}
 	}
 }

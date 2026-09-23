@@ -46,16 +46,21 @@ func NewArtifacts(s *Store) *Artifacts {
 			return fields.Set{"status.repository": o.(*v1alpha1.HarborArtifact).Status.Repository}
 		},
 		mayReturnArtifacts: mayReturn,
+		selectsByLinks:     selectsByReplication,
 	}}
 }
 
 // mayReturn returns whether a request with opts could return artifacts of repository in project.
-func mayReturn(opts *metainternalversion.ListOptions, project, repository string) bool {
+// In its namespace, the replication of link, if not nil, adds its label to the artifacts.
+func mayReturn(opts *metainternalversion.ListOptions, project, repository string, link *replicationLink) bool {
 	if opts == nil {
 		return true
 	}
-	if opts.LabelSelector != nil && !opts.LabelSelector.Matches(artifactLabels(repository)) {
-		return false
+	if s := opts.LabelSelector; s != nil {
+		base := artifactLabels(repository)
+		if !s.Matches(base) && (link == nil || !s.Matches(link.labels(base))) {
+			return false
+		}
 	}
 	if opts.FieldSelector != nil {
 		if full, ok := opts.FieldSelector.RequiresExactMatch("status.repository"); ok && full != project+"/"+repository {
@@ -66,6 +71,15 @@ func mayReturn(opts *metainternalversion.ListOptions, project, repository string
 		}
 	}
 	return true
+}
+
+// selectsByReplication returns whether a request with opts selects artifacts by the replication label.
+func selectsByReplication(opts *metainternalversion.ListOptions) bool {
+	if opts == nil || opts.LabelSelector == nil {
+		return false
+	}
+	requirements, _ := opts.LabelSelector.Requirements()
+	return slices.ContainsFunc(requirements, func(r labels.Requirement) bool { return r.Key() == v1alpha1.ReplicationLabel })
 }
 
 func (a *Artifacts) GetSingularName() string { return "harborartifact" }
@@ -99,7 +113,7 @@ func artifactItem(project, repository string, artifact harbor.Artifact) *item {
 		obj.Status.ConfigMediaType = artifact.MediaType
 	}
 	obj.Labels = artifactLabels(repository)
-	return &item{harborID: artifact.ID, obj: obj}
+	return &item{harborID: artifact.ID, obj: obj, repository: repository}
 }
 
 // artifactLabels returns the labels of every artifact of repository.

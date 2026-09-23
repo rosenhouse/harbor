@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +34,8 @@ type Harbor interface {
 type Namespaces interface {
 	Allows(namespace string) bool
 	Namespaces() []string
+	// Namespace returns the named namespace if it sees the project. Callers must not modify it.
+	Namespace(name string) (*corev1.Namespace, bool)
 }
 
 type object interface {
@@ -49,8 +52,11 @@ type storage struct {
 	newList   func() runtime.Object
 	// fields returns an object's selectable fields besides its name and namespace.
 	fields func(runtime.Object) fields.Set
-	// mayReturnArtifacts returns whether a request with opts could return artifacts of repository in project. Nil means never.
-	mayReturnArtifacts func(opts *metainternalversion.ListOptions, project, repository string) bool
+	// mayReturnArtifacts returns whether a request with opts could return artifacts of repository in project,
+	// which the replication of link, if not nil, copied. Nil means never.
+	mayReturnArtifacts func(opts *metainternalversion.ListOptions, project, repository string, link *replicationLink) bool
+	// selectsByLinks returns whether a request with opts selects objects by the replications that they link to. Nil means never.
+	selectsByLinks func(opts *metainternalversion.ListOptions) bool
 }
 
 func (s *storage) New() runtime.Object     { return s.newObject() }
@@ -64,7 +70,8 @@ func (s *storage) Get(ctx context.Context, name string, _ *metav1.GetOptions) (r
 }
 
 func (s *storage) List(ctx context.Context, opts *metainternalversion.ListOptions) (runtime.Object, error) {
-	objs, err := s.store.list(s.resource, genericapirequest.NamespaceValue(ctx), s.matcher(opts), s.needs(opts))
+	needsLinks := s.selectsByLinks != nil && s.selectsByLinks(opts)
+	objs, err := s.store.list(s.resource, genericapirequest.NamespaceValue(ctx), s.matcher(opts), s.needs(opts), needsLinks)
 	if err != nil {
 		return nil, err
 	}
@@ -76,19 +83,19 @@ func (s *storage) List(ctx context.Context, opts *metainternalversion.ListOption
 }
 
 // needs returns whether a response to a request with opts needs a repository's artifacts.
-func (s *storage) needs(opts *metainternalversion.ListOptions) func(repository string) bool {
-	return func(repository string) bool {
-		return s.mayReturnArtifacts != nil && s.mayReturnArtifacts(opts, s.store.project, repository)
+func (s *storage) needs(opts *metainternalversion.ListOptions) func(repository string, link *replicationLink) bool {
+	return func(repository string, link *replicationLink) bool {
+		return s.mayReturnArtifacts != nil && s.mayReturnArtifacts(opts, s.store.project, repository, link)
 	}
 }
 
-// matcher returns whether an object, in a namespace, matches the selectors of opts.
-func (s *storage) matcher(opts *metainternalversion.ListOptions) func(object, string) bool {
-	return func(o object, namespace string) bool {
+// matcher returns whether an object, with labels, in a namespace, matches the selectors of opts.
+func (s *storage) matcher(opts *metainternalversion.ListOptions) func(object, labels.Set, string) bool {
+	return func(o object, l labels.Set, namespace string) bool {
 		if opts == nil {
 			return true
 		}
-		if opts.LabelSelector != nil && !opts.LabelSelector.Matches(labels.Set(o.GetLabels())) {
+		if opts.LabelSelector != nil && !opts.LabelSelector.Matches(l) {
 			return false
 		}
 		if opts.FieldSelector == nil {

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	restclient "k8s.io/client-go/rest"
 
@@ -41,6 +42,12 @@ type allowed struct{}
 
 func (allowed) Allows(ns string) bool { return ns == "allowed" }
 func (allowed) Namespaces() []string  { return []string{"allowed"} }
+func (allowed) Namespace(ns string) (*corev1.Namespace, bool) {
+	if ns != "allowed" {
+		return nil, false
+	}
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, UID: "allowed-uid"}}, true
+}
 
 func newHandler(t *testing.T) http.Handler {
 	t.Helper()
