@@ -16,8 +16,18 @@ func (in HarborArtifactList) OpenAPIModelName() string {
 }
 
 // OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HarborArtifactReference) OpenAPIModelName() string {
+	return "io.goharbor.harbor.v1alpha1.HarborArtifactReference"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
 func (in HarborArtifactStatus) OpenAPIModelName() string {
 	return "io.goharbor.harbor.v1alpha1.HarborArtifactStatus"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HarborPlatform) OpenAPIModelName() string {
+	return "io.goharbor.harbor.v1alpha1.HarborPlatform"
 }
 
 // OpenAPIModelName returns the OpenAPI model name for this type.
@@ -33,4 +43,9 @@ func (in HarborRepositoryList) OpenAPIModelName() string {
 // OpenAPIModelName returns the OpenAPI model name for this type.
 func (in HarborRepositoryStatus) OpenAPIModelName() string {
 	return "io.goharbor.harbor.v1alpha1.HarborRepositoryStatus"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HarborTag) OpenAPIModelName() string {
+	return "io.goharbor.harbor.v1alpha1.HarborTag"
 }

@@ -152,18 +152,8 @@ func TestPathsEncodeNestedRepositoryNamesTwice(t *testing.T) {
 	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{}`)
 	})
-	c := newClient(t, f)
-	ctx := context.Background()
-	digest := "sha256:" + strings.Repeat("0", 64)
-
-	_, _ = c.GetRepository(ctx, "proj", "team/app")
-	_, _ = c.GetArtifact(ctx, "proj", "team/app", digest)
-
-	want := []string{
-		"/api/v2.0/projects/proj/repositories/team%252Fapp",
-		"/api/v2.0/projects/proj/repositories/team%252Fapp/artifacts/" + digest + "?with_tag=true",
-	}
-	if diff := cmp.Diff(want, f.requests); diff != "" {
+	_, _ = newClient(t, f).GetRepository(context.Background(), "proj", "team/app")
+	if diff := cmp.Diff([]string{"/api/v2.0/projects/proj/repositories/team%252Fapp"}, f.requests); diff != "" {
 		t.Errorf("requests (-want +got):\n%s", diff)
 	}
 }
@@ -187,7 +177,7 @@ func TestListArtifacts(t *testing.T) {
 		}]`)
 	})
 
-	artifacts, err := newClient(t, f).ListArtifacts(context.Background(), "proj", "team/app")
+	artifacts, err := newClient(t, f).ListArtifacts(context.Background(), "proj", "team/app", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,6 +201,16 @@ func TestListArtifacts(t *testing.T) {
 	}}
 	if diff := cmp.Diff(want, artifacts); diff != "" {
 		t.Errorf("artifacts (-want +got):\n%s", diff)
+	}
+}
+
+func TestListArtifactsWithDigestPrefix(t *testing.T) {
+	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) { writeJSON(t, w, []harbor.Artifact{}) })
+	if _, err := newClient(t, f).ListArtifacts(context.Background(), "proj", "app", "sha256:0123456789ab"); err != nil {
+		t.Fatal(err)
+	}
+	if want := "/api/v2.0/projects/proj/repositories/app/artifacts?page=1&page_size=100&q=digest%3D~sha256%3A0123456789ab&sort=id&with_tag=true"; f.requests[0] != want {
+		t.Errorf("request %s, want %s", f.requests[0], want)
 	}
 }
 
@@ -372,6 +372,10 @@ func TestHTTPClientTrustsCABundle(t *testing.T) {
 	}
 	if system.Timeout != time.Second {
 		t.Errorf("timeout %v", system.Timeout)
+	}
+
+	if n := system.Transport.(*http.Transport).MaxIdleConnsPerHost; n < 4 {
+		t.Errorf("keeps %d idle connections per host, fewer than a list's concurrent requests", n)
 	}
 
 	if _, err := harbor.NewHTTPClient([]byte("not a certificate"), time.Second); err == nil {

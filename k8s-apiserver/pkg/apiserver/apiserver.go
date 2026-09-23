@@ -63,9 +63,7 @@ func New(c genericapiserver.CompletedConfig, h registry.Harbor, project string, 
 	group.NegotiatedSerializer = withoutProtobuf{group.NegotiatedSerializer}
 	group.VersionedResourcesStorageMap[v1alpha1.SchemeGroupVersion.Version] = map[string]rest.Storage{
 		"harborrepositories": registry.NewRepositories(h, project, n),
-		"harborartifacts": registry.NewStub(v1alpha1.Resource("harborartifacts"), "harborartifact",
-			func() runtime.Object { return &v1alpha1.HarborArtifact{} },
-			func() runtime.Object { return &v1alpha1.HarborArtifactList{} }),
+		"harborartifacts":    registry.NewArtifacts(h, project, n),
 	}
 	if err := s.InstallAPIGroup(&group); err != nil {
 		return nil, err

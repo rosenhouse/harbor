@@ -33,6 +33,10 @@ func (fakeHarbor) GetRepository(context.Context, string, string) (*harbor.Reposi
 	return nil, harbor.ErrNotFound
 }
 
+func (fakeHarbor) ListArtifacts(context.Context, string, string, string) ([]harbor.Artifact, error) {
+	return nil, nil
+}
+
 func namespace(name string, labels map[string]string) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
 }

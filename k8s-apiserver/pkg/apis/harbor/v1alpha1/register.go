@@ -1,6 +1,8 @@
 package v1alpha1
 
 import (
+	"fmt"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -22,5 +24,13 @@ func AddToScheme(scheme *runtime.Scheme) error {
 		&HarborArtifactList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
-	return nil
+	return scheme.AddFieldLabelConversionFunc(SchemeGroupVersion.WithKind("HarborArtifact"), artifactFieldLabel)
+}
+
+func artifactFieldLabel(label, value string) (string, string, error) {
+	switch label {
+	case "metadata.name", "metadata.namespace", "status.repository":
+		return label, value, nil
+	}
+	return "", "", fmt.Errorf("field label not supported: %s", label)
 }

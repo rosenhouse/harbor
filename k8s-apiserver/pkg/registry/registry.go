@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +26,7 @@ import (
 type Harbor interface {
 	ListRepositories(ctx context.Context, project string) ([]harbor.Repository, error)
 	GetRepository(ctx context.Context, project, repository string) (*harbor.Repository, error)
+	ListArtifacts(ctx context.Context, project, repository, digestPrefix string) ([]harbor.Artifact, error)
 }
 
 // Namespaces decides which namespaces see the project.
@@ -46,16 +48,20 @@ func requestNamespaces(ctx context.Context, n Namespaces) []string {
 }
 
 func matches(meta metav1.ObjectMeta, opts *metainternalversion.ListOptions) bool {
+	return matchesFields(meta, nil, opts)
+}
+
+// matchesFields is matches for an object with more selectable fields than its name and namespace.
+func matchesFields(meta metav1.ObjectMeta, more fields.Set, opts *metainternalversion.ListOptions) bool {
 	if opts == nil {
 		return true
 	}
 	if opts.LabelSelector != nil && !opts.LabelSelector.Matches(labels.Set(meta.Labels)) {
 		return false
 	}
-	return opts.FieldSelector == nil || opts.FieldSelector.Matches(fields.Set{
-		"metadata.name":      meta.Name,
-		"metadata.namespace": meta.Namespace,
-	})
+	set := fields.Set{"metadata.name": meta.Name, "metadata.namespace": meta.Namespace}
+	maps.Copy(set, more)
+	return opts.FieldSelector == nil || opts.FieldSelector.Matches(set)
 }
 
 // uid is stable for a Harbor object seen from a namespace, and changes if Harbor recreates the object.

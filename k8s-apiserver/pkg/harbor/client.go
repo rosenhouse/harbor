@@ -113,6 +113,7 @@ func NewClient(baseURL string, credentials Credentials, httpClient *http.Client)
 // NewHTTPClient returns a client that trusts caBundle (PEM) in addition to the system roots.
 func NewHTTPClient(caBundle []byte, timeout time.Duration) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 16
 	if len(caBundle) > 0 {
 		pool, err := x509.SystemCertPool()
 		if err != nil {
@@ -140,17 +141,14 @@ func (c *Client) GetRepository(ctx context.Context, project, repository string) 
 	return &r, nil
 }
 
-func (c *Client) ListArtifacts(ctx context.Context, project, repository string) ([]Artifact, error) {
-	return list(ctx, c, repositoryPath(project, repository)+"/artifacts", url.Values{"sort": {"id"}, "with_tag": {"true"}},
-		func(a Artifact) int64 { return a.ID })
-}
-
-func (c *Client) GetArtifact(ctx context.Context, project, repository, digest string) (*Artifact, error) {
-	var a Artifact
-	if _, err := c.get(ctx, repositoryPath(project, repository)+"/artifacts/"+url.PathEscape(digest), url.Values{"with_tag": {"true"}}, &a); err != nil {
-		return nil, err
+// ListArtifacts lists a repository's artifacts, leaving out accessories and the children of an index.
+// A digestPrefix such as "sha256:0123" lists only the artifacts whose digests start with it.
+func (c *Client) ListArtifacts(ctx context.Context, project, repository, digestPrefix string) ([]Artifact, error) {
+	query := url.Values{"sort": {"id"}, "with_tag": {"true"}}
+	if digestPrefix != "" {
+		query.Set("q", "digest=~"+digestPrefix)
 	}
-	return &a, nil
+	return list(ctx, c, repositoryPath(project, repository)+"/artifacts", query, func(a Artifact) int64 { return a.ID })
 }
 
 func projectPath(project string) string {
