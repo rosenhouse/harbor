@@ -6,6 +6,11 @@ cd "$(dirname "$0")/.."
 module=$(go list -m)
 header=hack/boilerplate.go.txt
 apis=./pkg/apis/harbor/v1alpha1
+readonly_pkgs=(
+  k8s.io/apimachinery/pkg/apis/meta/v1
+  k8s.io/apimachinery/pkg/runtime
+  k8s.io/apimachinery/pkg/version
+)
 
 go tool deepcopy-gen --output-file zz_generated.deepcopy.go --go-header-file "$header" "$apis"
 
@@ -16,7 +21,6 @@ go tool openapi-gen \
   --go-header-file "$header" \
   --report-filename hack/api-rule-violations.list \
   --output-model-name-file zz_generated.model_name.go \
-  k8s.io/apimachinery/pkg/apis/meta/v1 \
-  k8s.io/apimachinery/pkg/runtime \
-  k8s.io/apimachinery/pkg/version \
+  "${readonly_pkgs[@]/#/--readonly-pkg=}" \
+  "${readonly_pkgs[@]}" \
   "$apis"
