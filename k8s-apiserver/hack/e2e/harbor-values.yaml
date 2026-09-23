@@ -3,8 +3,9 @@ expose:
   tls:
     enabled: false
 externalURL: http://localhost:30002
+# Persistent volumes keep registry blobs and database records in step when a pod restarts.
 persistence:
-  enabled: false
+  enabled: true
 trivy:
   enabled: false
 ipFamily:
