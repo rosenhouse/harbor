@@ -3,8 +3,6 @@ package registry
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apis/harbor/v1alpha1"
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
@@ -27,17 +24,18 @@ var (
 	updated = created.Add(time.Hour)
 )
 
-func newRepositories() (*Repositories, *fakeHarbor) {
-	h := &fakeHarbor{repositories: []harbor.Repository{
+func repositoryHarbor() *fakeHarbor {
+	return &fakeHarbor{repositories: []harbor.Repository{
 		{ID: 1, Name: "proj/nginx", Description: "web", ArtifactCount: 3, PullCount: 120, CreationTime: created, UpdateTime: updated},
 		{ID: 2, Name: "proj/team/api", ArtifactCount: 1, CreationTime: created},
 		{ID: 3, Name: "proj/dotted.name", CreationTime: created},
 	}}
-	return NewRepositories(h, "proj", fakeNamespaces{"ns1", "ns2"}), h
 }
 
-func inNamespace(ns string) context.Context {
-	return genericapirequest.WithNamespace(context.Background(), ns)
+func newRepositories(t *testing.T) (*Repositories, *fixture) {
+	t.Helper()
+	f := newFixture(t, repositoryHarbor())
+	return f.repositories, f
 }
 
 func listItems(t *testing.T, r *Repositories, namespace string, opts *metainternalversion.ListOptions) []v1alpha1.HarborRepository {
@@ -57,15 +55,23 @@ func names(items []v1alpha1.HarborRepository) []string {
 	return n
 }
 
+var dottedRepository = repositoryObjectName("dotted.name")
+
 func TestListRepositories(t *testing.T) {
-	r, _ := newRepositories()
-	items := listItems(t, r, "ns1", nil)
+	r, _ := newRepositories(t)
+	obj, err := r.List(inNamespace("ns1"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := obj.(*v1alpha1.HarborRepositoryList)
+	items := list.Items
 
 	want := v1alpha1.HarborRepository{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "nginx",
 			Namespace:         "ns1",
 			UID:               "00574b18-6628-5e46-960b-b7011fb281e7",
+			ResourceVersion:   items[1].ResourceVersion,
 			CreationTimestamp: metav1.NewTime(created),
 		},
 		Status: v1alpha1.HarborRepositoryStatus{
@@ -76,27 +82,32 @@ func TestListRepositories(t *testing.T) {
 			UpdateTime:    &metav1.Time{Time: updated},
 		},
 	}
-	if diff := cmp.Diff(want, items[0]); diff != "" {
+	if diff := cmp.Diff(want, items[1]); diff != "" {
 		t.Errorf("nginx (-want +got):\n%s", diff)
 	}
-	if diff := cmp.Diff([]string{"ns1/nginx", "ns1/team.api", "ns1/" + repositoryObjectName("dotted.name")}, names(items)); diff != "" {
+	if diff := cmp.Diff([]string{"ns1/" + dottedRepository, "ns1/nginx", "ns1/team.api"}, names(items)); diff != "" {
 		t.Errorf("names (-want +got):\n%s", diff)
 	}
-	if items[1].Status.UpdateTime != nil {
-		t.Errorf("team/api has update time %v, want none", items[1].Status.UpdateTime)
+	if items[2].Status.UpdateTime != nil {
+		t.Errorf("team/api has update time %v, want none", items[2].Status.UpdateTime)
+	}
+	for _, item := range items {
+		if parseRV(t, item.ResourceVersion) > parseRV(t, list.ResourceVersion) {
+			t.Errorf("%s has resourceVersion %s, after the list's %s", item.Name, item.ResourceVersion, list.ResourceVersion)
+		}
 	}
 }
 
 func TestListRepositoriesAcrossNamespaces(t *testing.T) {
-	r, _ := newRepositories()
-	want := []string{"ns1/nginx", "ns1/team.api", "ns1/" + repositoryObjectName("dotted.name"), "ns2/nginx", "ns2/team.api", "ns2/" + repositoryObjectName("dotted.name")}
+	r, _ := newRepositories(t)
+	want := []string{"ns1/" + dottedRepository, "ns1/nginx", "ns1/team.api", "ns2/" + dottedRepository, "ns2/nginx", "ns2/team.api"}
 	if diff := cmp.Diff(want, names(listItems(t, r, "", nil))); diff != "" {
 		t.Errorf("names (-want +got):\n%s", diff)
 	}
 }
 
 func TestRepositoryUIDs(t *testing.T) {
-	r, h := newRepositories()
+	r, f := newRepositories(t)
 	before := listItems(t, r, "", nil)
 	seen := map[types.UID]string{}
 	for _, repo := range before {
@@ -106,31 +117,32 @@ func TestRepositoryUIDs(t *testing.T) {
 		seen[repo.UID] = repo.Namespace + "/" + repo.Name
 	}
 
-	h.repositories[0].ID = 4
+	f.harbor.repositories[0].ID = 4
+	f.poll(t)
 	after := listItems(t, r, "", nil)
-	if after[0].UID == before[0].UID {
+	if after[1].UID == before[1].UID {
 		t.Error("a recreated repository kept its UID")
 	}
-	if after[1].UID != before[1].UID {
+	if after[2].UID != before[2].UID {
 		t.Error("an unchanged repository changed its UID")
 	}
 }
 
 func TestListRepositoriesInDisallowedNamespace(t *testing.T) {
-	r, h := newRepositories()
-	if n := names(listItems(t, r, "other", nil)); len(n) != 0 || len(h.calls) != 0 {
-		t.Errorf("got %v after Harbor calls %v", n, h.calls)
+	r, _ := newRepositories(t)
+	if n := names(listItems(t, r, "other", nil)); len(n) != 0 {
+		t.Errorf("got %v", n)
 	}
 }
 
 func TestListRepositoriesWithSelectors(t *testing.T) {
-	r, _ := newRepositories()
+	r, _ := newRepositories(t)
 	for _, tc := range []struct {
 		opts *metainternalversion.ListOptions
 		want []string
 	}{
 		{&metainternalversion.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.name", "team.api")}, []string{"ns1/team.api", "ns2/team.api"}},
-		{&metainternalversion.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.namespace", "ns2"), LabelSelector: labels.Everything()}, []string{"ns2/nginx", "ns2/team.api", "ns2/" + repositoryObjectName("dotted.name")}},
+		{&metainternalversion.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.namespace", "ns2"), LabelSelector: labels.Everything()}, []string{"ns2/" + dottedRepository, "ns2/nginx", "ns2/team.api"}},
 		{&metainternalversion.ListOptions{LabelSelector: labels.SelectorFromSet(labels.Set{"a": "b"})}, nil},
 	} {
 		if diff := cmp.Diff(tc.want, names(listItems(t, r, "", tc.opts))); diff != "" {
@@ -140,80 +152,53 @@ func TestListRepositoriesWithSelectors(t *testing.T) {
 }
 
 func TestGetRepository(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		wantCalls []string
-	}{
-		{"team.api", []string{"get proj team/api"}},
-		{repositoryObjectName("dotted.name"), []string{"list proj"}},
-	} {
-		r, h := newRepositories()
-		obj, err := r.Get(inNamespace("ns2"), tc.name, &metav1.GetOptions{})
+	r, _ := newRepositories(t)
+	listed := listItems(t, r, "ns2", nil)
+	for _, want := range listed {
+		obj, err := r.Get(inNamespace("ns2"), want.Name, &metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := obj.(*v1alpha1.HarborRepository)
-		if got.Name != tc.name || got.Namespace != "ns2" {
-			t.Errorf("got %s/%s", got.Namespace, got.Name)
-		}
-		if diff := cmp.Diff(tc.wantCalls, h.calls); diff != "" {
-			t.Errorf("%s: Harbor calls (-want +got):\n%s", tc.name, diff)
+		if diff := cmp.Diff(&want, obj); diff != "" {
+			t.Errorf("%s: get differs from list (-list +get):\n%s", want.Name, diff)
 		}
 	}
 }
 
 func TestGetRepositoryNotFound(t *testing.T) {
-	for _, tc := range []struct {
-		namespace, name string
-		wantCalls       []string
-	}{
-		{"ns1", "missing", []string{"get proj missing"}},
-		{"ns1", "dotted.name", []string{"get proj dotted/name"}},
-		{"ns1", "missing-0123456789", []string{"list proj"}},
-		{"ns1", "Not_A_Name", nil},
-		{"other", "nginx", nil},
+	for _, tc := range []struct{ namespace, name string }{
+		{"ns1", "missing"},
+		{"ns1", "dotted.name"},
+		{"ns1", "Not_A_Name"},
+		{"other", "nginx"},
 	} {
-		r, h := newRepositories()
+		r, _ := newRepositories(t)
 		_, err := r.Get(inNamespace(tc.namespace), tc.name, &metav1.GetOptions{})
 		if !apierrors.IsNotFound(err) {
 			t.Errorf("%s/%s: got %v, want NotFound", tc.namespace, tc.name, err)
 		}
-		if diff := cmp.Diff(tc.wantCalls, h.calls); diff != "" {
-			t.Errorf("%s/%s: Harbor calls (-want +got):\n%s", tc.namespace, tc.name, diff)
-		}
 	}
 }
 
-func TestRepositoryHarborErrors(t *testing.T) {
-	for _, tc := range []struct {
-		harborErr error
-		want      func(error) bool
-	}{
-		{fmt.Errorf("%w: dial tcp 10.0.0.1:443: refused", harbor.ErrUnavailable), apierrors.IsServiceUnavailable},
-		{harbor.ErrUnauthorized, apierrors.IsInternalError},
-		{harbor.ErrForbidden, apierrors.IsInternalError},
-		{errors.New("boom"), apierrors.IsInternalError},
-	} {
-		r, h := newRepositories()
-		h.err = tc.harborErr
-		if _, err := r.Get(inNamespace("ns1"), "nginx", &metav1.GetOptions{}); !tc.want(err) {
-			t.Errorf("get with %v: got %v", tc.harborErr, err)
-		}
-		_, err := r.List(inNamespace("ns1"), nil)
-		if !tc.want(err) {
-			t.Errorf("list with %v: got %v", tc.harborErr, err)
-		}
-		if strings.Contains(err.Error(), "10.0.0.1") || strings.Contains(err.Error(), "boom") {
-			t.Errorf("list with %v: error %q leaks details", tc.harborErr, err)
-		}
+func TestRequestsDoNotCallHarbor(t *testing.T) {
+	r, f := newRepositories(t)
+	f.harbor.calls = nil
+	listItems(t, r, "", nil)
+	if _, err := r.Get(inNamespace("ns1"), "nginx", &metav1.GetOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	startWatch(t, r, "", &metainternalversion.ListOptions{ResourceVersion: "0"})
+	if len(f.harbor.calls) > 0 {
+		t.Errorf("called Harbor: %v", f.harbor.calls)
 	}
 }
 
 func TestRepositoryTable(t *testing.T) {
-	r, h := newRepositories()
+	h := repositoryHarbor()
 	h.repositories[0].CreationTime = time.Now().Add(-10 * time.Hour)
 	h.repositories[1].CreationTime = time.Time{}
 	h.repositories[2].CreationTime = time.Now().Add(-72 * time.Hour)
+	r := newFixture(t, h).repositories
 	list, err := r.List(inNamespace("ns1"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -234,9 +219,9 @@ func TestRepositoryTable(t *testing.T) {
 		cells = append(cells, row.Cells)
 	}
 	wantCells := [][]any{
+		{dottedRepository, "proj/dotted.name", int64(0), int64(0), "3d"},
 		{"nginx", "proj/nginx", int64(3), int64(120), "10h"},
 		{"team.api", "proj/team/api", int64(1), int64(0), "<unknown>"},
-		{repositoryObjectName("dotted.name"), "proj/dotted.name", int64(0), int64(0), "3d"},
 	}
 	if diff := cmp.Diff(wantCells, cells); diff != "" {
 		t.Errorf("cells (-want +got):\n%s", diff)
@@ -252,7 +237,7 @@ func TestRepositoryTable(t *testing.T) {
 }
 
 func TestRepositoryTableOfEmptyList(t *testing.T) {
-	r, _ := newRepositories()
+	r, _ := newRepositories(t)
 	listMeta := metav1.ListMeta{ResourceVersion: "7", Continue: "next"}
 	table, err := r.ConvertToTable(context.Background(), &v1alpha1.HarborRepositoryList{ListMeta: listMeta}, nil)
 	if err != nil {

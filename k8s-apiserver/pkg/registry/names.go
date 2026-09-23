@@ -15,8 +15,7 @@ var (
 	notNameChars = regexp.MustCompile(`[^a-z0-9.-]`)
 	hashSuffix   = regexp.MustCompile(`-[0-9a-f]{10}$`)
 
-	nameableDigest    = regexp.MustCompile(`^([a-z0-9]{1,16}):([0-9a-f]{12})[0-9a-f]*$`)
-	artifactNameParts = regexp.MustCompile(`^(.+)(\.([a-z0-9]{1,16})-([0-9a-f]{12}))$`)
+	nameableDigest = regexp.MustCompile(`^([a-z0-9]{1,16}):([0-9a-f]{12})[0-9a-f]*$`)
 )
 
 // repositoryObjectName maps a repository name within its project, such as "team/api", to an object name.
@@ -52,22 +51,6 @@ func artifactObjectName(repository, digest string) string {
 	return repositoryObjectNameWithin(repository, validation.DNS1123SubdomainMaxLength-len(suffix)) + suffix
 }
 
-// splitArtifactObjectName returns the repository part of an artifact's object name, the length it was shortened to,
-// and the digest prefix, such as "sha256:0123456789ab".
-func splitArtifactObjectName(name string) (repositoryPart, digestPrefix string, maxLength int, ok bool) {
-	m := artifactNameParts.FindStringSubmatch(name)
-	if m == nil {
-		return "", "", 0, false
-	}
-	return m[1], m[3] + ":" + m[4], validation.DNS1123SubdomainMaxLength - len(m[2]), true
-}
-
-// isHashed reports whether an object name has a hash suffix, which only listing can resolve.
 func isHashed(objectName string) bool {
 	return hashSuffix.MatchString(objectName)
-}
-
-// repositoryNameCandidate reverses repositoryObjectName for names without a hash suffix.
-func repositoryNameCandidate(objectName string) string {
-	return strings.ReplaceAll(objectName, ".", "/")
 }

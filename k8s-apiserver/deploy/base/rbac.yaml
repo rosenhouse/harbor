@@ -63,4 +63,4 @@ metadata:
 rules:
   - apiGroups: [harbor.goharbor.io]
     resources: [harborrepositories, harborartifacts]
-    verbs: [get, list]
+    verbs: [get, list, watch]

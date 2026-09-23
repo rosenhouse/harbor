@@ -9,15 +9,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/duration"
+	"k8s.io/apimachinery/pkg/watch"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/klog/v2"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 )
@@ -25,43 +27,68 @@ import (
 // Harbor reads a Harbor project.
 type Harbor interface {
 	ListRepositories(ctx context.Context, project string) ([]harbor.Repository, error)
-	GetRepository(ctx context.Context, project, repository string) (*harbor.Repository, error)
-	ListArtifacts(ctx context.Context, project, repository, digestPrefix string) ([]harbor.Artifact, error)
+	ListArtifacts(ctx context.Context, project, repository string) ([]harbor.Artifact, error)
 }
 
-// Namespaces decides which namespaces see the project.
-type Namespaces interface {
-	Allows(namespace string) bool
-	Namespaces() []string
+type object interface {
+	runtime.Object
+	metav1.Object
 }
 
-// requestNamespaces returns the allowed namespaces that the request covers.
-func requestNamespaces(ctx context.Context, n Namespaces) []string {
-	ns := genericapirequest.NamespaceValue(ctx)
-	switch {
-	case ns == "":
-		return n.Namespaces()
-	case n.Allows(ns):
-		return []string{ns}
+// storage serves one resource from a Store.
+type storage struct {
+	store     *Store
+	resource  schema.GroupResource
+	newObject func() runtime.Object
+	newList   func() runtime.Object
+	// fields returns an object's selectable fields besides its name and namespace.
+	fields func(runtime.Object) fields.Set
+}
+
+func (s *storage) New() runtime.Object     { return s.newObject() }
+func (s *storage) NewList() runtime.Object { return s.newList() }
+func (s *storage) Destroy()                {}
+func (s *storage) NamespaceScoped() bool   { return true }
+
+func (s *storage) Get(ctx context.Context, name string, _ *metav1.GetOptions) (runtime.Object, error) {
+	return s.store.get(s.resource, genericapirequest.NamespaceValue(ctx), name)
+}
+
+func (s *storage) List(ctx context.Context, opts *metainternalversion.ListOptions) (runtime.Object, error) {
+	objs, rv, err := s.store.list(s.resource.Resource, genericapirequest.NamespaceValue(ctx), opts, s.matcher(opts))
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	list := s.newList()
+	if err := meta.SetList(list, objs); err != nil {
+		return nil, err
+	}
+	list.(metav1.ListInterface).SetResourceVersion(rv)
+	return list, nil
 }
 
-func matches(meta metav1.ObjectMeta, opts *metainternalversion.ListOptions) bool {
-	return matchesFields(meta, nil, opts)
+func (s *storage) Watch(ctx context.Context, opts *metainternalversion.ListOptions) (watch.Interface, error) {
+	return s.store.watch(ctx, s.resource.Resource, genericapirequest.NamespaceValue(ctx), s.matcher(opts), opts, s.newObject)
 }
 
-// matchesFields is matches for an object with more selectable fields than its name and namespace.
-func matchesFields(meta metav1.ObjectMeta, more fields.Set, opts *metainternalversion.ListOptions) bool {
-	if opts == nil {
-		return true
+// matcher returns whether an object, in a namespace, matches the selectors of opts.
+func (s *storage) matcher(opts *metainternalversion.ListOptions) func(object, string) bool {
+	return func(o object, namespace string) bool {
+		if opts == nil {
+			return true
+		}
+		if opts.LabelSelector != nil && !opts.LabelSelector.Matches(labels.Set(o.GetLabels())) {
+			return false
+		}
+		if opts.FieldSelector == nil {
+			return true
+		}
+		set := fields.Set{"metadata.name": o.GetName(), "metadata.namespace": namespace}
+		if s.fields != nil {
+			maps.Copy(set, s.fields(o))
+		}
+		return opts.FieldSelector.Matches(set)
 	}
-	if opts.LabelSelector != nil && !opts.LabelSelector.Matches(labels.Set(meta.Labels)) {
-		return false
-	}
-	set := fields.Set{"metadata.name": meta.Name, "metadata.namespace": meta.Namespace}
-	maps.Copy(set, more)
-	return opts.FieldSelector == nil || opts.FieldSelector.Matches(set)
 }
 
 // uid is stable for a Harbor object seen from a namespace, and changes if Harbor recreates the object.
@@ -83,17 +110,12 @@ func age(t metav1.Time) string {
 	return duration.HumanDuration(time.Since(t.Time))
 }
 
-// harborError logs a failed Harbor request and reports it without Harbor's address or response.
-// A missing project or a rejected robot account is a server misconfiguration.
-func harborError(err error) error {
-	klog.ErrorS(err, "Harbor request failed")
-	if errors.Is(err, harbor.ErrUnavailable) {
-		return apierrors.NewServiceUnavailable(harbor.ErrUnavailable.Error())
-	}
-	for _, kind := range []error{harbor.ErrUnauthorized, harbor.ErrForbidden, harbor.ErrNotFound} {
+// errorKind describes a failed Harbor request without Harbor's address or response.
+func errorKind(err error) error {
+	for _, kind := range []error{harbor.ErrUnavailable, harbor.ErrUnauthorized, harbor.ErrForbidden, harbor.ErrNotFound} {
 		if errors.Is(err, kind) {
-			return apierrors.NewInternalError(kind)
+			return kind
 		}
 	}
-	return apierrors.NewInternalError(errors.New("unexpected error reading harbor"))
+	return errors.New("unexpected error reading harbor")
 }

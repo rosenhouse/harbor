@@ -5,3 +5,15 @@ resources:
 images:
   - name: harbor-apiserver
     newTag: e2e
+# Tests see Harbor changes within seconds, and a Harbor outage within the minute that they wait.
+patches:
+  - target:
+      kind: Deployment
+      name: harbor-apiserver
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --harbor-poll-interval=2s
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --harbor-staleness-limit=20s

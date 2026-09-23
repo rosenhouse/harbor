@@ -6,6 +6,8 @@ metadata:
 spec:
   selector:
     app: harbor-apiserver
+  # Each replica numbers its own resourceVersions, so a watch should reach the replica that served the list before it.
+  sessionAffinity: ClientIP
   ports:
     - name: https
       port: 443

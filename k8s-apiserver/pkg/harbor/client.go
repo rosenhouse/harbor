@@ -132,23 +132,10 @@ func (c *Client) ListRepositories(ctx context.Context, project string) ([]Reposi
 		func(r Repository) int64 { return r.ID })
 }
 
-// GetRepository gets a repository by its name within the project, such as "team/app".
-func (c *Client) GetRepository(ctx context.Context, project, repository string) (*Repository, error) {
-	var r Repository
-	if _, err := c.get(ctx, repositoryPath(project, repository), nil, &r); err != nil {
-		return nil, err
-	}
-	return &r, nil
-}
-
 // ListArtifacts lists a repository's artifacts, leaving out accessories and the children of an index.
-// A digestPrefix such as "sha256:0123" lists only the artifacts whose digests start with it.
-func (c *Client) ListArtifacts(ctx context.Context, project, repository, digestPrefix string) ([]Artifact, error) {
-	query := url.Values{"sort": {"id"}, "with_tag": {"true"}}
-	if digestPrefix != "" {
-		query.Set("q", "digest=~"+digestPrefix)
-	}
-	return list(ctx, c, repositoryPath(project, repository)+"/artifacts", query, func(a Artifact) int64 { return a.ID })
+func (c *Client) ListArtifacts(ctx context.Context, project, repository string) ([]Artifact, error) {
+	return list(ctx, c, repositoryPath(project, repository)+"/artifacts", url.Values{"sort": {"id"}, "with_tag": {"true"}},
+		func(a Artifact) int64 { return a.ID })
 }
 
 func projectPath(project string) string {
@@ -160,11 +147,28 @@ func repositoryPath(project, repository string) string {
 	return projectPath(project) + "/repositories/" + url.PathEscape(url.PathEscape(repository))
 }
 
-// list gets every page, sorted by ID so that concurrent changes shift pages as little as possible.
-// It drops items that a shift repeated.
+// listAttempts is how many times list starts over when pages shift.
+const listAttempts = 3
+
+var errShifted = errors.New("pages shifted during the list")
+
+// list gets every page, sorted by ID so that items created during the list land on its last page.
+// A deletion shifts later pages, which skips an item, so list starts over when the total count changes.
 func list[T any](ctx context.Context, c *Client, path string, query url.Values, id func(T) int64) ([]T, error) {
+	for range listAttempts {
+		all, err := listOnce(ctx, c, path, query, id)
+		if !errors.Is(err, errShifted) {
+			return all, err
+		}
+	}
+	return nil, fmt.Errorf("GET %s: %w %d times", path, errShifted, listAttempts)
+}
+
+// listOnce gets every page, dropping items that a shift repeated.
+func listOnce[T any](ctx context.Context, c *Client, path string, query url.Values, id func(T) int64) ([]T, error) {
 	var all []T
 	seen := map[int64]bool{}
+	firstTotal := 0
 	for page := 1; page <= maxPages; page++ {
 		q := url.Values{"page": {strconv.Itoa(page)}, "page_size": {strconv.Itoa(pageSize)}}
 		for k, v := range query {
@@ -172,8 +176,13 @@ func list[T any](ctx context.Context, c *Client, path string, query url.Values, 
 		}
 		var items []T
 		total, err := c.get(ctx, path, q, &items)
-		if err != nil {
+		switch {
+		case err != nil:
 			return nil, err
+		case page == 1:
+			firstTotal = total
+		case total != firstTotal:
+			return nil, errShifted
 		}
 		for _, item := range items {
 			if !seen[id(item)] {
@@ -182,6 +191,9 @@ func list[T any](ctx context.Context, c *Client, path string, query url.Values, 
 			}
 		}
 		if len(items) < pageSize || (total >= 0 && page*pageSize >= total) {
+			if total >= 0 && len(all) != total {
+				return nil, errShifted
+			}
 			return all, nil
 		}
 	}

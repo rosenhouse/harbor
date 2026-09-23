@@ -61,8 +61,8 @@ func eventually(t *testing.T, check func() error) {
 
 func TestAPIResources(t *testing.T) {
 	want := []metav1.APIResource{
-		{Name: "harborartifacts", SingularName: "harborartifact", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborArtifact", Verbs: []string{"get", "list"}},
-		{Name: "harborrepositories", SingularName: "harborrepository", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborRepository", Verbs: []string{"get", "list"}},
+		{Name: "harborartifacts", SingularName: "harborartifact", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborArtifact", Verbs: []string{"get", "list", "watch"}},
+		{Name: "harborrepositories", SingularName: "harborrepository", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborRepository", Verbs: []string{"get", "list", "watch"}},
 	}
 	// kube-apiserver refreshes aggregated discovery shortly after the APIService becomes available.
 	eventually(t, func() error {
