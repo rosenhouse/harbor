@@ -102,14 +102,16 @@ func schema_pkg_apis_harbor_v1alpha1_HarborArtifact(ref common.ReferenceCallback
 					},
 					"metadata": {
 						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+							Description: "Standard object metadata.",
+							Default:     map[string]interface{}{},
+							Ref:         ref(v1.ObjectMeta{}.OpenAPIModelName()),
 						},
 					},
 					"status": {
 						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref(v1alpha1.HarborArtifactStatus{}.OpenAPIModelName()),
+							Description: "Status is the artifact as observed in Harbor.",
+							Default:     map[string]interface{}{},
+							Ref:         ref(v1alpha1.HarborArtifactStatus{}.OpenAPIModelName()),
 						},
 					},
 				},
@@ -124,7 +126,8 @@ func schema_pkg_apis_harbor_v1alpha1_HarborArtifactList(ref common.ReferenceCall
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Type: []string{"object"},
+				Description: "HarborArtifactList is a list of HarborArtifact.",
+				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
 						SchemaProps: spec.SchemaProps{
@@ -142,8 +145,9 @@ func schema_pkg_apis_harbor_v1alpha1_HarborArtifactList(ref common.ReferenceCall
 					},
 					"metadata": {
 						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+							Description: "Standard list metadata.",
+							Default:     map[string]interface{}{},
+							Ref:         ref(v1.ListMeta{}.OpenAPIModelName()),
 						},
 					},
 					"items": {
@@ -201,14 +205,16 @@ func schema_pkg_apis_harbor_v1alpha1_HarborRepository(ref common.ReferenceCallba
 					},
 					"metadata": {
 						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref(v1.ObjectMeta{}.OpenAPIModelName()),
+							Description: "Standard object metadata.",
+							Default:     map[string]interface{}{},
+							Ref:         ref(v1.ObjectMeta{}.OpenAPIModelName()),
 						},
 					},
 					"status": {
 						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref(v1alpha1.HarborRepositoryStatus{}.OpenAPIModelName()),
+							Description: "Status is the repository as observed in Harbor.",
+							Default:     map[string]interface{}{},
+							Ref:         ref(v1alpha1.HarborRepositoryStatus{}.OpenAPIModelName()),
 						},
 					},
 				},
@@ -223,7 +229,8 @@ func schema_pkg_apis_harbor_v1alpha1_HarborRepositoryList(ref common.ReferenceCa
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Type: []string{"object"},
+				Description: "HarborRepositoryList is a list of HarborRepository.",
+				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
 						SchemaProps: spec.SchemaProps{
@@ -241,8 +248,9 @@ func schema_pkg_apis_harbor_v1alpha1_HarborRepositoryList(ref common.ReferenceCa
 					},
 					"metadata": {
 						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref(v1.ListMeta{}.OpenAPIModelName()),
+							Description: "Standard list metadata.",
+							Default:     map[string]interface{}{},
+							Ref:         ref(v1.ListMeta{}.OpenAPIModelName()),
 						},
 					},
 					"items": {

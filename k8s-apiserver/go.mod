@@ -6,6 +6,7 @@ toolchain go1.26.4
 
 require (
 	github.com/spf13/cobra v1.10.2
+	k8s.io/api v0.37.0
 	k8s.io/apimachinery v0.37.0
 	k8s.io/apiserver v0.37.0
 	k8s.io/client-go v0.37.0
@@ -100,7 +101,6 @@ require (
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
-	k8s.io/api v0.37.0 // indirect
 	k8s.io/code-generator v0.37.0 // indirect
 	k8s.io/gengo/v2 v2.0.0-20260408192533-25e2208e0dc3 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect

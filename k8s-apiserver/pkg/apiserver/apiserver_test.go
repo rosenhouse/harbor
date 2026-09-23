@@ -14,6 +14,11 @@ import (
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apiserver"
 )
 
+var kinds = []struct{ resource, kind string }{
+	{"harborrepositories", "HarborRepository"},
+	{"harborartifacts", "HarborArtifact"},
+}
+
 func newHandler(t *testing.T) http.Handler {
 	t.Helper()
 	c := apiserver.NewConfig()
@@ -26,42 +31,45 @@ func newHandler(t *testing.T) http.Handler {
 	return s.PrepareRun().Handler
 }
 
-func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
+func get(t *testing.T, h http.Handler, path string, accept ...string) *httptest.ResponseRecorder {
 	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if len(accept) > 0 {
+		req.Header.Set("Accept", strings.Join(accept, ","))
+	}
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	h.ServeHTTP(rec, req)
 	return rec
 }
 
-func TestDiscovery(t *testing.T) {
-	rec := get(t, newHandler(t), "/apis/harbor.goharbor.io/v1alpha1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+func decode(t *testing.T, rec *httptest.ResponseRecorder, wantCode int, into any) {
+	t.Helper()
+	if rec.Code != wantCode {
+		t.Fatalf("status %d, want %d: %s", rec.Code, wantCode, rec.Body)
 	}
-	var list metav1.APIResourceList
-	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+	if err := json.Unmarshal(rec.Body.Bytes(), into); err != nil {
 		t.Fatal(err)
 	}
+}
 
-	want := map[string]string{
-		"harborrepositories": "HarborRepository",
-		"harborartifacts":    "HarborArtifact",
+func TestDiscovery(t *testing.T) {
+	var list metav1.APIResourceList
+	decode(t, get(t, newHandler(t), "/apis/harbor.goharbor.io/v1alpha1"), http.StatusOK, &list)
+
+	if len(list.APIResources) != len(kinds) {
+		t.Fatalf("got %d resources, want %d: %+v", len(list.APIResources), len(kinds), list.APIResources)
 	}
-	if len(list.APIResources) != len(want) {
-		t.Fatalf("got %d resources, want %d: %+v", len(list.APIResources), len(want), list.APIResources)
-	}
-	for _, r := range list.APIResources {
-		if want[r.Name] != r.Kind {
-			t.Errorf("resource %q has kind %q, want %q", r.Name, r.Kind, want[r.Name])
+	for _, k := range kinds {
+		i := slices.IndexFunc(list.APIResources, func(r metav1.APIResource) bool { return r.Name == k.resource })
+		if i < 0 {
+			t.Errorf("resource %q missing", k.resource)
+			continue
 		}
-		if !r.Namespaced {
-			t.Errorf("resource %q is not namespaced", r.Name)
+		r := list.APIResources[i]
+		if r.Kind != k.kind || !r.Namespaced || r.SingularName != strings.ToLower(k.kind) {
+			t.Errorf("resource %q: kind %q, namespaced %v, singular %q", r.Name, r.Kind, r.Namespaced, r.SingularName)
 		}
-		if r.SingularName != strings.ToLower(r.Kind) {
-			t.Errorf("resource %q has singular name %q", r.Name, r.SingularName)
-		}
-		verbs := slices.Sorted(slices.Values(r.Verbs))
-		if !slices.Equal(verbs, []string{"get", "list"}) {
+		if verbs := slices.Sorted(slices.Values(r.Verbs)); !slices.Equal(verbs, []string{"get", "list"}) {
 			t.Errorf("resource %q has verbs %v, want [get list]", r.Name, verbs)
 		}
 	}
@@ -69,49 +77,61 @@ func TestDiscovery(t *testing.T) {
 
 func TestListIsEmpty(t *testing.T) {
 	h := newHandler(t)
-	for _, tc := range []struct{ path, kind string }{
-		{"/apis/harbor.goharbor.io/v1alpha1/namespaces/default/harborrepositories", "HarborRepositoryList"},
-		{"/apis/harbor.goharbor.io/v1alpha1/harborartifacts", "HarborArtifactList"},
-	} {
-		rec := get(t, h, tc.path)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("GET %s: status %d: %s", tc.path, rec.Code, rec.Body)
-		}
-		var list struct {
-			Kind  string
-			Items []json.RawMessage
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
-			t.Fatal(err)
-		}
-		if list.Kind != tc.kind || len(list.Items) != 0 {
-			t.Errorf("GET %s: got kind %q with %d items", tc.path, list.Kind, len(list.Items))
+	for _, k := range kinds {
+		for _, path := range []string{
+			"/apis/harbor.goharbor.io/v1alpha1/namespaces/default/" + k.resource,
+			"/apis/harbor.goharbor.io/v1alpha1/" + k.resource,
+		} {
+			var list struct {
+				Kind  string
+				Items []json.RawMessage
+			}
+			decode(t, get(t, h, path), http.StatusOK, &list)
+			if list.Kind != k.kind+"List" || len(list.Items) != 0 {
+				t.Errorf("GET %s: got kind %q with %d items", path, list.Kind, len(list.Items))
+			}
 		}
 	}
 }
 
 func TestGetIsNotFound(t *testing.T) {
-	rec := get(t, newHandler(t), "/apis/harbor.goharbor.io/v1alpha1/namespaces/default/harborrepositories/nginx")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body)
-	}
-	var status metav1.Status
-	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
-		t.Fatal(err)
-	}
-	if status.Reason != metav1.StatusReasonNotFound {
-		t.Errorf("reason %q", status.Reason)
+	h := newHandler(t)
+	for _, k := range kinds {
+		var status metav1.Status
+		decode(t, get(t, h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/default/"+k.resource+"/x"), http.StatusNotFound, &status)
+		if status.Reason != metav1.StatusReasonNotFound || status.Details.Group != "harbor.goharbor.io" || status.Details.Kind != k.resource {
+			t.Errorf("%s: reason %q, details %+v", k.resource, status.Reason, status.Details)
+		}
 	}
 }
 
-func TestOpenAPIDescribesKinds(t *testing.T) {
-	rec := get(t, newHandler(t), "/openapi/v3/apis/harbor.goharbor.io/v1alpha1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+func TestProtobufFallsBackToJSON(t *testing.T) {
+	rec := get(t, newHandler(t), "/apis/harbor.goharbor.io/v1alpha1/harborrepositories",
+		"application/vnd.kubernetes.protobuf", "application/json")
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/json" {
+		t.Errorf("status %d, content type %q", rec.Code, rec.Header().Get("Content-Type"))
 	}
-	for _, def := range []string{"HarborRepository", "HarborArtifact"} {
-		if !strings.Contains(rec.Body.String(), `"io.goharbor.harbor.v1alpha1.`+def+`"`) {
-			t.Errorf("OpenAPI v3 lacks %s", def)
+}
+
+func TestOpenAPI(t *testing.T) {
+	h := newHandler(t)
+	for _, tc := range []struct{ path, definitions string }{
+		{"/openapi/v2", "definitions"},
+		{"/openapi/v3/apis/harbor.goharbor.io/v1alpha1", "components.schemas"},
+	} {
+		var doc map[string]any
+		decode(t, get(t, h, tc.path), http.StatusOK, &doc)
+		defs := doc
+		for _, key := range strings.Split(tc.definitions, ".") {
+			defs, _ = defs[key].(map[string]any)
+		}
+		for _, k := range kinds {
+			def, _ := defs["io.goharbor.harbor.v1alpha1."+k.kind].(map[string]any)
+			gvks, _ := json.Marshal(def["x-kubernetes-group-version-kind"])
+			want := `[{"group":"harbor.goharbor.io","kind":"` + k.kind + `","version":"v1alpha1"}]`
+			if string(gvks) != want {
+				t.Errorf("%s: %s has GVKs %s, want %s", tc.path, k.kind, gvks, want)
+			}
 		}
 	}
 }

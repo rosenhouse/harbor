@@ -22,12 +22,15 @@ type options struct {
 }
 
 func newOptions() *options {
-	return &options{
+	o := &options{
 		SecureServing:  genericoptions.NewSecureServingOptions().WithLoopback(),
 		Authentication: genericoptions.NewDelegatingAuthenticationOptions(),
 		Authorization:  genericoptions.NewDelegatingAuthorizationOptions(),
 		Logging:        logs.NewOptions(),
 	}
+	o.SecureServing.BindPort = 6443
+	o.SecureServing.ServerCert.CertDirectory = ""
+	return o
 }
 
 func (o *options) flags() cliflag.NamedFlagSets {

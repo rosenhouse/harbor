@@ -2,6 +2,8 @@
 package apiserver
 
 import (
+	"slices"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -18,19 +20,30 @@ import (
 )
 
 var (
-	Scheme = runtime.NewScheme()
-	Codecs = serializer.NewCodecFactory(Scheme)
+	scheme = runtime.NewScheme()
+	codecs = serializer.NewCodecFactory(scheme)
 )
 
 func init() {
-	utilruntime.Must(v1alpha1.AddToScheme(Scheme))
-	metav1.AddToGroupVersion(Scheme, schema.GroupVersion{Version: "v1"})
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
+	metav1.AddToGroupVersion(scheme, schema.GroupVersion{Version: "v1"})
+}
+
+// withoutProtobuf stops clients from negotiating protobuf, which the types don't implement.
+type withoutProtobuf struct {
+	runtime.NegotiatedSerializer
+}
+
+func (w withoutProtobuf) SupportedMediaTypes() []runtime.SerializerInfo {
+	return slices.DeleteFunc(slices.Clone(w.NegotiatedSerializer.SupportedMediaTypes()), func(i runtime.SerializerInfo) bool {
+		return i.MediaType == runtime.ContentTypeProtobuf
+	})
 }
 
 // NewConfig returns a server config without serving, authentication, or authorization.
 func NewConfig() *genericapiserver.Config {
-	c := genericapiserver.NewConfig(Codecs)
-	namer := openapi.NewDefinitionNamer(Scheme)
+	c := genericapiserver.NewConfig(codecs)
+	namer := openapi.NewDefinitionNamer(scheme)
 	c.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(generatedopenapi.GetOpenAPIDefinitions, namer)
 	c.OpenAPIConfig.Info.Title = "Harbor"
 	c.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(generatedopenapi.GetOpenAPIDefinitions, namer)
@@ -45,7 +58,8 @@ func New(c genericapiserver.CompletedConfig) (*genericapiserver.GenericAPIServer
 		return nil, err
 	}
 
-	group := genericapiserver.NewDefaultAPIGroupInfo(v1alpha1.GroupName, Scheme, metav1.ParameterCodec, Codecs)
+	group := genericapiserver.NewDefaultAPIGroupInfo(v1alpha1.GroupName, scheme, metav1.ParameterCodec, codecs)
+	group.NegotiatedSerializer = withoutProtobuf{group.NegotiatedSerializer}
 	group.VersionedResourcesStorageMap[v1alpha1.SchemeGroupVersion.Version] = map[string]rest.Storage{
 		"harborrepositories": registry.NewStub(v1alpha1.Resource("harborrepositories"), "harborrepository",
 			func() runtime.Object { return &v1alpha1.HarborRepository{} },

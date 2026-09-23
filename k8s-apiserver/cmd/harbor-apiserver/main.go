@@ -1,4 +1,4 @@
-// Command harbor-apiserver serves a read-only Kubernetes API over a Harbor project.
+// Command harbor-apiserver serves Harbor repositories and artifacts as Kubernetes API resources.
 package main
 
 import (
@@ -18,6 +18,7 @@ func newCommand() *cobra.Command {
 	o := newOptions()
 	cmd := &cobra.Command{
 		Use:          "harbor-apiserver",
+		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := logsapi.ValidateAndApply(o.Logging, nil); err != nil {
