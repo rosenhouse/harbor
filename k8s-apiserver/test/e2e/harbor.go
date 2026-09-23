@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +31,16 @@ const (
 	// HarborInClusterURL is how harbor-apiserver reaches Harbor.
 	HarborInClusterURL = "http://harbor.harbor.svc"
 	HarborProject      = "e2e"
-	robotName          = "harbor-apiserver"
+	// SourceProject holds the images that replications copy.
+	SourceProject = "e2e-source"
+	// ReplicationRegistry is the registry endpoint that replications may copy from. It is Harbor itself.
+	ReplicationRegistry = "e2e-harbor"
+	// unlistedRegistry is a registry endpoint that replications may not copy from.
+	unlistedRegistry     = "e2e-unlisted"
+	robotName            = "harbor-apiserver"
+	replicationRobotName = "harbor-apiserver-replication"
+	// replicationPrefix is harbor-apiserver's default --replication-prefix.
+	replicationPrefix = "k8s"
 )
 
 var adminAuth = authn.Basic{Username: "admin", Password: "Harbor12345"}
@@ -37,11 +48,16 @@ var adminAuth = authn.Basic{Username: "admin", Password: "Harbor12345"}
 // requestTimeout bounds each Harbor API call.
 var requestTimeout = 30 * time.Second
 
+// stopRetryInterval is how often a policy delete retries while the policy's executions stop.
+var stopRetryInterval = time.Second
+
 // Seed is what Harbor holds after seeding. Its images are reproducible, so tests can recompute their digests.
 type Seed struct {
 	App, Untagged, TeamAPI, Dotted v1.Image
 	Multi                          v1.ImageIndex
 	MultiAMD64, MultiARM64         v1.Image
+	// SourceV1 and SourceV2 are tags v1 and v2 of team/app in the source project.
+	SourceV1, SourceV2 v1.Image
 }
 
 func NewSeed() Seed {
@@ -52,6 +68,8 @@ func NewSeed() Seed {
 		Dotted:     image("dotted.name_x", "amd64"),
 		MultiAMD64: image("multi", "amd64"),
 		MultiARM64: image("multi", "arm64"),
+		SourceV1:   image("source v1", "amd64"),
+		SourceV2:   image("source v2", "amd64"),
 	}
 	s.Multi = mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex),
 		mutate.IndexAddendum{Add: s.MultiAMD64, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}}},
@@ -60,31 +78,47 @@ func NewSeed() Seed {
 	return s
 }
 
-// ReplaceRepositories creates the e2e project if needed and replaces its repositories with the seed images.
+// ReplaceRepositories creates the e2e and source projects if needed, and replaces their repositories with the seed images.
+// It first deletes the policies that could replicate into the e2e project.
 func (a *Admin) ReplaceRepositories(ctx context.Context, s Seed) error {
-	if err := a.do(ctx, http.MethodPost, "/projects", map[string]any{"project_name": HarborProject}, nil, http.StatusCreated, http.StatusConflict); err != nil {
-		return err
-	}
-	if err := a.deleteRepositories(ctx); err != nil {
+	if err := a.deleteReplicationPolicies(ctx, replicationPrefix+"."+HarborProject+"."); err != nil {
 		return err
 	}
 	untagged, err := s.Untagged.Digest()
 	if err != nil {
 		return err
 	}
-	for _, p := range []struct {
+	type pushed struct {
 		ref string
 		t   remote.Taggable
+	}
+	for _, p := range []struct {
+		name   string
+		images []pushed
 	}{
-		{"app:v1", s.App},
-		{"app:latest", s.App},
-		{"app@" + untagged.String(), s.Untagged},
-		{"multi:v1", s.Multi},
-		{"team/api:v1", s.TeamAPI},
-		{"dotted.name_x:v1", s.Dotted},
+		{HarborProject, []pushed{
+			{"app:v1", s.App},
+			{"app:latest", s.App},
+			{"app@" + untagged.String(), s.Untagged},
+			{"multi:v1", s.Multi},
+			{"team/api:v1", s.TeamAPI},
+			{"dotted.name_x:v1", s.Dotted},
+		}},
+		{SourceProject, []pushed{
+			{"team/app:v1", s.SourceV1},
+			{"team/app:v2", s.SourceV2},
+		}},
 	} {
-		if err := a.push(ctx, p.ref, p.t); err != nil {
-			return fmt.Errorf("pushing %s: %w", p.ref, err)
+		if err := a.do(ctx, http.MethodPost, "/projects", map[string]any{"project_name": p.name}, nil, http.StatusCreated, http.StatusConflict); err != nil {
+			return err
+		}
+		if err := a.deleteRepositories(ctx, p.name, ""); err != nil {
+			return err
+		}
+		for _, i := range p.images {
+			if err := a.push(ctx, p.name+"/"+i.ref, i.t); err != nil {
+				return fmt.Errorf("pushing %s/%s: %w", p.name, i.ref, err)
+			}
 		}
 	}
 	return nil
@@ -120,83 +154,204 @@ func NewAdmin(harborURL string) *Admin {
 	return &Admin{url: harborURL, http: &http.Client{Timeout: requestTimeout}}
 }
 
-// push pushes to ref in the e2e project.
+// push pushes to ref, which starts with the project.
 func (a *Admin) push(ctx context.Context, ref string, t remote.Taggable) error {
-	r, err := name.ParseReference(strings.TrimPrefix(a.url, "http://")+"/"+HarborProject+"/"+ref, name.Insecure)
+	r, err := name.ParseReference(strings.TrimPrefix(a.url, "http://")+"/"+ref, name.Insecure)
 	if err != nil {
 		return err
 	}
 	return remote.Push(r, t, remote.WithAuth(&adminAuth), remote.WithContext(ctx))
 }
 
-// deleteRepositories rereads the first page of repositories until it is empty, because deleting shifts the pages.
-func (a *Admin) deleteRepositories(ctx context.Context) error {
+// deleteRepositories deletes the repositories of a project whose names, within the project, start with prefix.
+// It rereads the first page until it finds none to delete, because deleting shifts the pages.
+func (a *Admin) deleteRepositories(ctx context.Context, project, prefix string) error {
 	for {
+		// Harbor matches names that contain the value, and unescapes q once more after parsing the query string.
+		query := url.Values{"page_size": {"100"}, "q": {"name=~" + url.QueryEscape(project+"/"+prefix)}}
 		var repos []struct{ Name string }
-		if err := a.do(ctx, http.MethodGet, "/projects/"+HarborProject+"/repositories?page_size=100", nil, &repos, http.StatusOK); err != nil {
+		if err := a.do(ctx, http.MethodGet, "/projects/"+project+"/repositories?"+query.Encode(), nil, &repos, http.StatusOK); err != nil {
 			return err
 		}
-		if len(repos) == 0 {
+		deleted := 0
+		for _, r := range repos {
+			repository, ok := strings.CutPrefix(r.Name, project+"/"+prefix)
+			if !ok {
+				continue
+			}
+			if err := a.deleteRepository(ctx, project, prefix+repository); err != nil {
+				return err
+			}
+			deleted++
+		}
+		if deleted == 0 {
 			return nil
 		}
-		for _, r := range repos {
-			if err := a.deleteRepository(ctx, strings.TrimPrefix(r.Name, HarborProject+"/")); err != nil {
+	}
+}
+
+// deleteRepository deletes a repository, named within its project.
+func (a *Admin) deleteRepository(ctx context.Context, project, repository string) error {
+	// Harbor requires repository names containing "/" to be encoded twice.
+	escaped := url.PathEscape(url.PathEscape(repository))
+	return a.do(ctx, http.MethodDelete, "/projects/"+project+"/repositories/"+escaped, nil, nil, http.StatusOK)
+}
+
+// deleteReplications deletes the policies that harbor-apiserver created for a namespace, and the repositories they copied into.
+func (a *Admin) deleteReplications(ctx context.Context, namespace string) error {
+	if err := a.deleteReplicationPolicies(ctx, replicationPrefix+"."+HarborProject+"."+namespace+"."); err != nil {
+		return err
+	}
+	return a.deleteRepositories(ctx, HarborProject, replicationPrefix+"/"+namespace+"/")
+}
+
+type replicationPolicy struct {
+	ID   int64
+	Name string
+}
+
+// replicationPolicies returns the policies on the first page of those whose names start with prefix.
+func (a *Admin) replicationPolicies(ctx context.Context, prefix string) ([]replicationPolicy, error) {
+	query := url.Values{"page_size": {"100"}, "q": {"name=~" + url.QueryEscape(prefix)}}
+	var policies []replicationPolicy
+	if err := a.do(ctx, http.MethodGet, "/replication/policies?"+query.Encode(), nil, &policies, http.StatusOK); err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(policies, func(p replicationPolicy) bool { return !strings.HasPrefix(p.Name, prefix) }), nil
+}
+
+// deleteReplicationPolicies deletes the policies whose names start with prefix.
+func (a *Admin) deleteReplicationPolicies(ctx context.Context, prefix string) error {
+	for {
+		policies, err := a.replicationPolicies(ctx, prefix)
+		if err != nil || len(policies) == 0 {
+			return err
+		}
+		for _, p := range policies {
+			if err := a.deleteReplicationPolicy(ctx, p.ID); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-// deleteRepository deletes a repository in the e2e project.
-func (a *Admin) deleteRepository(ctx context.Context, repository string) error {
-	// Harbor requires repository names containing "/" to be encoded twice.
-	escaped := url.PathEscape(url.PathEscape(repository))
-	return a.do(ctx, http.MethodDelete, "/projects/"+HarborProject+"/repositories/"+escaped, nil, nil, http.StatusOK)
+// deleteReplicationPolicy stops the policy's running executions until Harbor lets it delete the policy.
+func (a *Admin) deleteReplicationPolicy(ctx context.Context, id int64) error {
+	for {
+		err := a.do(ctx, http.MethodDelete, fmt.Sprintf("/replication/policies/%d", id), nil, nil, http.StatusOK)
+		if s := (*statusError)(nil); !errors.As(err, &s) || s.code != http.StatusPreconditionFailed {
+			return err
+		}
+		var running []struct{ ID int64 }
+		query := url.Values{"policy_id": {strconv.FormatInt(id, 10)}, "status": {"InProgress"}, "page_size": {"100"}}
+		if err := a.do(ctx, http.MethodGet, "/replication/executions?"+query.Encode(), nil, &running, http.StatusOK); err != nil {
+			return err
+		}
+		for _, e := range running {
+			if err := a.do(ctx, http.MethodPut, fmt.Sprintf("/replication/executions/%d", e.ID), nil, nil, http.StatusOK); err != nil {
+				return err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(stopRetryInterval):
+		}
+	}
+}
+
+// CreateRegistries creates registry endpoints for Harbor itself, if they don't exist: one that replications may copy from, and one that they may not.
+func (a *Admin) CreateRegistries(ctx context.Context) error {
+	for _, registry := range []string{ReplicationRegistry, unlistedRegistry} {
+		body := map[string]any{
+			"name":       registry,
+			"type":       "harbor",
+			"url":        HarborInClusterURL,
+			"insecure":   true,
+			"credential": map[string]string{"type": "basic", "access_key": adminAuth.Username, "access_secret": adminAuth.Password},
+		}
+		if err := a.do(ctx, http.MethodPost, "/registries", body, nil, http.StatusCreated, http.StatusConflict); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CreateRobot replaces the project robot account for harbor-apiserver, granting only the permissions it needs.
 // It returns the robot's full name and secret.
 func (a *Admin) CreateRobot(ctx context.Context) (name, secret string, err error) {
-	if err := a.deleteRobot(ctx); err != nil {
+	var project struct {
+		ID int64 `json:"project_id"`
+	}
+	if err := a.do(ctx, http.MethodGet, "/projects/"+HarborProject, nil, &project, http.StatusOK); err != nil {
 		return "", "", err
 	}
+	// Harbor stores the name as "<project>+<robot>".
+	q := fmt.Sprintf("Level=project,ProjectID=%d,name=%s", project.ID, HarborProject+"+"+robotName)
 	access := []map[string]string{
 		{"resource": "repository", "action": "list"},
 		{"resource": "artifact", "action": "list"},
 	}
-	body := map[string]any{
+	return a.replaceRobot(ctx, q, map[string]any{
 		"name":     robotName,
 		"level":    "project",
 		"duration": -1,
 		"permissions": []map[string]any{
 			{"kind": "project", "namespace": HarborProject, "access": access},
 		},
-	}
-	var robot struct{ Name, Secret string }
-	err = a.do(ctx, http.MethodPost, "/robots", body, &robot, http.StatusCreated)
-	return robot.Name, robot.Secret, err
+	})
 }
 
-func (a *Admin) deleteRobot(ctx context.Context) error {
-	var project struct {
-		ID int64 `json:"project_id"`
+// CreateReplicationRobot replaces the system robot account for harbor-apiserver's replications, granting only the permissions that the README lists.
+// It returns the robot's full name and secret.
+func (a *Admin) CreateReplicationRobot(ctx context.Context) (name, secret string, err error) {
+	var access []map[string]string
+	for _, p := range []struct {
+		resource string
+		actions  []string
+	}{
+		{"registry", []string{"list"}},
+		{"replication-policy", []string{"list", "read", "create", "delete"}},
+		{"replication", []string{"list", "create"}},
+	} {
+		for _, action := range p.actions {
+			access = append(access, map[string]string{"resource": p.resource, "action": action})
+		}
 	}
-	if err := a.do(ctx, http.MethodGet, "/projects/"+HarborProject, nil, &project, http.StatusOK); err != nil {
-		return err
-	}
-	// Harbor stores the name as "<project>+<robot>" and unescapes q once more after parsing the query string.
-	q := fmt.Sprintf("Level=project,ProjectID=%d,name=%s", project.ID, url.QueryEscape(HarborProject+"+"+robotName))
+	return a.replaceRobot(ctx, "Level=system,name="+replicationRobotName, map[string]any{
+		"name":     replicationRobotName,
+		"level":    "system",
+		"duration": -1,
+		"permissions": []map[string]any{
+			{"kind": "system", "namespace": "/", "access": access},
+		},
+	})
+}
+
+// replaceRobot deletes the robots that the query q finds, and creates robot. It returns the new robot's full name and secret.
+func (a *Admin) replaceRobot(ctx context.Context, q string, robot map[string]any) (name, secret string, err error) {
 	var robots []struct{ ID int64 }
-	if err := a.do(ctx, http.MethodGet, "/robots?"+url.Values{"q": {q}}.Encode(), nil, &robots, http.StatusOK); err != nil {
-		return err
+	// Harbor unescapes q once more after parsing the query string.
+	if err := a.do(ctx, http.MethodGet, "/robots?"+url.Values{"q": {url.QueryEscape(q)}}.Encode(), nil, &robots, http.StatusOK); err != nil {
+		return "", "", err
 	}
 	for _, r := range robots {
 		if err := a.do(ctx, http.MethodDelete, fmt.Sprintf("/robots/%d", r.ID), nil, nil, http.StatusOK); err != nil {
-			return err
+			return "", "", err
 		}
 	}
-	return nil
+	var created struct{ Name, Secret string }
+	err = a.do(ctx, http.MethodPost, "/robots", robot, &created, http.StatusCreated)
+	return created.Name, created.Secret, err
 }
+
+// statusError is a response with an unexpected status.
+type statusError struct {
+	code int
+	msg  string
+}
+
+func (e *statusError) Error() string { return e.msg }
 
 func (a *Admin) do(ctx context.Context, method, path string, body, into any, okStatus ...int) error {
 	var reqBody io.Reader
@@ -220,7 +375,7 @@ func (a *Admin) do(ctx context.Context, method, path string, body, into any, okS
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	if !slices.Contains(okStatus, resp.StatusCode) {
-		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, respBody)
+		return &statusError{resp.StatusCode, fmt.Sprintf("%s %s: %s: %s", method, path, resp.Status, respBody)}
 	}
 	if into != nil {
 		return json.Unmarshal(respBody, into)

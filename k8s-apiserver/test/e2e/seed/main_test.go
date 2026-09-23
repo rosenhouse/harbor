@@ -18,8 +18,13 @@ func TestApplySecretPipesItToKubectl(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	want := corev1.Secret{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "harbor-apiserver", Name: "some-secret"},
+		Data:       map[string][]byte{"password": []byte("s3cret")},
+	}
 
-	if err := applySecret(t.Context(), "robot$e2e+harbor-apiserver", "s3cret"); err != nil {
+	if err := applySecret(t.Context(), &want); err != nil {
 		t.Fatal(err)
 	}
 
@@ -38,17 +43,39 @@ func TestApplySecretPipesItToKubectl(t *testing.T) {
 	if err := json.Unmarshal(stdin, &got); err != nil {
 		t.Fatal(err)
 	}
-	want := corev1.Secret{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: metav1.ObjectMeta{Namespace: "harbor-apiserver", Name: "harbor-apiserver"},
-		Data: map[string][]byte{
-			"url":      []byte("http://harbor.harbor.svc"),
-			"project":  []byte("e2e"),
-			"username": []byte("robot$e2e+harbor-apiserver"),
-			"password": []byte("s3cret"),
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Secret (-want +got):\n%s", diff)
+	}
+}
+
+func TestSecrets(t *testing.T) {
+	got := secrets(
+		credentials{"robot$e2e+harbor-apiserver", "s3cret"},
+		credentials{"robot$harbor-apiserver-replication", "t0psecret"},
+	)
+
+	want := []*corev1.Secret{
+		{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "harbor-apiserver", Name: "harbor-apiserver"},
+			Data: map[string][]byte{
+				"url":      []byte("http://harbor.harbor.svc"),
+				"project":  []byte("e2e"),
+				"username": []byte("robot$e2e+harbor-apiserver"),
+				"password": []byte("s3cret"),
+			},
+		},
+		{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "harbor-apiserver", Name: "harbor-apiserver-replication"},
+			Data: map[string][]byte{
+				"registries": []byte("e2e-harbor"),
+				"username":   []byte("robot$harbor-apiserver-replication"),
+				"password":   []byte("t0psecret"),
+			},
 		},
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
-		t.Errorf("Secret (-want +got):\n%s", diff)
+		t.Errorf("Secrets (-want +got):\n%s", diff)
 	}
 }

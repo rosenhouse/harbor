@@ -46,7 +46,13 @@ func mustKubectl(t *testing.T, args ...string) string {
 // eventually retries check until it succeeds, and fails the test if it never does.
 func eventually(t *testing.T, check func() error) {
 	t.Helper()
-	deadline := time.Now().Add(time.Minute)
+	eventuallyWithin(t, time.Minute, check)
+}
+
+// eventuallyWithin retries check until it succeeds, and fails the test if it doesn't within timeout.
+func eventuallyWithin(t *testing.T, timeout time.Duration, check func() error) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for {
 		err := check()
 		if err == nil {
@@ -62,6 +68,7 @@ func eventually(t *testing.T, check func() error) {
 func TestAPIResources(t *testing.T) {
 	want := []metav1.APIResource{
 		{Name: "harborartifacts", SingularName: "harborartifact", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborArtifact", Verbs: []string{"get", "list"}},
+		{Name: "harborreplications", SingularName: "harborreplication", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborReplication", Verbs: []string{"create", "delete", "get", "list"}},
 		{Name: "harborrepositories", SingularName: "harborrepository", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborRepository", Verbs: []string{"get", "list"}},
 	}
 	// kube-apiserver refreshes aggregated discovery shortly after the APIService becomes available.
