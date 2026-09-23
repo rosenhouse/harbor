@@ -6,16 +6,16 @@ This model covers an install from `deploy/` as the [README](../README.md) descri
 ## Assets
 
 - Secret `harbor-apiserver` holds the robot credentials.
-  With the README's permissions, they can list and read repository and artifact metadata in one project, but cannot pull, push, or change anything.
+  With the README's permissions, they can list repository and artifact metadata in one project, but cannot pull, push, or change anything.
 - The project metadata includes repository names and descriptions, artifact digests, tags, sizes, media types, OCI annotations, and push and pull times and counts.
 - Secret `harbor-apiserver-ca` holds the serving CA's key, and Secret `harbor-apiserver-tls` holds the serving key.
   The aggregator trusts every serving certificate that the CA signs for this API.
 - The cluster's API depends on this server, because an unavailable APIService breaks discovery and namespace deletion cluster-wide.
-- Harbor's availability is at stake, because every request reads from Harbor.
+- Harbor's availability is at stake, because each replica reads the whole project from Harbor every poll interval.
 
 ## Actors
 
-- **Namespace users** can get or list the two kinds in a namespace, usually through the `view`, `edit`, or `admin` role.
+- **Namespace users** can get, list, or watch the two kinds in a namespace, usually through the `view`, `edit`, or `admin` role.
 - **Namespace-label writers** can create namespaces or change their labels, directly or through a tool.
 - **Cluster admins** can read Secrets and change RBAC, the APIService, and the `harbor-apiserver` namespace.
 - **Harbor admins** manage the project, its visibility, and the robot account.
@@ -46,20 +46,20 @@ This model covers an install from `deploy/` as the [README](../README.md) descri
 ### Every authorized user sees what the robot sees
 
 The server does not filter by user or by repository.
-Anyone allowed to list either kind in a labeled namespace sees every repository and artifact that the robot can list.
+Anyone allowed to list or watch either kind in a labeled namespace sees every repository and artifact that the robot can list.
 `harbor.goharbor.io:view` aggregates into `view`, so this includes every user and ServiceAccount bound to `view`, `edit`, or `admin` there.
 Harbor project membership does not apply to Kubernetes users.
 
 Mitigations:
 
-- The robot reads one project, with the three permissions in the README.
+- The robot reads one project, with the two permissions in the README.
 - The README shows how to remove the aggregation label and bind the role narrowly.
 
 Residual risk: access is all or nothing per namespace, and a cluster can hold only one install.
 
 ### Namespace-label writers grant visibility
 
-A namespace sees the project when it has `harbor.goharbor.io/project=<project>` ([gate.go](../pkg/namespaces/gate.go)).
+A namespace sees the project when it has `harbor.goharbor.io/project=<project>` ([watch.go](../pkg/namespaces/watch.go)).
 Anyone who can create namespaces or update their labels can grant that.
 The built-in `admin` and `edit` roles cannot change a Namespace object, but many clusters let tenants set namespace labels in other ways:
 
@@ -73,17 +73,17 @@ Mitigations:
 - Restrict the label with the ValidatingAdmissionPolicy in the [README](../README.md#label-namespaces), which lets only one group set, change, or remove it.
 
 Residual risk: visibility depends on cluster governance outside this server.
-Removing the label revokes visibility as soon as each replica's namespace informer sees the change.
+Removing the label revokes visibility as soon as each replica's namespace informer sees the change, and open watches then see each object deleted.
 
 ### Harbor cannot attribute reads to Kubernetes users
 
-Harbor sees only the robot.
+Harbor sees only the robot's polls, which no Kubernetes request triggers.
 Harbor's audit log records writes, pushes, and pulls, but not API reads such as these ([basic.go](../../src/pkg/auditext/event/basic.go)).
 If the cluster has an audit policy, the Kubernetes audit log records the user, verb, resource, and namespace of each request that kube-apiserver proxies.
 Clusters that kubeadm or kind creates have no audit policy by default.
-harbor-apiserver keeps no audit log of its own, and sends no request ID to Harbor.
+harbor-apiserver keeps no audit log of its own.
 
-Residual risk: correlating a Harbor-side request with a Kubernetes user needs timestamps from both logs.
+Residual risk: only the Kubernetes audit log can show which users read the project.
 Direct calls to the Service leave no Kubernetes audit record.
 
 ### Direct calls to the Service
@@ -94,6 +94,7 @@ The e2e test `TestDelegatedAuthorization` checks this.
 They do bypass kube-apiserver's audit log and its API Priority and Fairness.
 harbor-apiserver caches authentication and authorization decisions for 10 seconds, so revoking a direct caller's access takes up to 10 seconds.
 kube-apiserver authorizes the requests that it proxies itself, so revocation applies to them at once.
+Either way, a watch that is already open continues until it ends.
 
 At `-v` 8 or higher, client-go logs request bodies, including the TokenReviews that carry direct callers' bearer tokens, so keep `-v` below 8.
 
@@ -109,9 +110,9 @@ The credentials could leak from the cluster, from the server's responses or logs
 
 Mitigations:
 
-- API responses carry only fixed messages ([registry.go](../pkg/registry/registry.go)): `harbor is unavailable` (503), or `harbor rejected the robot account credentials`, `harbor denied the robot account access`, `not found in harbor`, or `unexpected error reading harbor` (500).
+- API responses describe Harbor failures only with fixed 503 messages ([store.go](../pkg/registry/store.go), [poll.go](../pkg/registry/poll.go), [registry.go](../pkg/registry/registry.go)): `harbor has not been read yet`, `harbor is unavailable`, `reading harbor takes longer than the staleness limit`, `reading a repository's artifacts failed`, `harbor rejected the robot account credentials`, `harbor denied the robot account access`, `not found in harbor`, or `unexpected error reading harbor`.
   They never include Harbor's URL, Harbor's response, or the credentials.
-- The server logs the full error of a failed Harbor request.
+- The server logs the full error of a failed read of Harbor.
   That error holds the request URL, the HTTP status, and Harbor's error message ([client.go](../pkg/harbor/client.go)).
   The credentials travel only in the `Authorization` header, which no error includes, and `net/http` redacts any password in a URL.
   A credential file error names the file, not its contents.
@@ -135,7 +136,7 @@ Anonymous users can list and read a public project.
 The server keeps working, and nothing in Kubernetes shows the failure.
 
 This exposes nothing new, because anyone who can reach Harbor can read a public project.
-The failure surfaces only when the project becomes private, as 500 errors.
+The failure surfaces only when the project becomes private, as 503 errors once the snapshot is older than `--harbor-staleness-limit`.
 
 Mitigations: prefer a private project, track the robot's expiry, and watch harbor-core's logs for failed robot authentication.
 
@@ -180,32 +181,27 @@ Keep the front-proxy CA separate from the cluster CA, and set `--requestheader-a
 
 ### Denial of service against Harbor and the server
 
-The server keeps no cache, so every Kubernetes request calls Harbor:
-
-| Request | Harbor requests |
-| --- | --- |
-| list repositories | one repository list |
-| get repository | one repository get, or a repository list for a name with a hash suffix |
-| list artifacts | one repository list, then one artifact list per repository, 4 at a time ([artifacts.go](../pkg/registry/artifacts.go)) |
-| list artifacts, selecting one repository by label or `status.repository` | one artifact list, plus a repository list for a label value with a hash suffix |
-| get artifact, or list artifacts by `metadata.name` | one artifact list filtered by digest prefix, plus a repository list for a name with a hash suffix |
-
-Each Harbor list pages through 100 items at a time.
-A list across all namespaces makes the same Harbor requests, but repeats every object once per labeled namespace in memory and in the response.
+Kubernetes requests never call Harbor.
+Instead, each replica polls Harbor ([poll.go](../pkg/registry/poll.go)).
+Each poll makes one repository list, then one artifact list per repository, 4 at a time.
+Each Harbor list pages through 100 items at a time, and starts over after 1 second, up to 3 tries in all, when the item count drops during it.
+After a poll, the replica waits `--harbor-poll-interval` (30s) plus up to 10% jitter.
+After a poll that fails, or that keeps a repository's artifacts from an earlier poll, it retries once after 1 second, and then waits the poll interval until a poll succeeds.
 
 Limits:
 
-- [client.go](../pkg/harbor/client.go) reads at most 1000 pages per list and 16 MiB per response, and fails the request beyond either.
-- `--harbor-timeout` (10s) bounds each Harbor request.
-- `k8s.io/apiserver` ends each request after 60 seconds, which cancels its Harbor requests.
-  Each replica serves at most 400 read requests at once, so it can have up to 1600 Harbor requests in flight.
+- [client.go](../pkg/harbor/client.go) reads at most 1000 pages per list and 16 MiB per response, and fails the list beyond either.
+- `--harbor-timeout` (10s) bounds each Harbor request, and `--harbor-staleness-limit` (5m) bounds each poll.
+- Each replica has at most 4 Harbor requests in flight.
+- Each replica serves at most 400 read requests at once, but watches don't count toward this limit.
 - kube-apiserver's API Priority and Fairness applies to the requests it proxies, but not to direct calls to the Service.
 
-Residual risk: an authorized user can put sustained read load on Harbor, and all of it comes from the robot.
+Residual risk: Harbor's load grows with the project's size and the number of replicas, but not with Kubernetes requests.
+A poll that fails partway, such as on a 429 response, starts over from the repository list after 1 second, and after the poll interval if it fails again.
 The server ignores `limit` and `continue`.
-Harbor-side rate limits that return 429 turn into 503 errors.
 
 The page and size limits do not bound memory in practice.
+Each replica holds the project in memory, along with a log of about the last 10000 object changes, which watches resume from ([store.go](../pkg/registry/store.go)).
 A list holds every object in memory, once per labeled namespace, and then encodes the whole response.
 The pods request 64 MiB of memory, and have no memory limit and no priority class.
 So a list of a large project across all namespaces, such as from a monitoring or dashboard ServiceAccount with cluster-wide `list`, or a few concurrent lists, can grow a pod far beyond its request.
@@ -215,13 +211,23 @@ Not yet done: a memory limit with headroom, a cap on the objects or bytes in a r
 
 ### Harbor outages
 
-Connection errors, timeouts before Harbor responds, and 429 and 5xx responses from Harbor fail requests with 503 `harbor is unavailable`.
-A timeout or dropped connection while the server reads Harbor's response fails the request with 500 `unexpected error reading harbor` instead ([client.go](../pkg/harbor/client.go)).
-Readiness depends only on the namespace informer, never on Harbor ([server.go](../cmd/harbor-apiserver/server.go)), so the APIService stays Available and discovery keeps working.
-Startup does not contact Harbor, so pods can restart during an outage.
+A failed poll leaves the replica's last good snapshot in place ([poll.go](../pkg/registry/poll.go)).
+The replica serves that snapshot until it is older than `--harbor-staleness-limit` (5m).
+Then it fails requests for labeled namespaces with 503, and ends open watches there with the same error ([store.go](../pkg/registry/store.go)).
+Connection errors, timeouts before Harbor responds, and 429 and 5xx responses give the message `harbor is unavailable`.
+A timeout or dropped connection while the server reads the repository list's response gives `unexpected error reading harbor` instead ([client.go](../pkg/harbor/client.go)).
+A poll that runs longer than `--harbor-staleness-limit` fails, and gives `reading harbor takes longer than the staleness limit`.
+
+Readiness does not depend on Harbor's health ([server.go](../cmd/harbor-apiserver/server.go)).
+A pod becomes ready once it has listed namespaces, and either its first poll has ended, in success or failure, or twice `--harbor-timeout` has passed since it started.
+So the APIService stays Available, discovery keeps working, and pods can restart during an outage.
+A pod that starts during an outage fails requests with 503 until it reads Harbor.
 The e2e test `TestHarborOutageIsServiceUnavailable` checks this behavior.
 
-Residual risk: a slow Harbor holds each request for up to 60 seconds.
+Residual risk: during an outage, clients get data up to `--harbor-staleness-limit` old, without an error.
+Some failures of one repository's artifact list, such as a timeout while the server reads Harbor's response, or more than 1000 pages, don't fail the poll.
+That repository then keeps its artifacts from the last poll, or none if the last poll did not list it.
+Once they are older than `--harbor-staleness-limit`, or at once on a pod's first poll, the replica fails every request for labeled namespaces with `reading a repository's artifacts failed`, including requests for other repositories.
 If the image is hosted in the same Harbor, new pods cannot pull it during the outage.
 
 ### Untrusted Harbor data
@@ -230,6 +236,9 @@ Project members who can push or update repositories control repository names, de
 The server copies them into `status` without interpreting them.
 It derives object names that fit Kubernetes rules, and skips an artifact whose digest cannot form a name.
 Clients that display these fields should treat them as untrusted.
+
+Residual risk: a pusher can make one repository's artifact list fail on every poll, such as by pushing more than 100000 artifacts, or artifacts whose annotations make a page exceed 16 MiB.
+Every replica then fails all requests for labeled namespaces once `--harbor-staleness-limit` passes, as in [Harbor outages](#harbor-outages).
 
 Object names hold only part of what they name: an artifact's name holds 12 hex digits of its digest, and a hash suffix holds 10 hex digits of the repository name's hash ([names.go](../pkg/registry/names.go)).
 A pusher can grind a manifest whose digest shares its first 12 hex digits with one that will be pushed later, such as a mirrored upstream image, in about 2^48 SHA-256 operations.

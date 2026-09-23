@@ -115,6 +115,7 @@ func pages(t *testing.T, repos *[]harbor.Repository, changed func(page string)) 
 }
 
 func TestListStartsOverWhenADeletionShiftsPages(t *testing.T) {
+	defer harbor.SetListRetryWait(time.Millisecond)()
 	repos := repositories(1, 150)
 	deleted := false
 	f := newFakeHarbor(t, pages(t, &repos, func(page string) {
@@ -135,7 +136,26 @@ func TestListStartsOverWhenADeletionShiftsPages(t *testing.T) {
 	}
 }
 
+func TestListKeepsGoingWhenItemsAreCreated(t *testing.T) {
+	repos := repositories(1, 150)
+	f := newFakeHarbor(t, pages(t, &repos, func(string) {
+		repos = append(slices.Clip(repos), harbor.Repository{ID: int64(len(repos) + 1), Name: "proj/new"})
+	}))
+
+	got, err := newClient(t, f).ListRepositories(context.Background(), "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(repositories(1, 150), got[:150]); diff != "" || len(got) != 151 {
+		t.Errorf("got %d repositories (-want +got):\n%s", len(got), diff)
+	}
+	if len(f.requests) != 2 {
+		t.Errorf("sent %d requests, want 1 list of 2 pages", len(f.requests))
+	}
+}
+
 func TestListStartsOverWhenTheCountMissesADeletion(t *testing.T) {
+	defer harbor.SetListRetryWait(time.Millisecond)()
 	repos := repositories(1, 50)
 	var mu sync.Mutex
 	counted := len(repos)
@@ -162,13 +182,43 @@ func TestListStartsOverWhenTheCountMissesADeletion(t *testing.T) {
 }
 
 func TestListGivesUpWhenPagesKeepShifting(t *testing.T) {
+	defer harbor.SetListRetryWait(50 * time.Millisecond)()
 	repos := repositories(1, 300)
-	f := newFakeHarbor(t, pages(t, &repos, func(string) { repos = repos[1:] }))
+	var requested []time.Time
+	f := newFakeHarbor(t, pages(t, &repos, func(string) {
+		requested = append(requested, time.Now())
+		repos = repos[1:]
+	}))
 	if _, err := newClient(t, f).ListRepositories(context.Background(), "proj"); err == nil {
 		t.Error("returned a list that kept changing")
 	}
 	if len(f.requests) != 6 {
-		t.Errorf("sent %d requests, want 3 attempts of 2 pages", len(f.requests))
+		t.Fatalf("sent %d requests, want 3 attempts of 2 pages", len(f.requests))
+	}
+	for _, i := range []int{2, 4} {
+		if wait := requested[i].Sub(requested[i-1]); wait < 50*time.Millisecond {
+			t.Errorf("started attempt %d after %v", i/2+1, wait)
+		}
+	}
+}
+
+func TestListStopsWaitingToStartOverWhenCancelled(t *testing.T) {
+	defer harbor.SetListRetryWait(10 * time.Second)()
+	repos := repositories(1, 150)
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	f := newFakeHarbor(t, pages(t, &repos, func(string) {
+		once.Do(func() {
+			repos = repos[1:]
+			time.AfterFunc(100*time.Millisecond, cancel)
+		})
+	}))
+	start := time.Now()
+	if _, err := newClient(t, f).ListRepositories(ctx, "proj"); !errors.Is(err, context.Canceled) {
+		t.Errorf("got %v, want %v", err, context.Canceled)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("returned after %v", took)
 	}
 }
 

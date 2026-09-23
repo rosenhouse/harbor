@@ -50,8 +50,8 @@ func (s *storage) NewList() runtime.Object { return s.newList() }
 func (s *storage) Destroy()                {}
 func (s *storage) NamespaceScoped() bool   { return true }
 
-func (s *storage) Get(ctx context.Context, name string, _ *metav1.GetOptions) (runtime.Object, error) {
-	return s.store.get(s.resource, genericapirequest.NamespaceValue(ctx), name)
+func (s *storage) Get(ctx context.Context, name string, opts *metav1.GetOptions) (runtime.Object, error) {
+	return s.store.get(s.resource, genericapirequest.NamespaceValue(ctx), name, opts)
 }
 
 func (s *storage) List(ctx context.Context, opts *metainternalversion.ListOptions) (runtime.Object, error) {
@@ -110,9 +110,9 @@ func age(t metav1.Time) string {
 	return duration.HumanDuration(time.Since(t.Time))
 }
 
-// errorKind describes a failed Harbor request without Harbor's address or response.
+// errorKind describes a failed read of Harbor without Harbor's address or response.
 func errorKind(err error) error {
-	for _, kind := range []error{harbor.ErrUnavailable, harbor.ErrUnauthorized, harbor.ErrForbidden, harbor.ErrNotFound} {
+	for _, kind := range []error{errSlowRead, errArtifactsRead, harbor.ErrUnavailable, harbor.ErrUnauthorized, harbor.ErrForbidden, harbor.ErrNotFound} {
 		if errors.Is(err, kind) {
 			return kind
 		}

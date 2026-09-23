@@ -147,15 +147,25 @@ func repositoryPath(project, repository string) string {
 	return projectPath(project) + "/repositories/" + url.PathEscape(url.PathEscape(repository))
 }
 
-// listAttempts is how many times list starts over when pages shift.
+// listAttempts is how many times list tries to get pages that did not shift.
 const listAttempts = 3
+
+// listRetryWait is how long list waits before it starts over.
+var listRetryWait = time.Second
 
 var errShifted = errors.New("pages shifted during the list")
 
 // list gets every page, sorted by ID so that items created during the list land on its last page.
-// A deletion shifts later pages, which skips an item, so list starts over when the total count changes.
+// A deletion shifts later pages, which skips an item, so list starts over when the total count drops.
 func list[T any](ctx context.Context, c *Client, path string, query url.Values, id func(T) int64) ([]T, error) {
-	for range listAttempts {
+	for attempt := range listAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("%w: %w", ErrUnavailable, ctx.Err())
+			case <-time.After(listRetryWait):
+			}
+		}
 		all, err := listOnce(ctx, c, path, query, id)
 		if !errors.Is(err, errShifted) {
 			return all, err
@@ -168,7 +178,7 @@ func list[T any](ctx context.Context, c *Client, path string, query url.Values, 
 func listOnce[T any](ctx context.Context, c *Client, path string, query url.Values, id func(T) int64) ([]T, error) {
 	var all []T
 	seen := map[int64]bool{}
-	firstTotal := 0
+	lastTotal := 0
 	for page := 1; page <= maxPages; page++ {
 		q := url.Values{"page": {strconv.Itoa(page)}, "page_size": {strconv.Itoa(pageSize)}}
 		for k, v := range query {
@@ -179,11 +189,10 @@ func listOnce[T any](ctx context.Context, c *Client, path string, query url.Valu
 		switch {
 		case err != nil:
 			return nil, err
-		case page == 1:
-			firstTotal = total
-		case total != firstTotal:
+		case page > 1 && total < lastTotal:
 			return nil, errShifted
 		}
+		lastTotal = total
 		for _, item := range items {
 			if !seen[id(item)] {
 				seen[id(item)] = true

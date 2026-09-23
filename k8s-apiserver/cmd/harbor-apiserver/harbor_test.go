@@ -18,7 +18,8 @@ func TestHarborOptionsValidate(t *testing.T) {
 	var empty harborOptions
 	want := []string{
 		"--harbor-url is required", "--harbor-project is required", "--harbor-username-file is required", "--harbor-password-file is required",
-		"--harbor-poll-interval must be positive", "--harbor-staleness-limit must be longer than twice --harbor-poll-interval plus --harbor-timeout",
+		"--harbor-timeout must be positive", "--harbor-poll-interval must be positive",
+		"--harbor-staleness-limit must be longer than 2.2 times --harbor-poll-interval plus twice --harbor-timeout",
 	}
 	// Map iteration would vary the order between calls.
 	for range 20 {
@@ -31,7 +32,7 @@ func TestHarborOptionsValidate(t *testing.T) {
 		}
 	}
 
-	valid := harborOptions{URL: "https://h", Project: "library", UsernameFile: "u", PasswordFile: "p", Timeout: time.Second, PollInterval: time.Second, StalenessLimit: 3*time.Second + 1}
+	valid := harborOptions{URL: "https://h", Project: "library", UsernameFile: "u", PasswordFile: "p", Timeout: time.Second, PollInterval: time.Second, StalenessLimit: 4200*time.Millisecond + 1}
 	if errs := valid.validate(); len(errs) != 0 {
 		t.Errorf("valid options: %v", errs)
 	}
@@ -42,14 +43,15 @@ func TestHarborOptionsValidate(t *testing.T) {
 		t.Errorf("project longer than a label value: got %v", errs)
 	}
 
-	for _, tc := range []struct{ pollInterval, stalenessLimit time.Duration }{
-		{0, 2 * time.Second},
-		{time.Second, 3 * time.Second},
+	for _, tc := range []struct{ timeout, pollInterval, stalenessLimit time.Duration }{
+		{-time.Second, time.Second, 5 * time.Second},
+		{time.Second, 0, 3 * time.Second},
+		{time.Second, time.Second, 4200 * time.Millisecond},
 	} {
 		o := valid
-		o.PollInterval, o.StalenessLimit = tc.pollInterval, tc.stalenessLimit
+		o.Timeout, o.PollInterval, o.StalenessLimit = tc.timeout, tc.pollInterval, tc.stalenessLimit
 		if errs := o.validate(); len(errs) != 1 {
-			t.Errorf("poll interval %v, staleness limit %v: got %v", tc.pollInterval, tc.stalenessLimit, errs)
+			t.Errorf("timeout %v, poll interval %v, staleness limit %v: got %v", tc.timeout, tc.pollInterval, tc.stalenessLimit, errs)
 		}
 	}
 }

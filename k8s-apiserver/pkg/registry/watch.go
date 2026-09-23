@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"iter"
 	"strconv"
 	"sync"
 	"time"
@@ -20,7 +21,7 @@ type watcher struct {
 	match     func(object, string) bool
 	newObject func() runtime.Object
 
-	initial        []event
+	initial        iter.Seq[event]
 	markInitialEnd bool
 	bookmarks      bool
 	// rv is the resourceVersion that the watcher has followed the log to.
@@ -57,14 +58,13 @@ func (w *watcher) run(ctx context.Context) {
 	defer close(w.done)
 	defer close(w.result)
 
-	for _, e := range w.initial {
-		if !w.sendEvent(ctx, e) {
-			return
+	if w.initial != nil {
+		for e := range w.initial {
+			if !w.sendEvent(ctx, e) {
+				return
+			}
 		}
-	}
-	w.initial = nil
-	if w.markInitialEnd && !w.sendBookmark(ctx, map[string]string{metav1.InitialEventsAnnotationKey: "true"}) {
-		return
+		w.initial = nil
 	}
 
 	var tick <-chan time.Time
@@ -73,12 +73,19 @@ func (w *watcher) run(ctx context.Context) {
 		defer ticker.Stop()
 		tick = ticker.C()
 	}
+	bookmarkDue := false
 	for {
-		changes, changed, err := w.store.changesAfter(w.rv, w.namespace)
+		changes, changed, staleAt, err := w.store.changesAfter(w.rv, w.namespace)
 		if err != nil {
 			status := err.(apierrors.APIStatus).Status()
 			w.send(ctx, watch.Event{Type: watch.Error, Object: &status})
 			return
+		}
+		if w.markInitialEnd {
+			if !w.sendBookmark(ctx, map[string]string{metav1.InitialEventsAnnotationKey: "true"}) {
+				return
+			}
+			w.markInitialEnd = false
 		}
 		for _, c := range changes {
 			for e := range c.eventsFor(w.resource, w.namespace) {
@@ -91,18 +98,40 @@ func (w *watcher) run(ctx context.Context) {
 		if len(changes) > 0 {
 			continue
 		}
-		select {
-		case <-changed:
-		case <-tick:
+		if bookmarkDue {
 			if !w.sendBookmark(ctx, nil) {
 				return
 			}
-		case <-ctx.Done():
-			return
-		case <-w.stop:
+			bookmarkDue = false
+			continue
+		}
+		var ok bool
+		if bookmarkDue, ok = w.wait(ctx, changed, staleAt, tick); !ok {
 			return
 		}
 	}
+}
+
+// wait returns once the log may have grown, the store goes stale at staleAt, or a bookmark is due, which it reports.
+// It returns false for ok once the watch ends.
+func (w *watcher) wait(ctx context.Context, changed <-chan struct{}, staleAt time.Time, tick <-chan time.Time) (bookmarkDue, ok bool) {
+	var stale <-chan time.Time
+	if !staleAt.IsZero() {
+		timer := w.store.clock.NewTimer(staleAt.Sub(w.store.clock.Now()))
+		defer timer.Stop()
+		stale = timer.C()
+	}
+	select {
+	case <-changed:
+	case <-stale:
+	case <-tick:
+		return true, true
+	case <-ctx.Done():
+		return false, false
+	case <-w.stop:
+		return false, false
+	}
+	return false, true
 }
 
 func (w *watcher) sendEvent(ctx context.Context, e event) bool {

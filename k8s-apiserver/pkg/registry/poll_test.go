@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -104,16 +106,15 @@ func TestPollStopsAtFailureOfHarbor(t *testing.T) {
 	}
 }
 
-func TestPollKeepsArtifactsOfRepositoryThatFails(t *testing.T) {
+func TestPollKeepsArtifactsOfRepositoryThatFailsUntilStale(t *testing.T) {
 	h := artifactHarbor()
-	h.repositories = append(h.repositories, harbor.Repository{ID: 4, Name: "proj/broken"})
-	h.artifactErrs = map[string]error{"proj/broken": errors.New("unexpected response from harbor")}
 	f := newFixture(t, h)
 	before := artifactNames(artifactItems(t, f.artifacts, "ns1", nil))
 
-	h.artifactErrs["proj/nginx"] = errors.New("more than 1000 pages")
+	h.artifactErrs = map[string]error{"proj/nginx": errors.New("more than 1000 pages")}
 	h.artifacts["proj/nginx"] = nil
 	h.artifacts["proj/team/api"][0].Size++
+	f.clock.Step(stalenessLimit / 2)
 	f.poll(t)
 
 	items := artifactItems(t, f.artifacts, "ns1", nil)
@@ -123,9 +124,55 @@ func TestPollKeepsArtifactsOfRepositoryThatFails(t *testing.T) {
 	if size := items[3].Status.Size; size != 1537 {
 		t.Errorf("team/api artifact has size %d, want the new read's 1537", size)
 	}
-	if _, err := f.repositories.Get(inNamespace("ns1"), "broken", &metav1.GetOptions{}); err != nil {
-		t.Errorf("get broken: %v", err)
+
+	f.clock.Step(stalenessLimit / 2)
+	f.poll(t)
+	expectAvailable(t, f, "ns1")
+	f.clock.Step(time.Nanosecond)
+	expectUnavailable(t, f, "ns1", "reading a repository's artifacts failed")
+
+	delete(h.artifactErrs, "proj/nginx")
+	f.poll(t)
+	expectAvailable(t, f, "ns1")
+}
+
+func TestNewRepositoryHasNoArtifactsAsOfTheLastRead(t *testing.T) {
+	h := artifactHarbor()
+	f := newFixture(t, h)
+	before := artifactNames(artifactItems(t, f.artifacts, "ns1", nil))
+	f.clock.Step(stalenessLimit / 2)
+	h.repositories = append(h.repositories, harbor.Repository{ID: 4, Name: "proj/new"})
+	h.artifacts["proj/new"] = []harbor.Artifact{{ID: 9, Digest: digest("999999999999")}}
+	h.artifactErrs = map[string]error{"proj/new": errors.New("unexpected response from harbor")}
+	if err := f.poller.Poll(t.Context()); !errors.Is(err, errArtifactsRead) {
+		t.Errorf("poll returned %v, want %v", err, errArtifactsRead)
 	}
+	expectAvailable(t, f, "ns1")
+	if _, err := f.repositories.Get(inNamespace("ns1"), "new", &metav1.GetOptions{}); err != nil {
+		t.Error(err)
+	}
+	if diff := cmp.Diff(before, artifactNames(artifactItems(t, f.artifacts, "ns1", nil))); diff != "" {
+		t.Errorf("names (-before +after):\n%s", diff)
+	}
+
+	f.clock.Step(stalenessLimit / 2)
+	f.poll(t)
+	expectAvailable(t, f, "ns1")
+	f.clock.Step(time.Nanosecond)
+	expectUnavailable(t, f, "ns1", "reading a repository's artifacts failed")
+}
+
+func TestFirstReadWithoutSomeArtifactsIsStale(t *testing.T) {
+	h := artifactHarbor()
+	h.artifactErrs = map[string]error{"proj/nginx": errors.New("unexpected response from harbor")}
+	f := newFixture(t, h)
+	expectUnavailable(t, f, "ns1", "reading a repository's artifacts failed")
+	f.poll(t)
+	expectUnavailable(t, f, "ns1", "reading a repository's artifacts failed")
+
+	delete(h.artifactErrs, "proj/nginx")
+	f.poll(t)
+	expectAvailable(t, f, "ns1")
 }
 
 func TestStalenessCountsFromTheStartOfARead(t *testing.T) {
@@ -136,7 +183,60 @@ func TestStalenessCountsFromTheStartOfARead(t *testing.T) {
 	f.clock.Step(stalenessLimit / 2)
 	expectAvailable(t, f, "ns1")
 	f.clock.Step(time.Nanosecond)
-	expectUnavailable(t, f, "ns1", "harbor is unavailable")
+	expectUnavailable(t, f, "ns1", "reading harbor takes longer than the staleness limit")
+}
+
+// slowArtifacts lists repository app, and then lists its artifacts until the poll ends, failing with err.
+type slowArtifacts struct{ err error }
+
+func (slowArtifacts) ListRepositories(context.Context, string) ([]harbor.Repository, error) {
+	return []harbor.Repository{{ID: 1, Name: "proj/app"}}, nil
+}
+
+func (s slowArtifacts) ListArtifacts(ctx context.Context, _, _ string) ([]harbor.Artifact, error) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+	}
+	return nil, s.err
+}
+
+func TestPollEndsAtTheStalenessLimit(t *testing.T) {
+	for _, err := range []error{
+		fmt.Errorf("%w: %w", harbor.ErrUnavailable, context.DeadlineExceeded),
+		fmt.Errorf("decoding a response: %w", context.DeadlineExceeded),
+	} {
+		s := NewStore(50 * time.Millisecond)
+		s.SetNamespace("ns1", true)
+		if got := NewPoller(slowArtifacts{err}, "proj", s).Poll(t.Context()); !errors.Is(got, errSlowRead) {
+			t.Errorf("%v: poll returned %v, want %v", err, got, errSlowRead)
+		}
+		_, listErr := NewRepositories(s).List(inNamespace("ns1"), nil)
+		if !apierrors.IsServiceUnavailable(listErr) || !strings.Contains(listErr.Error(), "reading harbor takes longer than the staleness limit") {
+			t.Errorf("%v: list returned %v", err, listErr)
+		}
+	}
+}
+
+func TestPollsDoNotOverlap(t *testing.T) {
+	h := repositoryHarbor()
+	f := newUnreadFixture(h)
+	listing, release := make(chan struct{}, 2), make(chan struct{})
+	h.onList = func() {
+		listing <- struct{}{}
+		<-release
+	}
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Go(func() { f.poll(t) })
+	}
+	<-listing
+	time.Sleep(50 * time.Millisecond)
+	if len(listing) > 0 {
+		t.Error("listed repositories twice at once")
+	}
+	close(release)
+	wg.Wait()
 }
 
 // stepWhenWaiting steps the clock once something waits on it.
@@ -159,7 +259,7 @@ func expectRepositoryLists(t *testing.T, h *fakeHarbor, want int) {
 	}
 }
 
-func TestRunRetriesAFailedReadSooner(t *testing.T) {
+func TestRunRetriesOnceSoonerAfterAFailure(t *testing.T) {
 	h := repositoryHarbor()
 	h.setErr(harbor.ErrUnavailable)
 	f := newUnreadFixture(h)
@@ -176,17 +276,21 @@ func TestRunRetriesAFailedReadSooner(t *testing.T) {
 	expectRepositoryLists(t, h, 1)
 	stepWhenWaiting(t, f, 1100*time.Millisecond)
 	expectRepositoryLists(t, h, 2)
-	stepWhenWaiting(t, f, 1100*time.Millisecond)
+	stepWhenWaiting(t, f, 59*time.Second)
 	time.Sleep(10 * time.Millisecond)
 	expectRepositoryLists(t, h, 2)
 
 	h.setErr(nil)
-	stepWhenWaiting(t, f, 1100*time.Millisecond)
+	stepWhenWaiting(t, f, 7*time.Second)
 	expectRepositoryLists(t, h, 3)
-	expectAvailable(t, f, "ns1")
 	stepWhenWaiting(t, f, 59*time.Second)
 	time.Sleep(10 * time.Millisecond)
 	expectRepositoryLists(t, h, 3)
+	expectAvailable(t, f, "ns1")
+
+	h.setErr(harbor.ErrUnavailable)
 	stepWhenWaiting(t, f, 7*time.Second)
 	expectRepositoryLists(t, h, 4)
+	stepWhenWaiting(t, f, 1100*time.Millisecond)
+	expectRepositoryLists(t, h, 5)
 }

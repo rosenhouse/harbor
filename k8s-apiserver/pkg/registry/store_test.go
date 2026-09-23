@@ -3,6 +3,10 @@ package registry
 import (
 	"context"
 	"fmt"
+	"maps"
+	"math/rand/v2"
+	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -284,6 +288,21 @@ func TestWatchMarksEndOfInitialEvents(t *testing.T) {
 	}
 }
 
+func TestWatchDoesNotMarkEndOfStaleInitialEvents(t *testing.T) {
+	f := newFixture(t, repositoryHarbor())
+	w := startWatch(t, f.repositories, "ns1", &metainternalversion.ListOptions{
+		SendInitialEvents:    ptr.To(true),
+		ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
+		AllowWatchBookmarks:  true,
+	})
+	f.clock.Step(stalenessLimit + time.Nanosecond)
+	want := []string{"ADDED ns1/" + dottedRepository, "ADDED ns1/nginx", "ADDED ns1/team.api", "ERROR ServiceUnavailable"}
+	if diff := cmp.Diff(want, nextEvents(t, w, len(want))); diff != "" {
+		t.Errorf("events (-want +got):\n%s", diff)
+	}
+	expectEnd(t, w)
+}
+
 // bookmarkAfterInterval steps the clock past the bookmark interval once w's ticker is waiting.
 func bookmarkAfterInterval(t *testing.T, f *fixture) {
 	t.Helper()
@@ -297,6 +316,7 @@ func bookmarkAfterInterval(t *testing.T, f *fixture) {
 
 func TestWatchSendsBookmarks(t *testing.T) {
 	f := newFixture(t, repositoryHarbor())
+	f.store.bookmarkInterval = stalenessLimit / 4
 	opts := &metainternalversion.ListOptions{
 		ResourceVersion:     resourceVersion(t, f.repositories),
 		FieldSelector:       fields.OneTermEqualSelector("metadata.name", "team.api"),
@@ -390,14 +410,14 @@ func colored(color string) map[key]*item {
 
 func TestObjectsThatStartOrStopMatchingAppearOrDisappear(t *testing.T) {
 	f := newUnreadFixture(&fakeHarbor{})
-	f.store.update(colored("red"), f.clock.Now())
+	f.store.update(colored("red"), f.clock.Now(), nil)
 	rv := resourceVersion(t, f.repositories)
 	byColor := func(color string) *metainternalversion.ListOptions {
 		return &metainternalversion.ListOptions{ResourceVersion: rv, LabelSelector: labels.SelectorFromSet(labels.Set{"color": color})}
 	}
 	red := startWatch(t, f.repositories, "ns1", byColor("red"))
 	blue := startWatch(t, f.repositories, "ns1", byColor("blue"))
-	f.store.update(colored("blue"), f.clock.Now())
+	f.store.update(colored("blue"), f.clock.Now(), nil)
 
 	deleted, added := nextEvent(t, red), nextEvent(t, blue)
 	if diff := cmp.Diff([]string{"DELETED ns1/app", "ADDED ns1/app"}, []string{describe(deleted), describe(added)}); diff != "" {
@@ -467,11 +487,43 @@ func TestListResourceVersion(t *testing.T) {
 		{next, metav1.ResourceVersionMatchNotOlderThan, apistorage.IsTooLargeResourceVersion},
 		{next, "", apistorage.IsTooLargeResourceVersion},
 		{"x", "", apierrors.IsBadRequest},
+		{"00", "", apierrors.IsBadRequest},
+		{"0" + current, "", apierrors.IsBadRequest},
 	} {
 		_, err := f.repositories.List(inNamespace("ns1"), &metainternalversion.ListOptions{ResourceVersion: tc.rv, ResourceVersionMatch: tc.match})
 		if !tc.want(err) {
 			t.Errorf("list with resourceVersion %s, match %q: got %v", tc.rv, tc.match, err)
 		}
+	}
+}
+
+func TestGetResourceVersion(t *testing.T) {
+	f := newFixture(t, repositoryHarbor())
+	current := resourceVersion(t, f.repositories)
+	next := strconv.FormatUint(parseRV(t, current)+1, 10)
+	succeeds := func(err error) bool { return err == nil }
+	for _, tc := range []struct {
+		rv   string
+		want func(error) bool
+	}{
+		{"", succeeds},
+		{"0", succeeds},
+		{current, succeeds},
+		{next, apistorage.IsTooLargeResourceVersion},
+		{"x", apierrors.IsBadRequest},
+		{"00", apierrors.IsBadRequest},
+	} {
+		_, err := f.repositories.Get(inNamespace("ns1"), "nginx", &metav1.GetOptions{ResourceVersion: tc.rv})
+		if !tc.want(err) {
+			t.Errorf("get with resourceVersion %q: got %v", tc.rv, err)
+		}
+	}
+}
+
+func TestWatchFromNonCanonicalZero(t *testing.T) {
+	f := newFixture(t, repositoryHarbor())
+	if _, err := f.repositories.Watch(inNamespace("ns1"), from("00")); !apierrors.IsBadRequest(err) {
+		t.Errorf("got %v, want BadRequest", err)
 	}
 }
 
@@ -579,7 +631,7 @@ func TestServesLastReadUntilStale(t *testing.T) {
 func TestStaleWithoutFailedRead(t *testing.T) {
 	f := newFixture(t, repositoryHarbor())
 	f.clock.Step(stalenessLimit + time.Nanosecond)
-	expectUnavailable(t, f, "ns1", "harbor is unavailable")
+	expectUnavailable(t, f, "ns1", "reading harbor takes longer than the staleness limit")
 }
 
 func TestInvalidResourceVersionIsBadRequestWhenStale(t *testing.T) {
@@ -612,6 +664,88 @@ func TestWatchEndsWhenStale(t *testing.T) {
 	}
 	expectEnd(t, w)
 	expectNoEvent(t, other)
+}
+
+func TestWatchEndsOnceStaleDuringARead(t *testing.T) {
+	f := newFixture(t, repositoryHarbor())
+	w := startWatch(t, f.repositories, "ns1", from(resourceVersion(t, f.repositories)))
+	stepWhenWaiting(t, f, stalenessLimit+time.Nanosecond)
+	if diff := cmp.Diff([]string{"ERROR ServiceUnavailable"}, nextEvents(t, w, 1)); diff != "" {
+		t.Errorf("events (-want +got):\n%s", diff)
+	}
+	expectEnd(t, w)
+}
+
+func TestWatchSendsNoBookmarkOnceStale(t *testing.T) {
+	// The bookmark and staleness are due at once, and the watch sees them in random order.
+	for range 10 {
+		f := newFixture(t, repositoryHarbor())
+		f.store.bookmarkInterval = stalenessLimit + time.Nanosecond
+		w := startWatch(t, f.repositories, "ns1", &metainternalversion.ListOptions{ResourceVersion: resourceVersion(t, f.repositories), AllowWatchBookmarks: true})
+		stepWhenWaiting(t, f, stalenessLimit+time.Nanosecond)
+		if diff := cmp.Diff([]string{"ERROR ServiceUnavailable"}, nextEvents(t, w, 1)); diff != "" {
+			t.Errorf("events (-want +got):\n%s", diff)
+		}
+		expectEnd(t, w)
+	}
+}
+
+func TestWatchEndsWhenTheReadGetsOlder(t *testing.T) {
+	f := newFixture(t, repositoryHarbor())
+	w := startWatch(t, f.repositories, "ns1", from(resourceVersion(t, f.repositories)))
+	expectNoEvent(t, w)
+	f.store.update(maps.Clone(f.store.items), time.Time{}, errArtifactsRead)
+	if diff := cmp.Diff([]string{"ERROR ServiceUnavailable"}, nextEvents(t, w, 1)); diff != "" {
+		t.Errorf("events (-want +got):\n%s", diff)
+	}
+}
+
+func TestPollsWithoutChangesWakeNoWatch(t *testing.T) {
+	f := newFixture(t, repositoryHarbor())
+	_, changed, _, err := f.store.changesAfter(parseRV(t, resourceVersion(t, f.repositories)), "ns1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.poll(t)
+	f.harbor.err = harbor.ErrUnavailable
+	f.poll(t)
+	select {
+	case <-changed:
+		t.Error("woke watches")
+	default:
+	}
+}
+
+func TestPollsWithoutChangesKeepTheItems(t *testing.T) {
+	f := newFixture(t, repositoryHarbor())
+	items := f.store.items
+	f.poll(t)
+	if reflect.ValueOf(f.store.items).UnsafePointer() != reflect.ValueOf(items).UnsafePointer() {
+		t.Error("replaced the items")
+	}
+}
+
+func TestStartingAWatchDoesNotCopyTheState(t *testing.T) {
+	f := newUnreadFixture(&fakeHarbor{})
+	items := map[key]*item{}
+	for i := range 1000 {
+		name := fmt.Sprintf("r%d", i)
+		items[key{repositoriesResource.Resource, name}] = &item{harborID: int64(i), obj: &v1alpha1.HarborRepository{ObjectMeta: metav1.ObjectMeta{Name: name}}}
+	}
+	f.store.update(items, f.clock.Now(), nil)
+	for i := range 100 {
+		f.store.SetNamespace(fmt.Sprintf("n%d", i), true)
+	}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for range 10 {
+		startWatch(t, f.repositories, "", from("0"))
+	}
+	runtime.ReadMemStats(&after)
+	if n := after.TotalAlloc - before.TotalAlloc; n > 10<<20 {
+		t.Errorf("starting 10 watches of 100000 objects allocated %d MiB", n>>20)
+	}
 }
 
 func TestWatchEndsWithContext(t *testing.T) {
@@ -670,6 +804,114 @@ func TestEventObjectsAreCopies(t *testing.T) {
 	for _, r := range listItems(t, f.repositories, "", nil) {
 		if len(r.Labels) > 0 {
 			t.Errorf("%s/%s has labels %v", r.Namespace, r.Name, r.Labels)
+		}
+	}
+}
+
+// randomRepositories returns some of six repositories, each with one of two IDs and pull counts.
+func randomRepositories(rng *rand.Rand) []harbor.Repository {
+	var repos []harbor.Repository
+	for i := range 6 {
+		if rng.IntN(2) == 0 {
+			repos = append(repos, harbor.Repository{ID: int64(10*i + rng.IntN(2)), Name: fmt.Sprintf("proj/r%d", i), PullCount: int64(rng.IntN(2))})
+		}
+	}
+	return repos
+}
+
+// listedByName lists repositories in all namespaces, keyed by namespace and name.
+func listedByName(t *testing.T, f *fixture) map[string]v1alpha1.HarborRepository {
+	t.Helper()
+	listed := map[string]v1alpha1.HarborRepository{}
+	for _, r := range listItems(t, f.repositories, "", nil) {
+		listed[r.Namespace+"/"+r.Name] = r
+	}
+	return listed
+}
+
+// replay applies w's events to state until it sees the object named last.
+// It checks that the resourceVersions of the events after the first initial ones increase from rv.
+// If marked, a bookmark at rv must mark the end of the initial events.
+func replay(t *testing.T, w watch.Interface, state map[string]v1alpha1.HarborRepository, rv uint64, initial int, marked bool, last string) map[string]v1alpha1.HarborRepository {
+	t.Helper()
+	for i := 0; ; i++ {
+		e := nextEvent(t, w)
+		o := e.Object.(*v1alpha1.HarborRepository)
+		if marked && i == initial {
+			if e.Type != watch.Bookmark || parseRV(t, o.ResourceVersion) != rv || o.Annotations[metav1.InitialEventsAnnotationKey] != "true" {
+				t.Fatalf("%s at %s ends the initial events, want a bookmark at %d", describe(e), o.ResourceVersion, rv)
+			}
+			continue
+		}
+		k := o.Namespace + "/" + o.Name
+		if next := parseRV(t, o.ResourceVersion); i < initial && (e.Type != watch.Added || next > rv) {
+			t.Fatalf("initial %s at %d, after %d", describe(e), next, rv)
+		} else if i >= initial && next <= rv {
+			t.Fatalf("%s at %d follows %d", describe(e), next, rv)
+		} else if i >= initial {
+			rv = next
+		}
+		_, exists := state[k]
+		switch {
+		case e.Type == watch.Added && !exists, e.Type == watch.Modified && exists:
+			state[k] = *o
+		case e.Type == watch.Deleted && exists:
+			delete(state, k)
+		default:
+			t.Fatalf("%s, but it exists: %v", describe(e), exists)
+		}
+		if k == last {
+			return state
+		}
+	}
+}
+
+func TestWatchesReplayToTheLatestList(t *testing.T) {
+	for seed := range uint64(20) {
+		rng := rand.New(rand.NewPCG(seed, seed))
+		f := newFixture(t, &fakeHarbor{})
+		type start struct {
+			listed                      map[string]v1alpha1.HarborRepository
+			rv                          uint64
+			resumed, initial, watchList watch.Interface
+		}
+		var starts []start
+		for range 30 {
+			if rng.IntN(3) == 0 {
+				f.store.SetNamespace(fmt.Sprintf("ns%d", rng.IntN(4)), rng.IntN(2) == 0)
+			} else {
+				f.harbor.repositories = randomRepositories(rng)
+				f.poll(t)
+			}
+			rv := resourceVersion(t, f.repositories)
+			starts = append(starts, start{
+				listed:  listedByName(t, f),
+				rv:      parseRV(t, rv),
+				resumed: startWatch(t, f.repositories, "", from(rv)),
+				initial: startWatch(t, f.repositories, "", from("0")),
+				watchList: startWatch(t, f.repositories, "", &metainternalversion.ListOptions{
+					SendInitialEvents:    ptr.To(true),
+					ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
+					AllowWatchBookmarks:  true,
+				}),
+			})
+		}
+		// The newest repository's event in a new namespace comes last.
+		f.harbor.repositories = append(f.harbor.repositories, harbor.Repository{ID: 100, Name: "proj/last"})
+		f.poll(t)
+		f.store.SetNamespace("last", true)
+		want := listedByName(t, f)
+
+		for i, s := range starts {
+			if diff := cmp.Diff(want, replay(t, s.initial, map[string]v1alpha1.HarborRepository{}, s.rv, len(s.listed), false, "last/last")); diff != "" {
+				t.Fatalf("seed %d, watch with the state at %d (-want +got):\n%s", seed, i, diff)
+			}
+			if diff := cmp.Diff(want, replay(t, s.watchList, map[string]v1alpha1.HarborRepository{}, s.rv, len(s.listed), true, "last/last")); diff != "" {
+				t.Fatalf("seed %d, watch list with the state at %d (-want +got):\n%s", seed, i, diff)
+			}
+			if diff := cmp.Diff(want, replay(t, s.resumed, s.listed, s.rv, 0, false, "last/last")); diff != "" {
+				t.Fatalf("seed %d, watch with the state at %d (-want +got):\n%s", seed, i, diff)
+			}
 		}
 	}
 }

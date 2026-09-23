@@ -23,8 +23,6 @@ import (
 	apistorage "k8s.io/apiserver/pkg/storage"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
-
-	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 )
 
 // Store holds the last read of a Harbor project and serves a copy of it to each namespace that sees the project.
@@ -43,18 +41,19 @@ type Store struct {
 
 	mu sync.Mutex
 	// rv is the last resourceVersion that a change took.
-	rv    uint64
+	rv uint64
+	// items is replaced but never modified, so requests read it after releasing mu. Only update replaces it.
 	items map[key]*item
-	// namespaces see the project, in ordinal order. Changes in the log hold earlier slices, so SetNamespace only appends to or copies it.
+	// namespaces see the project, in ordinal order. Requests and the log hold earlier slices, so SetNamespace only appends to or copies it.
 	namespaces                            []*labeledNamespace
 	nextItemOrdinal, nextNamespaceOrdinal uint64
 	log                                   []change
 	logCost                               int
 	// oldest is the oldest resourceVersion that a watch can resume from.
 	oldest uint64
-	// changed is closed when the log grows or a read of Harbor fails.
+	// changed is closed when the log grows or the last read gets older.
 	changed chan struct{}
-	// read is when the last successful read of Harbor started, and readErr is why a later read failed.
+	// read is when the oldest part of the last read of Harbor started, and readErr is why no later read replaced that part.
 	read    time.Time
 	readErr error
 }
@@ -202,35 +201,54 @@ func (s *Store) SetNamespace(name string, allowed bool) {
 	s.publishLocked(batch)
 }
 
-// update replaces the last read of Harbor, which started at read, recording a change for each object that differs.
-func (s *Store) update(items map[key]*item, read time.Time) {
+// update replaces the last read of Harbor, recording a change for each object that differs.
+// read is when the oldest part of items was read, and err is why later reads of that part failed.
+// Calls must not overlap, since update reads s.items without holding mu.
+func (s *Store) update(items map[key]*item, read time.Time, err error) {
+	changes := diffItems(s.items, items)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.read, s.readErr = read, nil
 	batch := len(s.log)
-	for _, k := range sortedKeys(s.items, items) {
-		old, cur := s.items[k], items[k]
-		switch {
-		case old == nil || cur == nil:
-			s.changeLocked(k, old, cur)
-		case old.harborID != cur.harborID:
-			s.changeLocked(k, old, nil)
-			s.changeLocked(k, nil, cur)
-		case equality.Semantic.DeepEqual(old.obj, cur.obj):
-			items[k] = old
-		default:
-			s.changeLocked(k, old, cur)
-		}
+	for _, c := range changes {
+		s.changeLocked(c.key, c.old, c.cur)
 	}
-	s.items = items
-	s.publishLocked(batch)
+	if len(changes) > 0 {
+		s.items = items
+	}
+	older := read.Before(s.read)
+	s.read, s.readErr = read, err
+	switch {
+	case len(changes) > 0:
+		s.publishLocked(batch)
+	case older:
+		s.wakeLocked()
+	}
 }
 
+// diffItems returns the changes from old to cur, in key order. It puts in cur each item of old that did not change.
+func diffItems(old, cur map[key]*item) []event {
+	var changes []event
+	for _, k := range sortedKeys(old, cur) {
+		o, c := old[k], cur[k]
+		switch {
+		case o == nil || c == nil:
+			changes = append(changes, event{key: k, old: o, cur: c})
+		case o.harborID != c.harborID:
+			changes = append(changes, event{key: k, old: o}, event{key: k, cur: c})
+		case equality.Semantic.DeepEqual(o.obj, c.obj):
+			cur[k] = o
+		default:
+			changes = append(changes, event{key: k, old: o, cur: c})
+		}
+	}
+	return changes
+}
+
+// failed records why a read of Harbor failed.
 func (s *Store) failed(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.readErr = err
-	s.wakeLocked()
 }
 
 // changeLocked logs a change to an object in Harbor.
@@ -290,56 +308,68 @@ func sortedKeys(itemSets ...map[key]*item) []key {
 // A request that covers no namespace that sees the project needs none.
 func (s *Store) checkLocked(namespace string) error {
 	switch {
-	case len(s.namespacesLocked(namespace)) == 0:
-		return nil
-	case !s.read.IsZero() && s.clock.Since(s.read) <= s.stalenessLimit:
+	case !s.coversLocked(namespace), s.clock.Now().Before(s.staleAtLocked()):
 		return nil
 	case s.readErr != nil:
 		return apierrors.NewServiceUnavailable(errorKind(s.readErr).Error())
 	case s.read.IsZero():
 		return apierrors.NewServiceUnavailable("harbor has not been read yet")
 	}
-	return apierrors.NewServiceUnavailable(harbor.ErrUnavailable.Error())
+	return apierrors.NewServiceUnavailable(errSlowRead.Error())
 }
 
-// namespacesLocked returns, sorted by name, the namespaces that see the project among those that a request for namespace covers.
-func (s *Store) namespacesLocked(namespace string) []*labeledNamespace {
-	var covered []*labeledNamespace
-	for _, ns := range s.namespaces {
+// staleAtLocked returns the first time at which the last read is older than the staleness limit.
+func (s *Store) staleAtLocked() time.Time {
+	return s.read.Add(s.stalenessLimit + time.Nanosecond)
+}
+
+// coversLocked returns whether a request for namespace covers a namespace that sees the project.
+func (s *Store) coversLocked(namespace string) bool {
+	return slices.ContainsFunc(s.namespaces, func(ns *labeledNamespace) bool { return namespace == "" || ns.name == namespace })
+}
+
+// covered returns, sorted by name, the namespaces among nss that a request for namespace covers.
+func covered(nss []*labeledNamespace, namespace string) []*labeledNamespace {
+	var c []*labeledNamespace
+	for _, ns := range nss {
 		if namespace == "" || ns.name == namespace {
-			covered = append(covered, ns)
+			c = append(c, ns)
 		}
 	}
-	slices.SortFunc(covered, func(a, b *labeledNamespace) int { return cmp.Compare(a.name, b.name) })
-	return covered
+	slices.SortFunc(c, func(a, b *labeledNamespace) int { return cmp.Compare(a.name, b.name) })
+	return c
 }
 
 // stateLocked returns an event that adds each object of resource in the namespaces that a request for namespace covers.
-func (s *Store) stateLocked(resource, namespace string) []event {
-	var keys []key
-	for k := range s.items {
-		if k.resource == resource {
-			keys = append(keys, k)
+// The events come from the current items and namespaces, which no one modifies, so they can be read after mu is released.
+func (s *Store) stateLocked(resource, namespace string) iter.Seq[event] {
+	items, namespaces := s.items, s.namespaces
+	return func(yield func(event) bool) {
+		var keys []key
+		for k := range items {
+			if k.resource == resource {
+				keys = append(keys, k)
+			}
+		}
+		slices.SortFunc(keys, func(a, b key) int { return cmp.Compare(a.name, b.name) })
+		for _, ns := range covered(namespaces, namespace) {
+			for _, k := range keys {
+				it := items[k]
+				if !yield(event{rv: ns.resourceVersion(it), namespace: ns.name, key: k, cur: it}) {
+					return
+				}
+			}
 		}
 	}
-	slices.SortFunc(keys, func(a, b key) int { return cmp.Compare(a.name, b.name) })
-	var state []event
-	for _, ns := range s.namespacesLocked(namespace) {
-		for _, k := range keys {
-			it := s.items[k]
-			state = append(state, event{rv: ns.resourceVersion(it), namespace: ns.name, key: k, cur: it})
-		}
-	}
-	return state
 }
 
 // parseResourceVersion returns the resourceVersion that a request asks for, or 0 for any.
 func parseResourceVersion(rv string) (uint64, error) {
-	if rv == "" || rv == "0" {
+	if rv == "" {
 		return 0, nil
 	}
 	n, err := strconv.ParseUint(rv, 10, 64)
-	if err != nil {
+	if err != nil || strconv.FormatUint(n, 10) != rv {
 		return 0, apierrors.NewBadRequest(fmt.Sprintf("invalid resource version %q", rv))
 	}
 	return n, nil
@@ -362,15 +392,20 @@ func (s *Store) checkResumeLocked(rv uint64) error {
 	case rv < s.oldest:
 		return apierrors.NewResourceExpired(fmt.Sprintf("too old resource version: %d (%d)", rv, s.oldest))
 	case rv > s.rv:
+		// A later resourceVersion comes from another replica or process, so waiting for it would only delay a relist.
 		return apierrors.NewResourceExpired(fmt.Sprintf("unknown resource version: %d (%d)", rv, s.rv))
 	}
 	return nil
 }
 
-func (s *Store) get(resource schema.GroupResource, namespace, name string) (runtime.Object, error) {
+func (s *Store) get(resource schema.GroupResource, namespace, name string, opts *metav1.GetOptions) (runtime.Object, error) {
+	rv, err := parseResourceVersion(ptr.Deref(opts, metav1.GetOptions{}).ResourceVersion)
+	if err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.checkLocked(namespace); err != nil {
+	if err := cmp.Or(s.checkLocked(namespace), s.checkStateLocked(rv, "")); err != nil {
 		return nil, err
 	}
 	k := key{resource.Resource, name}
@@ -398,7 +433,7 @@ func (s *Store) list(resource, namespace string, opts *metainternalversion.ListO
 	state, current := s.stateLocked(resource, namespace), s.rv
 	s.mu.Unlock()
 	var objs []runtime.Object
-	for _, e := range state {
+	for e := range state {
 		if we, ok := e.watchEvent(match); ok {
 			objs = append(objs, we.Object)
 		}
@@ -406,16 +441,21 @@ func (s *Store) list(resource, namespace string, opts *metainternalversion.ListO
 	return objs, strconv.FormatUint(current, 10), nil
 }
 
-// changesAfter returns the logged changes after resourceVersion rv, and a channel that is closed when there may be more.
+// changesAfter returns the logged changes after resourceVersion rv, a channel that is closed when there may be more,
+// and when a request for namespace will need a fresher read of Harbor, or zero for never.
 // It fails once a request for namespace needs a fresher read of Harbor.
-func (s *Store) changesAfter(rv uint64, namespace string) ([]change, <-chan struct{}, error) {
+func (s *Store) changesAfter(rv uint64, namespace string) ([]change, <-chan struct{}, time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := cmp.Or(s.checkLocked(namespace), s.checkResumeLocked(rv)); err != nil {
-		return nil, nil, err
+		return nil, nil, time.Time{}, err
+	}
+	var staleAt time.Time
+	if s.coversLocked(namespace) {
+		staleAt = s.staleAtLocked()
 	}
 	i := sort.Search(len(s.log), func(i int) bool { return s.log[i].last > rv })
-	return s.log[i:], s.changed, nil
+	return s.log[i:], s.changed, staleAt, nil
 }
 
 func (s *Store) watch(ctx context.Context, resource, namespace string, match func(object, string) bool, opts *metainternalversion.ListOptions, newObject func() runtime.Object) (watch.Interface, error) {

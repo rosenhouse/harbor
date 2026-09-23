@@ -17,3 +17,6 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/args/-
         value: --harbor-staleness-limit=20s
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --harbor-timeout=5s
