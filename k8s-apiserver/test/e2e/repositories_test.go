@@ -192,7 +192,7 @@ func TestHarborOutageIsServiceUnavailable(t *testing.T) {
 	}
 	eventually(t, unavailable)
 
-	// A readiness probe that depended on Harbor would fail within 30s (see deploy/deployment.yaml).
+	// A readiness probe that depended on Harbor would fail within 30s (see deploy/base/deployment.yaml).
 	time.Sleep(40 * time.Second)
 	eventually(t, unavailable)
 	if after := apiServiceAvailable(t); after != available {
