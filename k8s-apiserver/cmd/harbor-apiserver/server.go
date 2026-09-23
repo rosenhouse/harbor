@@ -38,20 +38,22 @@ func run(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	s, err := newServer(c.Complete(nil), kube, h, o.Harbor.Project)
+	s, err := newServer(c.Complete(nil), kube, h, o.Harbor)
 	if err != nil {
 		return err
 	}
 	return s.PrepareRun().RunWithContext(ctx)
 }
 
-// newServer returns a server that is ready once it has read the labeled namespaces from kube.
-func newServer(c genericapiserver.CompletedConfig, kube kubernetes.Interface, h registry.Harbor, project string) (*genericapiserver.GenericAPIServer, error) {
-	factory := informers.NewSharedInformerFactoryWithOptions(kube, 0, informers.WithTweakListOptions(func(o *metav1.ListOptions) {
-		o.LabelSelector = namespaces.ProjectLabel
+// newServer returns a server that polls Harbor.
+// It is ready once it has listed the labeled namespaces and its first poll of Harbor has ended.
+func newServer(c genericapiserver.CompletedConfig, kube kubernetes.Interface, h registry.Harbor, o *harborOptions) (*genericapiserver.GenericAPIServer, error) {
+	factory := informers.NewSharedInformerFactoryWithOptions(kube, 0, informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+		opts.LabelSelector = namespaces.ProjectLabel
 	}))
 	namespaceInformer := factory.Core().V1().Namespaces()
-	s, err := apiserver.New(c, h, project, namespaces.NewGate(namespaceInformer.Lister(), project))
+	store := registry.NewStore(o.Project, o.StalenessLimit, namespaces.NewGate(namespaceInformer.Lister(), o.Project))
+	s, err := apiserver.New(c, store)
 	if err != nil {
 		return nil, err
 	}
@@ -62,12 +64,30 @@ func newServer(c genericapiserver.CompletedConfig, kube kubernetes.Interface, h 
 	if err != nil {
 		return nil, err
 	}
-	err = s.AddReadyzChecks(healthz.NamedCheck("namespaces-synced", func(*http.Request) error {
-		if !namespaceInformer.Informer().HasSynced() {
-			return errors.New("namespace informer has not synced")
-		}
+	poller := registry.NewPoller(h, store)
+	err = s.AddPostStartHook("start-harbor-poller", func(ctx genericapiserver.PostStartHookContext) error {
+		go poller.Run(ctx, o.PollInterval)
 		return nil
-	}))
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = s.AddReadyzChecks(
+		healthz.NamedCheck("namespaces-synced", func(*http.Request) error {
+			if !namespaceInformer.Informer().HasSynced() {
+				return errors.New("namespace informer has not synced")
+			}
+			return nil
+		}),
+		healthz.NamedCheck("harbor-read", func(*http.Request) error {
+			select {
+			case <-poller.Attempted():
+			default:
+				return errors.New("harbor has not been read yet")
+			}
+			return nil
+		}),
+	)
 	if err != nil {
 		return nil, err
 	}

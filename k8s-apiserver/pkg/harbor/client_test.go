@@ -9,8 +9,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -98,6 +100,128 @@ func TestListRepositoriesPages(t *testing.T) {
 	}
 }
 
+// pages serves repos in pages of 100, with X-Total-Count, calling changed after reading each page.
+func pages(t *testing.T, repos *[]harbor.Repository, changed func(page string)) http.HandlerFunc {
+	var mu sync.Mutex
+	return func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		all := *repos
+		changed(r.URL.Query().Get("page"))
+		mu.Unlock()
+		w.Header().Set("X-Total-Count", strconv.Itoa(len(all)))
+		writeJSON(t, w, all[min(len(all), (page-1)*100):min(len(all), page*100)])
+	}
+}
+
+func TestListStartsOverWhenADeletionShiftsPages(t *testing.T) {
+	defer harbor.SetListRetryWait(time.Millisecond)()
+	repos := repositories(1, 150)
+	deleted := false
+	f := newFakeHarbor(t, pages(t, &repos, func(page string) {
+		if page == "1" && !deleted {
+			repos, deleted = slices.Delete(repos, 4, 5), true
+		}
+	}))
+
+	got, err := newClient(t, f).ListRepositories(context.Background(), "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(repos, got); diff != "" {
+		t.Errorf("repositories (-want +got):\n%s", diff)
+	}
+	if len(f.requests) != 4 {
+		t.Errorf("sent %d requests, want 2 lists of 2 pages", len(f.requests))
+	}
+}
+
+func TestListKeepsGoingWhenItemsAreCreated(t *testing.T) {
+	repos := repositories(1, 150)
+	f := newFakeHarbor(t, pages(t, &repos, func(string) {
+		repos = append(slices.Clip(repos), harbor.Repository{ID: int64(len(repos) + 1), Name: "proj/new"})
+	}))
+
+	got, err := newClient(t, f).ListRepositories(context.Background(), "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(repositories(1, 150), got[:150]); diff != "" || len(got) != 151 {
+		t.Errorf("got %d repositories (-want +got):\n%s", len(got), diff)
+	}
+	if len(f.requests) != 2 {
+		t.Errorf("sent %d requests, want 1 list of 2 pages", len(f.requests))
+	}
+}
+
+func TestListStartsOverWhenTheCountMissesADeletion(t *testing.T) {
+	defer harbor.SetListRetryWait(time.Millisecond)()
+	repos := repositories(1, 50)
+	var mu sync.Mutex
+	counted := len(repos)
+	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		total := counted
+		counted = len(repos)
+		mu.Unlock()
+		w.Header().Set("X-Total-Count", strconv.Itoa(total))
+		writeJSON(t, w, repos)
+	})
+	repos = repos[1:]
+
+	got, err := newClient(t, f).ListRepositories(context.Background(), "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(repos, got); diff != "" {
+		t.Errorf("repositories (-want +got):\n%s", diff)
+	}
+	if len(f.requests) != 2 {
+		t.Errorf("sent %d requests, want 2 lists of a page", len(f.requests))
+	}
+}
+
+func TestListGivesUpWhenPagesKeepShifting(t *testing.T) {
+	defer harbor.SetListRetryWait(50 * time.Millisecond)()
+	repos := repositories(1, 300)
+	var requested []time.Time
+	f := newFakeHarbor(t, pages(t, &repos, func(string) {
+		requested = append(requested, time.Now())
+		repos = repos[1:]
+	}))
+	if _, err := newClient(t, f).ListRepositories(context.Background(), "proj"); err == nil {
+		t.Error("returned a list that kept changing")
+	}
+	if len(f.requests) != 6 {
+		t.Fatalf("sent %d requests, want 3 attempts of 2 pages", len(f.requests))
+	}
+	for _, i := range []int{2, 4} {
+		if wait := requested[i].Sub(requested[i-1]); wait < 50*time.Millisecond {
+			t.Errorf("started attempt %d after %v", i/2+1, wait)
+		}
+	}
+}
+
+func TestListStopsWaitingToStartOverWhenCancelled(t *testing.T) {
+	defer harbor.SetListRetryWait(10 * time.Second)()
+	repos := repositories(1, 150)
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	f := newFakeHarbor(t, pages(t, &repos, func(string) {
+		once.Do(func() {
+			repos = repos[1:]
+			time.AfterFunc(100*time.Millisecond, cancel)
+		})
+	}))
+	start := time.Now()
+	if _, err := newClient(t, f).ListRepositories(ctx, "proj"); !errors.Is(err, context.Canceled) {
+		t.Errorf("got %v, want %v", err, context.Canceled)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("returned after %v", took)
+	}
+}
+
 func TestListStopsAfterLastPage(t *testing.T) {
 	for name, tc := range map[string]struct {
 		totalCount string
@@ -141,20 +265,10 @@ func TestListGivesUpOnEndlessPages(t *testing.T) {
 func TestResponseSizeLimit(t *testing.T) {
 	defer harbor.SetLimits(1000, 100)()
 	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, harbor.Repository{Name: strings.Repeat("x", 200)})
+		writeJSON(t, w, []harbor.Repository{{Name: strings.Repeat("x", 200)}})
 	})
-	if _, err := newClient(t, f).GetRepository(context.Background(), "proj", "x"); err == nil {
+	if _, err := newClient(t, f).ListRepositories(context.Background(), "proj"); err == nil {
 		t.Error("decoded a response over the size limit")
-	}
-}
-
-func TestPathsEncodeNestedRepositoryNamesTwice(t *testing.T) {
-	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{}`)
-	})
-	_, _ = newClient(t, f).GetRepository(context.Background(), "proj", "team/app")
-	if diff := cmp.Diff([]string{"/api/v2.0/projects/proj/repositories/team%252Fapp"}, f.requests); diff != "" {
-		t.Errorf("requests (-want +got):\n%s", diff)
 	}
 }
 
@@ -177,7 +291,7 @@ func TestListArtifacts(t *testing.T) {
 		}]`)
 	})
 
-	artifacts, err := newClient(t, f).ListArtifacts(context.Background(), "proj", "team/app", "")
+	artifacts, err := newClient(t, f).ListArtifacts(context.Background(), "proj", "team/app")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,16 +318,6 @@ func TestListArtifacts(t *testing.T) {
 	}
 }
 
-func TestListArtifactsWithDigestPrefix(t *testing.T) {
-	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) { writeJSON(t, w, []harbor.Artifact{}) })
-	if _, err := newClient(t, f).ListArtifacts(context.Background(), "proj", "app", "sha256:0123456789ab"); err != nil {
-		t.Fatal(err)
-	}
-	if want := "/api/v2.0/projects/proj/repositories/app/artifacts?page=1&page_size=100&q=digest%3D~sha256%3A0123456789ab&sort=id&with_tag=true"; f.requests[0] != want {
-		t.Errorf("request %s, want %s", f.requests[0], want)
-	}
-}
-
 func TestErrors(t *testing.T) {
 	for _, tc := range []struct {
 		status  int
@@ -234,14 +338,14 @@ func TestErrors(t *testing.T) {
 				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, tc.body)
 			})
-			repo, err := newClient(t, f).GetRepository(context.Background(), "proj", "a")
-			if err == nil || repo != nil {
-				t.Fatalf("got %v, %v; want only an error", repo, err)
+			artifacts, err := newClient(t, f).ListArtifacts(context.Background(), "proj", "a")
+			if err == nil || artifacts != nil {
+				t.Fatalf("got %v, %v; want only an error", artifacts, err)
 			}
 			if tc.want != nil && !errors.Is(err, tc.want) {
 				t.Errorf("got %v, want %v", err, tc.want)
 			}
-			wantMsg := fmt.Sprintf("GET /api/v2.0/projects/proj/repositories/a: %d %s", tc.status, http.StatusText(tc.status))
+			wantMsg := fmt.Sprintf("GET /api/v2.0/projects/proj/repositories/a/artifacts: %d %s", tc.status, http.StatusText(tc.status))
 			if tc.wantMsg != "" {
 				wantMsg += ": " + tc.wantMsg
 			}
@@ -323,7 +427,7 @@ func TestCredentialsForEachRequest(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, password, _ := r.BasicAuth()
 		passwords = append(passwords, password)
-		_, _ = io.WriteString(w, `{}`)
+		_, _ = io.WriteString(w, `[]`)
 	}))
 	t.Cleanup(s.Close)
 	calls := 0
@@ -337,7 +441,7 @@ func TestCredentialsForEachRequest(t *testing.T) {
 	}
 
 	for range 2 {
-		if _, err := c.GetRepository(context.Background(), "proj", "app"); err != nil {
+		if _, err := c.ListRepositories(context.Background(), "proj"); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -14,12 +14,14 @@ import (
 )
 
 type harborOptions struct {
-	URL          string
-	Project      string
-	UsernameFile string
-	PasswordFile string
-	CAFile       string
-	Timeout      time.Duration
+	URL            string
+	Project        string
+	UsernameFile   string
+	PasswordFile   string
+	CAFile         string
+	Timeout        time.Duration
+	PollInterval   time.Duration
+	StalenessLimit time.Duration
 }
 
 func (h *harborOptions) addFlags(fs *pflag.FlagSet) {
@@ -28,7 +30,9 @@ func (h *harborOptions) addFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&h.UsernameFile, "harbor-username-file", h.UsernameFile, "File holding the robot account name.")
 	fs.StringVar(&h.PasswordFile, "harbor-password-file", h.PasswordFile, "File holding the robot account secret.")
 	fs.StringVar(&h.CAFile, "harbor-ca-file", h.CAFile, "PEM bundle of extra CAs to trust for Harbor.")
-	fs.DurationVar(&h.Timeout, "harbor-timeout", 10*time.Second, "Timeout for each request to Harbor.")
+	fs.DurationVar(&h.Timeout, "harbor-timeout", 10*time.Second, "Timeout for each request to Harbor. It must be positive.")
+	fs.DurationVar(&h.PollInterval, "harbor-poll-interval", 30*time.Second, "How long to wait between polls of the project.")
+	fs.DurationVar(&h.StalenessLimit, "harbor-staleness-limit", 5*time.Minute, "How old data can be before requests that need it fail with 503. A poll that takes longer fails. It must be longer than 2.2 times --harbor-poll-interval plus twice --harbor-timeout.")
 }
 
 // trimmedString is a flag value without surrounding whitespace, such as the trailing newline of a Secret value.
@@ -52,6 +56,15 @@ func (h *harborOptions) validate() []error {
 	}
 	if msgs := validation.IsValidLabelValue(h.Project); h.Project != "" && len(msgs) > 0 {
 		errs = append(errs, fmt.Errorf("--harbor-project %q cannot be a label value: %s", h.Project, strings.Join(msgs, "; ")))
+	}
+	if h.Timeout <= 0 {
+		errs = append(errs, errors.New("--harbor-timeout must be positive"))
+	}
+	if h.PollInterval <= 0 {
+		errs = append(errs, errors.New("--harbor-poll-interval must be positive"))
+	}
+	if h.StalenessLimit <= 2*(h.PollInterval+h.PollInterval/10+h.Timeout) {
+		errs = append(errs, errors.New("--harbor-staleness-limit must be longer than 2.2 times --harbor-poll-interval plus twice --harbor-timeout"))
 	}
 	return errs
 }

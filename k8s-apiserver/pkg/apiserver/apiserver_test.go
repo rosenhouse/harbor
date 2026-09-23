@@ -8,12 +8,14 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	restclient "k8s.io/client-go/rest"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apiserver"
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
+	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/registry"
 )
 
 var kinds = []struct{ resource, kind string }{
@@ -27,11 +29,7 @@ func (fakeHarbor) ListRepositories(context.Context, string) ([]harbor.Repository
 	return []harbor.Repository{{ID: 1, Name: "proj/team/api", ArtifactCount: 2, PullCount: 3}}, nil
 }
 
-func (fakeHarbor) GetRepository(context.Context, string, string) (*harbor.Repository, error) {
-	return &harbor.Repository{ID: 1, Name: "proj/team/api"}, nil
-}
-
-func (fakeHarbor) ListArtifacts(_ context.Context, _, repository, _ string) ([]harbor.Artifact, error) {
+func (fakeHarbor) ListArtifacts(_ context.Context, _, repository string) ([]harbor.Artifact, error) {
 	if repository != "team/api" {
 		return nil, harbor.ErrNotFound
 	}
@@ -46,10 +44,14 @@ func (allowed) Namespaces() []string  { return []string{"allowed"} }
 
 func newHandler(t *testing.T) http.Handler {
 	t.Helper()
+	store := registry.NewStore("proj", time.Minute, allowed{})
+	if err := registry.NewPoller(fakeHarbor{}, store).Poll(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	c := apiserver.NewConfig()
 	c.ExternalAddress = "localhost:443"
 	c.LoopbackClientConfig = &restclient.Config{}
-	s, err := apiserver.New(c.Complete(nil), fakeHarbor{}, "proj", allowed{})
+	s, err := apiserver.New(c.Complete(nil), store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +112,19 @@ func TestListIsEmptyOutsideAllowedNamespaces(t *testing.T) {
 		decode(t, get(t, h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/default/"+k.resource), http.StatusOK, &list)
 		if list.Kind != k.kind+"List" || len(list.Items) != 0 {
 			t.Errorf("%s: got kind %q with %d items", k.resource, list.Kind, len(list.Items))
+		}
+	}
+}
+
+func TestWatchIsNotSupported(t *testing.T) {
+	h := newHandler(t)
+	for _, k := range kinds {
+		for _, path := range []string{"/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/", "/apis/harbor.goharbor.io/v1alpha1/"} {
+			var status metav1.Status
+			decode(t, get(t, h, path+k.resource+"?watch=true"), http.StatusMethodNotAllowed, &status)
+			if status.Reason != metav1.StatusReasonMethodNotAllowed {
+				t.Errorf("%s: reason %q", path+k.resource, status.Reason)
+			}
 		}
 	}
 }

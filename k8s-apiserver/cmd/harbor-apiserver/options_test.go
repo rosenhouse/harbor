@@ -75,7 +75,7 @@ func TestDelegatesAuthenticationAndAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := newServer(c.Complete(nil), fake.NewClientset(), nil, "proj")
+	s, err := newServer(c.Complete(nil), fake.NewClientset(), nil, &testHarborOptions)
 	if err != nil {
 		t.Fatal(err)
 	}

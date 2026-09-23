@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -157,6 +158,29 @@ func TestNamespaceLabelControlsVisibility(t *testing.T) {
 	expect("some-other-project", nil)
 	expect(HarborProject, seededRepositories)
 	expect("", nil)
+}
+
+func TestListsFollowHarbor(t *testing.T) {
+	ns := newNamespace(t)
+	label(t, ns, HarborProject)
+	expectRepositories(t, ns, seededRepositories)
+
+	admin := NewAdmin(HarborURL)
+	repository := fmt.Sprintf("new-%d", time.Now().UnixNano())
+	img := image(repository, "amd64")
+	t.Cleanup(func() { _ = admin.deleteRepository(context.Background(), repository) })
+	if err := admin.push(t.Context(), repository+":v1", img); err != nil {
+		t.Fatal(err)
+	}
+	want := append(slices.Clone(seededRepositories), HarborProject+"/"+repository)
+	slices.Sort(want)
+	expectRepositories(t, ns, want)
+	expectArtifacts(t, []string{HarborProject + "/" + repository + "@" + digest(t, img)}, "-n", ns, "-l", v1alpha1.RepositoryLabel+"="+repository)
+
+	if err := admin.deleteRepository(t.Context(), repository); err != nil {
+		t.Fatal(err)
+	}
+	expectRepositories(t, ns, seededRepositories)
 }
 
 func TestHarborOutageIsServiceUnavailable(t *testing.T) {

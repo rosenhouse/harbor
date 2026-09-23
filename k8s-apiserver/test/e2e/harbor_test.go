@@ -63,14 +63,6 @@ func TestRobotReadsSeededProject(t *testing.T) {
 		t.Errorf("artifact counts by repository (-want +got):\n%s", diff)
 	}
 
-	repo, err := c.GetRepository(ctx, HarborProject, "team/api")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if repo.Name != "e2e/team/api" || repo.ArtifactCount != 1 {
-		t.Errorf("team/api: got %+v", repo)
-	}
-
 	for _, tc := range []struct {
 		repo string
 		want []artifactSummary
@@ -87,34 +79,12 @@ func TestRobotReadsSeededProject(t *testing.T) {
 		{"team/api", []artifactSummary{{Digest: digest(t, seed.TeamAPI), Tags: []string{"v1"}}}},
 		{"dotted.name_x", []artifactSummary{{Digest: digest(t, seed.Dotted), Tags: []string{"v1"}}}},
 	} {
-		artifacts, err := c.ListArtifacts(ctx, HarborProject, tc.repo, "")
+		artifacts, err := c.ListArtifacts(ctx, HarborProject, tc.repo)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if diff := cmp.Diff(sortedSummaries(tc.want), summarize(artifacts)); diff != "" {
 			t.Errorf("%s artifacts (-want +got):\n%s", tc.repo, diff)
-		}
-	}
-
-	digestPrefix := func(digest string) string { return digest[:len("sha256:")+12] }
-	for _, tc := range []struct {
-		repo, digestPrefix string
-		want               []string
-	}{
-		{"app", digestPrefix(digest(t, seed.Untagged)), []string{digest(t, seed.Untagged)}},
-		{"multi", digestPrefix(digest(t, seed.Multi)), []string{digest(t, seed.Multi)}},
-		{"multi", digestPrefix(digest(t, seed.MultiAMD64)), nil},
-	} {
-		artifacts, err := c.ListArtifacts(ctx, HarborProject, tc.repo, tc.digestPrefix)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var digests []string
-		for _, a := range artifacts {
-			digests = append(digests, a.Digest)
-		}
-		if diff := cmp.Diff(tc.want, digests); diff != "" {
-			t.Errorf("%s artifacts with digest prefix %s (-want +got):\n%s", tc.repo, tc.digestPrefix, diff)
 		}
 	}
 }

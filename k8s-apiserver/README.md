@@ -2,8 +2,11 @@
 
 harbor-apiserver is a Kubernetes aggregated API server.
 It serves a read-only view of one Harbor project's repositories and artifacts as the namespaced kinds `HarborRepository` and `HarborArtifact` in `harbor.goharbor.io/v1alpha1`.
-It supports `get` and `list`, but not `watch`.
-It reads Harbor as a project robot account on every request, and keeps no cache.
+It supports `get` and `list`, but not `watch`, because Harbor has no change feed.
+So `kubectl get --watch`, informers, controller-runtime caches, and Argo CD don't work with these kinds, but `kubectl get` and other clients that only get and list do.
+Each replica reads the project from Harbor as a project robot account every `--harbor-poll-interval`, and serves requests from that in-memory snapshot.
+Replicas read Harbor independently, so two requests can see different snapshots.
+Requests fail with 503 until a replica first reads Harbor successfully, and again once its snapshot is older than `--harbor-staleness-limit`.
 A namespace sees the project only when it has the label `harbor.goharbor.io/project=<project>`.
 
 Kubernetes RBAC and that label are the only access controls.
@@ -48,7 +51,6 @@ The server needs only these project permissions:
 | Permission | Harbor API call |
 | --- | --- |
 | Repository: List | `GET /api/v2.0/projects/{project}/repositories` |
-| Repository: Read | `GET /api/v2.0/projects/{project}/repositories/{repository}` |
 | Artifact: List | `GET /api/v2.0/projects/{project}/repositories/{repository}/artifacts` |
 
 Keep the robot's name and secret in a private directory until you create the Secret below:
@@ -58,7 +60,7 @@ dir=$(mktemp -d)
 ```
 
 In the Harbor UI, open the project, then **Robot Accounts** > **New Robot Account**.
-Name it `harbor-apiserver`, set an expiration, and select only the three permissions above.
+Name it `harbor-apiserver`, set an expiration, and select only the two permissions above.
 Harbor then shows the robot's full name, such as `robot$my-project+harbor-apiserver`, and, only this once, its secret.
 Save them in `$dir/username` and `$dir/password`.
 
@@ -72,7 +74,6 @@ curl -fsS -u my-harbor-admin -H 'Content-Type: application/json' \
     "duration": 90,
     "permissions": [{"kind": "project", "namespace": "my-project", "access": [
       {"resource": "repository", "action": "list"},
-      {"resource": "repository", "action": "read"},
       {"resource": "artifact", "action": "list"}]}]}'
 jq -r .name "$dir/robot.json" >"$dir/username"
 jq -r .secret "$dir/robot.json" >"$dir/password"
@@ -83,7 +84,7 @@ jq -r .secret "$dir/robot.json" >"$dir/password"
 ## Create the Secret
 
 `url` must be Harbor's `https://` URL.
-The server sends the robot's secret with every request, so an `http://` URL, such as that of Harbor's in-cluster Service, exposes it to anyone who can capture traffic on the pod network.
+The server sends the robot's secret with every request to Harbor, so an `http://` URL, such as that of Harbor's in-cluster Service, exposes it to anyone who can capture traffic on the pod network.
 
 ```sh
 kubectl apply -f deploy/base/namespace.yaml
@@ -115,7 +116,7 @@ kubectl -n harbor-apiserver rollout status deployment/harbor-apiserver
 ```
 
 Without a restart, the kubelet updates the mounted files within a minute or two.
-Refreshing a robot's secret in Harbor invalidates the old secret at once, so requests fail until the pods read the new one.
+Refreshing a robot's secret in Harbor invalidates the old secret at once, so reads of Harbor fail until the pods read the new one.
 After you change `url`, `project`, or `ca.crt`, restart the pods.
 
 ## Write an overlay
@@ -293,7 +294,6 @@ web.frontend-bf9624cbaa.sha256-4b5e57f6eb2f   my-project/web.frontend   v1      
 ```
 
 Select one repository's artifacts by the `harbor.goharbor.io/repository` label, which holds the `HarborRepository` name, or by the `status.repository` field, which holds the full Harbor name.
-Either selector makes the server read only that repository's artifacts from Harbor.
 
 ```console
 $ kubectl -n my-namespace get harborartifacts -l harbor.goharbor.io/repository=team.api
@@ -312,7 +312,7 @@ Select by field instead.
 ## Flags
 
 These flags are specific to harbor-apiserver.
-The Deployment sets all but `--harbor-ca-file`, `--harbor-timeout`, and `--kubeconfig`.
+The Deployment sets only the required ones.
 
 | Flag | Meaning |
 | --- | --- |
@@ -321,7 +321,9 @@ The Deployment sets all but `--harbor-ca-file`, `--harbor-timeout`, and `--kubec
 | `--harbor-username-file` | File holding the robot account name. Required. |
 | `--harbor-password-file` | File holding the robot account secret. Required. |
 | `--harbor-ca-file` | PEM bundle of CAs to trust for Harbor, in addition to the system roots. |
-| `--harbor-timeout` | Timeout for each HTTP request to Harbor. A list makes one request per page of 100. Default `10s`. |
+| `--harbor-timeout` | Timeout for each HTTP request to Harbor. It must be positive. A list makes one request per page of 100. Default `10s`. |
+| `--harbor-poll-interval` | How long to wait between polls of the project. Each wait adds up to 10% jitter. After a poll fails, the replica retries once after 1 second, and then waits this interval until a poll succeeds. Default `30s`. |
+| `--harbor-staleness-limit` | How old data can be before requests that need it fail with 503. A poll that takes longer than this fails. It must be longer than 2.2 times `--harbor-poll-interval` plus twice `--harbor-timeout`. Default `5m`. |
 | `--kubeconfig` | Kubeconfig for reading namespaces. Defaults to the in-cluster configuration. |
 
 The other flags are the standard secure serving, delegated authentication and authorization, and logging flags of `k8s.io/apiserver`.
@@ -331,7 +333,12 @@ Keep `-v` below 8: from 8 up, client-go logs request bodies, including TokenRevi
 ## Troubleshooting
 
 Read the server's logs with `kubectl -n harbor-apiserver logs -l app=harbor-apiserver --prefix`.
-When a request fails because of Harbor, the server logs the error as `"Harbor request failed"`.
+When a poll of Harbor fails, the server logs the error as `"Reading Harbor failed"`.
+A poll that takes longer than `--harbor-poll-interval` logs `"Reading Harbor took longer than the poll interval"`.
+When one repository's artifact list fails without failing the poll, the server logs `"Listing a repository's artifacts failed, so the server keeps those it listed before"`.
+Once that repository's artifacts are older than `--harbor-staleness-limit`, each poll logs `"Requests for a repository's artifacts fail, because they were not listed within the staleness limit"`.
+Both messages name the repository.
+The [threat model](docs/threat-model.md#harbor-outages) explains which requests fail.
 
 ### The APIService is not Available
 
@@ -342,31 +349,35 @@ While it is not Available, kubectl reports that it couldn't get the resource lis
   - `ContainerCreating` means a Secret is missing. Check Secret `harbor-apiserver`, and Secret `harbor-apiserver-tls` from cert-manager (`kubectl -n harbor-apiserver get certificate`) or `hack/gen-serving-cert.sh`.
   - `CreateContainerConfigError` means Secret `harbor-apiserver` lacks `url` or `project`.
   - `ImagePullBackOff` or `ErrImagePull` means the nodes cannot pull the image. If the registry needs credentials, add the `imagePullSecrets` patch to your overlay.
-  - `CrashLoopBackOff`: the logs name the problem, such as a missing flag, an invalid `--harbor-project`, a missing or empty credentials file, or an unreadable CA file.
+  - `CrashLoopBackOff`: the logs name the problem, such as a missing flag, an invalid `--harbor-project`, a `--harbor-staleness-limit` that is too short, a missing or empty credentials file, or an unreadable CA file.
     `exec format error` means the image was built for another architecture.
     `unable to load configmap based request-header-client-ca-file` means the RoleBinding in `kube-system` is missing.
-  - `Running` but not ready means the server has not listed namespaces yet. Check the ClusterRoleBinding `harbor-apiserver`.
+  - `Running` but not ready means the server has not listed namespaces yet, which needs the ClusterRoleBinding `harbor-apiserver`, or its first poll of Harbor has not ended. `--harbor-staleness-limit` bounds that poll.
 - `FailedDiscoveryCheck` with a certificate error: the `caBundle` does not match the serving certificate.
   Rerun `hack/gen-serving-cert.sh`, or check that cert-manager's CA injector is running.
 - `FailedDiscoveryCheck` with a timeout or `dial tcp` error: kube-apiserver cannot reach the pods on TCP port 6443.
   Allow that traffic in any NetworkPolicy in `harbor-apiserver`, and in the firewall between the control plane and the nodes, as on GKE private clusters.
 
-### 503 ServiceUnavailable: harbor is unavailable
+### 503 ServiceUnavailable
 
-The server could not reach Harbor, timed out waiting for Harbor to respond, or got a 429 or 5xx response.
-A TLS error, such as an unknown certificate authority, also shows as unavailable; set `ca.crt` as above.
-The APIService stays Available during a Harbor outage, by design.
+A 503's message gives the reason:
 
-A 503 that says "the server is currently unable to handle the request" comes from kube-apiserver instead, and means the APIService is not Available.
-
-### 500 InternalError
-
+- `harbor has not been read yet`: the replica's first poll has not ended.
+- `harbor is unavailable`: the server could not reach Harbor, timed out waiting for Harbor to respond, or got a 429 or 5xx response.
+  A TLS error, such as an unknown certificate authority, also shows as unavailable; set `ca.crt` as above.
+- `reading harbor takes longer than the staleness limit`: a poll ran longer than `--harbor-staleness-limit`, which cancelled it, or the data passed the limit while a poll was running.
+  Harbor is slow, or the project is too large for the limit. Raise `--harbor-staleness-limit`.
+- `reading a repository's artifacts failed`: the response could include artifacts of a repository that the server has not listed within `--harbor-staleness-limit`. The logs name the repository.
 - `harbor rejected the robot account credentials`: Harbor returned 401. The robot's name or secret is wrong, or the robot is expired or disabled.
 - `harbor denied the robot account access`: Harbor returned 403. The project does not exist, the robot lacks a permission above, or the robot belongs to another project.
 - `not found in harbor`: Harbor returned 404 when listing repositories. Check that `url` is Harbor's base URL, such as `https://harbor.example.com` without `/api/v2.0`, and that it reaches Harbor rather than another server.
 - `unexpected error reading harbor`: see the logs.
-  A timeout or dropped connection while the server reads Harbor's response causes this.
+  A timeout or dropped connection while the server reads the repository list's response causes this.
   So does a redirect, such as from `http://` to `https://`, because the server refuses redirects. Use Harbor's `https://` URL, which must not redirect.
+
+The APIService stays Available during a Harbor outage, by design.
+
+A 503 that says "the server is currently unable to handle the request" comes from kube-apiserver instead, and means the APIService is not Available.
 
 ### Broken credentials that still work
 

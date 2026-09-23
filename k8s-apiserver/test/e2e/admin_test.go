@@ -263,7 +263,6 @@ func TestCreateRobotGrantsOnlyReadAccessToTheProject(t *testing.T) {
 			"namespace": "e2e",
 			"access": [
 				{"resource": "repository", "action": "list"},
-				{"resource": "repository", "action": "read"},
 				{"resource": "artifact", "action": "list"}
 			]
 		}]

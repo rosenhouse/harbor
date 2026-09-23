@@ -140,13 +140,18 @@ func (a *Admin) deleteRepositories(ctx context.Context) error {
 			return nil
 		}
 		for _, r := range repos {
-			// Harbor requires repository names containing "/" to be encoded twice.
-			escaped := url.PathEscape(url.PathEscape(strings.TrimPrefix(r.Name, HarborProject+"/")))
-			if err := a.do(ctx, http.MethodDelete, "/projects/"+HarborProject+"/repositories/"+escaped, nil, nil, http.StatusOK); err != nil {
+			if err := a.deleteRepository(ctx, strings.TrimPrefix(r.Name, HarborProject+"/")); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+// deleteRepository deletes a repository in the e2e project.
+func (a *Admin) deleteRepository(ctx context.Context, repository string) error {
+	// Harbor requires repository names containing "/" to be encoded twice.
+	escaped := url.PathEscape(url.PathEscape(repository))
+	return a.do(ctx, http.MethodDelete, "/projects/"+HarborProject+"/repositories/"+escaped, nil, nil, http.StatusOK)
 }
 
 // CreateRobot replaces the project robot account for harbor-apiserver, granting only the permissions it needs.
@@ -157,7 +162,6 @@ func (a *Admin) CreateRobot(ctx context.Context) (name, secret string, err error
 	}
 	access := []map[string]string{
 		{"resource": "repository", "action": "list"},
-		{"resource": "repository", "action": "read"},
 		{"resource": "artifact", "action": "list"},
 	}
 	body := map[string]any{

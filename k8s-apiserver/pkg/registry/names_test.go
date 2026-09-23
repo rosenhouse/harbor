@@ -50,14 +50,6 @@ func TestRepositoryObjectNamesAreDistinct(t *testing.T) {
 	}
 }
 
-func TestRepositoryNameCandidate(t *testing.T) {
-	for _, repo := range []string{"nginx", "team/api", "team/sub-team/api"} {
-		if got := repositoryNameCandidate(repositoryObjectName(repo)); got != repo {
-			t.Errorf("%q: round trip gave %q", repo, got)
-		}
-	}
-}
-
 func TestHashed(t *testing.T) {
 	for _, repo := range []string{"nginx", "team/api", "a/b-abcdef0123x"} {
 		if name := repositoryObjectName(repo); isHashed(name) {
@@ -126,31 +118,22 @@ func TestLongArtifactObjectNames(t *testing.T) {
 	}
 }
 
-func TestSplitArtifactObjectName(t *testing.T) {
-	for _, repository := range []string{
-		"nginx", "team/api", "dotted.name", "looks/hashed-0123456789", "a/sha256-0123456789ab",
-		strings.Repeat("a", 240), strings.Repeat("a", 300) + "/b",
-	} {
-		for _, digest := range []string{sha256Digest, sha512Digest} {
-			name := artifactObjectName(repository, digest)
-			part, digestPrefix, maxLength, ok := splitArtifactObjectName(name)
-			switch {
-			case !ok:
-				t.Errorf("%q: cannot split", name)
-			case digestPrefix != digest[:strings.Index(digest, ":")+13]:
-				t.Errorf("%q: digest prefix %q", name, digestPrefix)
-			case repositoryObjectNameWithin(repository, maxLength) != part:
-				t.Errorf("%q: split into %q and %d", name, part, maxLength)
-			case !isHashed(part) && repositoryNameCandidate(part) != repository:
-				t.Errorf("%q: unhashed repository part %q does not reverse to %q", name, part, repository)
+func TestNamesArtifactOf(t *testing.T) {
+	fits := strings.Repeat("a", validation.DNS1123SubdomainMaxLength-len(".sha256-0123456789ab"))
+	repositories := []string{"team", "team/api", "dotted.name", fits, fits + "a", fits + "b"}
+	for _, of := range repositories {
+		for _, digest := range []string{sha256Digest, "b:0123456789ab"} {
+			name := artifactObjectName(of, digest)
+			for _, repository := range repositories {
+				if got := namesArtifactOf(name, repository); got != (repository == of) {
+					t.Errorf("%q names an artifact of %q: got %v", name, repository, got)
+				}
 			}
 		}
 	}
-	for _, name := range []string{
-		"team.api", "team.api.sha256-0123456789a", "team.api.sha256-0123456789abc", ".sha256-0123456789ab", "team.api-sha256-0123456789ab",
-	} {
-		if part, _, _, ok := splitArtifactObjectName(name); ok {
-			t.Errorf("%q: split off %q", name, part)
+	for _, name := range []string{"team", "", "team.sha256-0123456789ab.x", "x." + strings.Repeat("a", 250), "x." + strings.Repeat("a", 300)} {
+		if namesArtifactOf(name, "team") {
+			t.Errorf("%q names an artifact of team", name)
 		}
 	}
 }
