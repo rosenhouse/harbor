@@ -19,6 +19,7 @@ type options struct {
 	Authorization  *genericoptions.DelegatingAuthorizationOptions
 	Logging        *logs.Options
 	Harbor         *harborOptions
+	Replication    *replicationOptions
 	Kubeconfig     string
 }
 
@@ -29,6 +30,7 @@ func newOptions() *options {
 		Authorization:  genericoptions.NewDelegatingAuthorizationOptions(),
 		Logging:        logs.NewOptions(),
 		Harbor:         &harborOptions{},
+		Replication:    &replicationOptions{},
 	}
 	o.SecureServing.BindPort = 6443
 	o.SecureServing.ServerCert.CertDirectory = ""
@@ -42,6 +44,7 @@ func (o *options) flags() cliflag.NamedFlagSets {
 	o.Authorization.AddFlags(fss.FlagSet("authorization"))
 	logsapi.AddFlags(o.Logging, fss.FlagSet("logging"))
 	o.Harbor.addFlags(fss.FlagSet("harbor"))
+	o.Replication.addFlags(fss.FlagSet("replication"))
 	fss.FlagSet("namespaces").StringVar(&o.Kubeconfig, "kubeconfig", o.Kubeconfig, "Kubeconfig for reading namespaces. Defaults to the in-cluster configuration.")
 	return fss
 }

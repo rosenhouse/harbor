@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,11 +17,13 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	restclient "k8s.io/client-go/rest"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apis/harbor/v1alpha1"
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apiserver"
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/namespaces"
+	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/registry"
 )
 
 // fakeHarbor serves repository app, or fails with err. Its lists wait until release is closed.
@@ -51,17 +54,22 @@ func namespace(name string, labels map[string]string) *corev1.Namespace {
 var testHarborOptions = harborOptions{Project: "proj", Timeout: time.Minute, PollInterval: 10 * time.Millisecond, StalenessLimit: time.Minute}
 
 // startServer runs the post-start hooks of a server for project "proj" and returns its handler.
-func startServer(t *testing.T, kube *fake.Clientset, h fakeHarbor) http.Handler {
+func startServer(t *testing.T, kube *fake.Clientset, h registry.Harbor) http.Handler {
 	t.Helper()
 	return startServerWithOptions(t, kube, h, testHarborOptions)
 }
 
-func startServerWithOptions(t *testing.T, kube *fake.Clientset, h fakeHarbor, o harborOptions) http.Handler {
+func startServerWithOptions(t *testing.T, kube *fake.Clientset, h registry.Harbor, o harborOptions) http.Handler {
+	t.Helper()
+	return startServerWithReplications(t, kube, h, o, nil, replicationOptions{})
+}
+
+func startServerWithReplications(t *testing.T, kube *fake.Clientset, h registry.Harbor, o harborOptions, rh registry.ReplicationHarbor, r replicationOptions) http.Handler {
 	t.Helper()
 	c := apiserver.NewConfig()
 	c.ExternalAddress = "localhost:443"
 	c.LoopbackClientConfig = &restclient.Config{}
-	s, err := newServer(c.Complete(nil), kube, h, &o)
+	s, err := newServer(c.Complete(nil), kube, h, &o, rh, &r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,5 +172,92 @@ func TestServerWatchesOnlyLabeledNamespaces(t *testing.T) {
 		if w, ok := a.(clienttesting.WatchAction); ok && w.GetWatchRestrictions().Labels.String() != namespaces.ProjectLabel {
 			t.Errorf("watched namespaces matching %q, want only those with the %s label", w.GetWatchRestrictions().Labels, namespaces.ProjectLabel)
 		}
+	}
+}
+
+// replicatedHarbor has an artifact that replication nginx in namespace labeled copied.
+type replicatedHarbor struct{}
+
+func (replicatedHarbor) ListRepositories(context.Context, string) ([]harbor.Repository, error) {
+	return []harbor.Repository{{ID: 1, Name: "proj/k8s/labeled/nginx/library/nginx"}}, nil
+}
+
+func (replicatedHarbor) ListArtifacts(context.Context, string, string) ([]harbor.Artifact, error) {
+	return []harbor.Artifact{{ID: 1, Digest: "sha256:" + strings.Repeat("0", 64), Type: "IMAGE"}}, nil
+}
+
+// fakeReplicationHarbor has the policy of replication nginx in namespace labeled, and counts its calls.
+type fakeReplicationHarbor struct {
+	registry.ReplicationHarbor
+	calls atomic.Int32
+}
+
+func (f *fakeReplicationHarbor) ListReplicationPolicies(context.Context, string) ([]harbor.ReplicationPolicy, error) {
+	f.calls.Add(1)
+	return []harbor.ReplicationPolicy{{
+		ID:   1,
+		Name: "k8s.proj.labeled.nginx",
+		Description: `{"managedBy":"harbor-apiserver","namespace":"labeled","namespaceUID":"labeled-uid","name":"nginx","uid":"nginx-uid",` +
+			`"spec":{"registry":"docker-hub","repository":"library/nginx","tag":"1.27"}}`,
+		SrcRegistry:               &harbor.Registry{ID: 2, Name: "docker-hub"},
+		DestNamespace:             "proj/k8s/labeled/nginx",
+		DestNamespaceReplaceCount: ptr.To[int8](0),
+		Trigger:                   &harbor.ReplicationTrigger{Type: "manual"},
+		Filters:                   []harbor.ReplicationFilter{{Type: "name", Value: "library/nginx"}, {Type: "tag", Value: "1.27", Decoration: "matches"}},
+	}}, nil
+}
+
+func (f *fakeReplicationHarbor) LatestReplicationExecution(context.Context, int64) (*harbor.ReplicationExecution, error) {
+	f.calls.Add(1)
+	return nil, nil
+}
+
+var enabledReplications = replicationOptions{Enabled: true, Registries: []string{"docker-hub"}, Prefix: "k8s"}
+
+func labeledNamespace() *corev1.Namespace {
+	ns := namespace("labeled", map[string]string{namespaces.ProjectLabel: "proj"})
+	ns.UID = "labeled-uid"
+	return ns
+}
+
+func TestServerServesReplicationsOnlyWhenEnabled(t *testing.T) {
+	for _, r := range []replicationOptions{{}, enabledReplications} {
+		rh := &fakeReplicationHarbor{}
+		h := startServerWithReplications(t, fake.NewClientset(labeledNamespace()), replicatedHarbor{}, testHarborOptions, rh, r)
+		waitForOK(t, h, "/readyz")
+
+		code, body := serve(h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/labeled/harborreplications/nginx")
+		if r.Enabled {
+			if code != http.StatusOK || !strings.Contains(body, `"uid":"nginx-uid"`) {
+				t.Errorf("enabled: get returned %d: %s", code, body)
+			}
+		} else if code != http.StatusNotFound || rh.calls.Load() != 0 {
+			t.Errorf("disabled: get returned %d, and Harbor got %d replication calls: %s", code, rh.calls.Load(), body)
+		}
+	}
+}
+
+func TestServerLinksReplicatedArtifactsInItsFirstPoll(t *testing.T) {
+	kube := fake.NewClientset(labeledNamespace())
+	releaseList := make(chan struct{})
+	kube.PrependReactor("list", "namespaces", func(clienttesting.Action) (bool, runtime.Object, error) {
+		<-releaseList
+		return false, nil, nil
+	})
+	o := testHarborOptions
+	o.PollInterval = time.Hour
+	h := startServerWithReplications(t, kube, replicatedHarbor{}, o, &fakeReplicationHarbor{}, enabledReplications)
+
+	time.Sleep(100 * time.Millisecond)
+	close(releaseList)
+	waitForOK(t, h, "/readyz")
+
+	code, body := serve(h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/labeled/harborartifacts?labelSelector="+v1alpha1.ReplicationLabel+"%3Dnginx")
+	var list v1alpha1.HarborArtifactList
+	if err := json.Unmarshal([]byte(body), &list); code != http.StatusOK || err != nil {
+		t.Fatalf("list returned %d, %v: %s", code, err, body)
+	}
+	if len(list.Items) != 1 || len(list.Items[0].OwnerReferences) != 1 || list.Items[0].OwnerReferences[0].UID != "nginx-uid" {
+		t.Errorf("artifacts %+v", list.Items)
 	}
 }

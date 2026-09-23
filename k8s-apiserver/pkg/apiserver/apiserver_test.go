@@ -1,6 +1,7 @@
 package apiserver_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -51,6 +52,11 @@ func (allowed) Namespace(ns string) (*corev1.Namespace, bool) {
 
 func newHandler(t *testing.T) http.Handler {
 	t.Helper()
+	return newHandlerWithReplications(t, nil)
+}
+
+func newHandlerWithReplications(t *testing.T, replications *registry.Replications) http.Handler {
+	t.Helper()
 	store := registry.NewStore("proj", time.Minute, allowed{})
 	if err := registry.NewPoller(fakeHarbor{}, store).Poll(t.Context()); err != nil {
 		t.Fatal(err)
@@ -58,7 +64,7 @@ func newHandler(t *testing.T) http.Handler {
 	c := apiserver.NewConfig()
 	c.ExternalAddress = "localhost:443"
 	c.LoopbackClientConfig = &restclient.Config{}
-	s, err := apiserver.New(c.Complete(nil), store)
+	s, err := apiserver.New(c.Complete(nil), store, replications)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,5 +236,68 @@ func TestOpenAPI(t *testing.T) {
 				t.Errorf("%s: %s has GVKs %s, want %s", tc.path, k.kind, gvks, want)
 			}
 		}
+	}
+}
+
+// fakeReplicationHarbor has registry docker-hub, and no replication policies.
+type fakeReplicationHarbor struct{ registry.ReplicationHarbor }
+
+func (fakeReplicationHarbor) ListRegistries(context.Context) ([]harbor.Registry, error) {
+	return []harbor.Registry{{ID: 1, Name: "docker-hub"}}, nil
+}
+
+func (fakeReplicationHarbor) ListReplicationPolicies(context.Context, string) ([]harbor.ReplicationPolicy, error) {
+	return nil, nil
+}
+
+func discover(t *testing.T, h http.Handler, resource string) (metav1.APIResource, bool) {
+	t.Helper()
+	var list metav1.APIResourceList
+	decode(t, get(t, h, "/apis/harbor.goharbor.io/v1alpha1"), http.StatusOK, &list)
+	i := slices.IndexFunc(list.APIResources, func(r metav1.APIResource) bool { return r.Name == resource })
+	if i < 0 {
+		return metav1.APIResource{}, false
+	}
+	return list.APIResources[i], true
+}
+
+func TestReplicationsAreAbsentWhenDisabled(t *testing.T) {
+	h := newHandler(t)
+	if r, ok := discover(t, h, "harborreplications"); ok {
+		t.Errorf("discovered %+v", r)
+	}
+	if rec := get(t, h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborreplications"); rec.Code != http.StatusNotFound {
+		t.Errorf("list returned %d: %s", rec.Code, rec.Body)
+	}
+}
+
+func TestReplicationsArePresentWhenEnabled(t *testing.T) {
+	h := newHandlerWithReplications(t, registry.NewReplications(fakeReplicationHarbor{}, allowed{},
+		registry.ReplicationConfig{Project: "proj", Prefix: "k8s", Registries: []string{"docker-hub"}}))
+
+	r, ok := discover(t, h, "harborreplications")
+	if !ok {
+		t.Fatal("harborreplications missing")
+	}
+	if r.Kind != "HarborReplication" || !r.Namespaced || r.SingularName != "harborreplication" {
+		t.Errorf("kind %q, namespaced %v, singular %q", r.Kind, r.Namespaced, r.SingularName)
+	}
+	if verbs := slices.Sorted(slices.Values(r.Verbs)); !slices.Equal(verbs, []string{"create", "delete", "get", "list"}) {
+		t.Errorf("verbs %v, want [create delete get list]", verbs)
+	}
+
+	body := `{"apiVersion":"harbor.goharbor.io/v1alpha1","kind":"HarborReplication","metadata":{"name":"nginx"},` +
+		`"spec":{"registry":"docker-hub","repository":"library/nginx","tag":"1.27"}}`
+	req := httptest.NewRequest(http.MethodPost, "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborreplications?dryRun=All", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var created struct {
+		Kind   string
+		Status struct{ Destination string }
+	}
+	decode(t, rec, http.StatusCreated, &created)
+	if created.Kind != "HarborReplication" || created.Status.Destination != "proj/k8s/allowed/nginx" {
+		t.Errorf("created %+v", created)
 	}
 }

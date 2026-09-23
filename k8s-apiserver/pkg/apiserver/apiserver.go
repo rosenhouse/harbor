@@ -52,8 +52,8 @@ func NewConfig() *genericapiserver.Config {
 	return c
 }
 
-// New serves Harbor project data from store.
-func New(c genericapiserver.CompletedConfig, store *registry.Store) (*genericapiserver.GenericAPIServer, error) {
+// New serves Harbor project data from store, and replications unless they are nil.
+func New(c genericapiserver.CompletedConfig, store *registry.Store, replications *registry.Replications) (*genericapiserver.GenericAPIServer, error) {
 	s, err := c.New("harbor-apiserver", genericapiserver.NewEmptyDelegate())
 	if err != nil {
 		return nil, err
@@ -61,10 +61,14 @@ func New(c genericapiserver.CompletedConfig, store *registry.Store) (*genericapi
 
 	group := genericapiserver.NewDefaultAPIGroupInfo(v1alpha1.GroupName, scheme, metav1.ParameterCodec, codecs)
 	group.NegotiatedSerializer = withoutProtobuf{group.NegotiatedSerializer}
-	group.VersionedResourcesStorageMap[v1alpha1.SchemeGroupVersion.Version] = map[string]rest.Storage{
+	resources := map[string]rest.Storage{
 		"harborrepositories": registry.NewRepositories(store),
 		"harborartifacts":    registry.NewArtifacts(store),
 	}
+	if replications != nil {
+		resources["harborreplications"] = replications
+	}
+	group.VersionedResourcesStorageMap[v1alpha1.SchemeGroupVersion.Version] = resources
 	if err := s.InstallAPIGroup(&group); err != nil {
 		return nil, err
 	}

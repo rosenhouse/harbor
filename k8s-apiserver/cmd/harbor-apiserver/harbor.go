@@ -70,7 +70,14 @@ func (h *harborOptions) validate() []error {
 }
 
 func (h *harborOptions) client() (*harbor.Client, error) {
-	_, _, err := h.credentials()
+	return h.clientFor(h.UsernameFile, h.PasswordFile)
+}
+
+// clientFor returns a client that authenticates as the robot account in usernameFile and passwordFile.
+// It reads the files on every request, so that rotating the Secret that holds them needs no restart.
+func (h *harborOptions) clientFor(usernameFile, passwordFile string) (*harbor.Client, error) {
+	credentials := func() (string, string, error) { return readCredentials(usernameFile, passwordFile) }
+	_, _, err := credentials()
 	if err != nil {
 		return nil, err
 	}
@@ -84,15 +91,14 @@ func (h *harborOptions) client() (*harbor.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return harbor.NewClient(h.URL, h.credentials, httpClient)
+	return harbor.NewClient(h.URL, credentials, httpClient)
 }
 
-// credentials reads the files on every call, so that rotating the Secret that holds them needs no restart.
-func (h *harborOptions) credentials() (username, password string, err error) {
-	if username, err = readTrimmed(h.UsernameFile); err != nil {
+func readCredentials(usernameFile, passwordFile string) (username, password string, err error) {
+	if username, err = readTrimmed(usernameFile); err != nil {
 		return "", "", err
 	}
-	if password, err = readTrimmed(h.PasswordFile); err != nil {
+	if password, err = readTrimmed(passwordFile); err != nil {
 		return "", "", err
 	}
 	return username, password, nil
