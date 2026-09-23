@@ -4,5 +4,6 @@ resources:
   - namespace.yaml
   - rbac.yaml
   - deployment.yaml
+  - poddisruptionbudget.yaml
   - service.yaml
   - apiservice.yaml

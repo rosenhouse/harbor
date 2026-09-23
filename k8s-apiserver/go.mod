@@ -5,6 +5,7 @@ go 1.26.0
 toolchain go1.26.4
 
 require (
+	github.com/google/go-cmp v0.7.0
 	github.com/spf13/cobra v1.10.2
 	k8s.io/api v0.37.0
 	k8s.io/apimachinery v0.37.0

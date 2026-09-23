@@ -6,17 +6,21 @@ cd "$(dirname "$0")/.."
 
 cluster=${KIND_CLUSTER:-harbor-apiserver-e2e}
 image=harbor-apiserver:e2e
+export KUBECONFIG=${E2E_KUBECONFIG:-${TMPDIR:-/tmp}/$cluster.kubeconfig}
 
-if ! kind get clusters | grep -qx "$cluster"; then
+if ! kind get clusters | grep -x "$cluster" >/dev/null; then
   kind create cluster --name "$cluster" --wait 2m
 fi
-kubectl config use-context "kind-$cluster"
+kind export kubeconfig --name "$cluster"
 
 docker build -t "$image" .
 kind load docker-image --name "$cluster" "$image"
 
+existing=$(kubectl -n harbor-apiserver get deployment harbor-apiserver --ignore-not-found -o name)
 kubectl apply -k hack/e2e
-kubectl -n harbor-apiserver rollout restart deployment/harbor-apiserver
+if [ -n "$existing" ]; then
+  kubectl -n harbor-apiserver rollout restart deployment/harbor-apiserver
+fi
 kubectl -n harbor-apiserver rollout status deployment/harbor-apiserver --timeout=2m
 kubectl wait --for=condition=Available apiservice/v1alpha1.harbor.goharbor.io --timeout=2m
 

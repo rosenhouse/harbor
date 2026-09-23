@@ -4,16 +4,21 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
 	"os/exec"
-	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // kubectl returns stdout. Its error includes stderr.
@@ -39,21 +44,24 @@ func mustKubectl(t *testing.T, args ...string) string {
 }
 
 func TestAPIResources(t *testing.T) {
-	out := mustKubectl(t, "api-resources", "--api-group=harbor.goharbor.io", "--no-headers", "-o", "wide")
-	got := strings.Split(out, "\n")
-	slices.Sort(got)
-	want := []string{
-		"harborartifacts true HarborArtifact [get list]",
-		"harborrepositories true HarborRepository [get list]",
+	want := []metav1.APIResource{
+		{Name: "harborartifacts", SingularName: "harborartifact", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborArtifact", Verbs: []string{"get", "list"}},
+		{Name: "harborrepositories", SingularName: "harborrepository", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborRepository", Verbs: []string{"get", "list"}},
 	}
-	for i := range got {
-		got[i] = strings.Join(slices.DeleteFunc(strings.Fields(got[i]), func(f string) bool {
-			return f == "harbor.goharbor.io/v1alpha1"
-		}), " ")
+	var diff string
+	// kube-apiserver refreshes aggregated discovery shortly after the APIService becomes available.
+	for range 30 {
+		var list metav1.APIResourceList
+		out := mustKubectl(t, "api-resources", "--api-group=harbor.goharbor.io", "-o", "json")
+		if err := json.Unmarshal([]byte(out), &list); err != nil {
+			t.Fatal(err)
+		}
+		if diff = cmp.Diff(want, list.APIResources, cmpopts.IgnoreFields(metav1.APIResource{}, "StorageVersionHash")); diff == "" {
+			return
+		}
+		time.Sleep(time.Second)
 	}
-	if !slices.Equal(got, want) {
-		t.Errorf("got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	t.Errorf("api-resources (-want +got):\n%s", diff)
 }
 
 func TestListAllNamespaces(t *testing.T) {
@@ -100,9 +108,12 @@ func TestViewRoleGrantsAccess(t *testing.T) {
 func TestDelegatedAuthorization(t *testing.T) {
 	ns := namespaceWithServiceAccounts(t)
 	base := portForward(t)
-	client := &http.Client{Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // the serving certificate is self-signed
-	}}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // the serving certificate is self-signed
+		},
+	}
 
 	for _, tc := range []struct {
 		serviceAccount, namespace string
@@ -135,29 +146,29 @@ func TestDelegatedAuthorization(t *testing.T) {
 	}
 }
 
+// portForward forwards a local port to the harbor-apiserver Service and returns its URL.
 func portForward(t *testing.T) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	cmd := exec.Command("kubectl", "-n", "harbor-apiserver", "port-forward", "service/harbor-apiserver", ":443")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-
-	cmd := exec.Command("kubectl", "-n", "harbor-apiserver", "port-forward", "service/harbor-apiserver", fmt.Sprintf("%d:443", port))
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	for range 50 {
-		if c, err := net.Dial("tcp", addr); err == nil {
-			_ = c.Close()
-			return "https://" + addr
-		}
-		time.Sleep(100 * time.Millisecond)
+	// kubectl prints "Forwarding from 127.0.0.1:<port> -> 6443" once it listens.
+	r := bufio.NewReader(stdout)
+	line, err := r.ReadString('\n')
+	rest, ok := strings.CutPrefix(line, "Forwarding from ")
+	if err != nil || !ok {
+		t.Fatalf("port-forward printed %q, %v: %s", line, err, stderr.String())
 	}
-	t.Fatalf("port-forward to %s did not become ready", addr)
-	return ""
+	go func() { _, _ = io.Copy(io.Discard, r) }()
+	addr, _, _ := strings.Cut(rest, " ")
+	return "https://" + addr
 }

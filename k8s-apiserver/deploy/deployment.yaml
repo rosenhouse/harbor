@@ -4,7 +4,8 @@ metadata:
   name: harbor-apiserver
   namespace: harbor-apiserver
 spec:
-  replicas: 1
+  # An unavailable APIService breaks discovery and namespace deletion cluster-wide.
+  replicas: 2
   selector:
     matchLabels:
       app: harbor-apiserver
@@ -14,6 +15,15 @@ spec:
         app: harbor-apiserver
     spec:
       serviceAccountName: harbor-apiserver
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: harbor-apiserver
       securityContext:
         runAsNonRoot: true
         seccompProfile:
