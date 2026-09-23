@@ -331,6 +331,9 @@ func TestErrors(t *testing.T) {
 		{http.StatusInternalServerError, `{"errors":[{"message":"internal server error"}]}`, harbor.ErrUnavailable, "internal server error"},
 		{http.StatusServiceUnavailable, "<html>" + strings.Repeat("x", 1000), harbor.ErrUnavailable, "<html>" + strings.Repeat("x", 250)},
 		{http.StatusTooManyRequests, "slow down", harbor.ErrUnavailable, "slow down"},
+		{http.StatusBadRequest, `{"errors":[{"message":"invalid"}]}`, harbor.ErrBadRequest, "invalid"},
+		{http.StatusConflict, `{"errors":[{"message":"exists"}]}`, harbor.ErrConflict, "exists"},
+		{http.StatusPreconditionFailed, `{"errors":[{"message":"running"}]}`, harbor.ErrPrecondition, "running"},
 		{http.StatusFound, "", nil, ""},
 	} {
 		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {

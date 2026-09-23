@@ -1,7 +1,8 @@
-// Package harbor reads repositories and artifacts from the Harbor v2.0 REST API.
+// Package harbor is a client for the Harbor v2.0 REST API.
 package harbor
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -21,6 +22,9 @@ var (
 	ErrUnauthorized = errors.New("harbor rejected the robot account credentials")
 	ErrForbidden    = errors.New("harbor denied the robot account access")
 	ErrUnavailable  = errors.New("harbor is unavailable")
+	ErrBadRequest   = errors.New("harbor rejected the request as invalid")
+	ErrConflict     = errors.New("harbor reported a conflict")
+	ErrPrecondition = errors.New("harbor reported a failed precondition")
 )
 
 const pageSize = 100
@@ -185,11 +189,12 @@ func listOnce[T any](ctx context.Context, c *Client, path string, query url.Valu
 			q[k] = v
 		}
 		var items []T
-		total, err := c.get(ctx, path, q, &items)
-		switch {
-		case err != nil:
+		header, err := c.do(ctx, http.MethodGet, path, q, nil, http.StatusOK, &items)
+		if err != nil {
 			return nil, err
-		case page > 1 && total < lastTotal:
+		}
+		total := totalCount(header)
+		if page > 1 && total < lastTotal {
 			return nil, errShifted
 		}
 		lastTotal = total
@@ -209,51 +214,76 @@ func listOnce[T any](ctx context.Context, c *Client, path string, query url.Valu
 	return nil, fmt.Errorf("GET %s: more than %d pages", path, maxPages)
 }
 
-// get decodes the response into `into` and returns its X-Total-Count header, or -1 if it has none.
-func (c *Client) get(ctx context.Context, path string, query url.Values, into any) (int, error) {
+// totalCount returns the X-Total-Count header, or -1 if it has none.
+func totalCount(header http.Header) int {
+	total, err := strconv.Atoi(header.Get("X-Total-Count"))
+	if err != nil {
+		return -1
+	}
+	return total
+}
+
+// do sends body as JSON if it is not nil, and decodes the response into `into` if it is not nil.
+// A status other than want is an error.
+func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any, want int, into any) (http.Header, error) {
 	u := c.baseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	var reqBody io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("encoding %s %s: %w", method, path, err)
+		}
+		reqBody = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, reqBody)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	username, password, err := c.credentials()
 	if err != nil {
-		return 0, fmt.Errorf("getting harbor credentials: %w", err)
+		return nil, fmt.Errorf("getting harbor credentials: %w", err)
 	}
 	req.SetBasicAuth(username, password)
 	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		return 0, responseError(req, resp)
+	if resp.StatusCode != want {
+		return nil, responseError(req, resp)
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(into); err != nil {
-		return 0, fmt.Errorf("decoding GET %s: %w", req.URL.Path, err)
+	if into != nil {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(into); err != nil {
+			return nil, fmt.Errorf("decoding %s %s: %w", method, req.URL.Path, err)
+		}
 	}
-	total, err := strconv.Atoi(resp.Header.Get("X-Total-Count"))
-	if err != nil {
-		return -1, nil
-	}
-	return total, nil
+	return resp.Header, nil
 }
 
 func responseError(req *http.Request, resp *http.Response) error {
 	var kind error
 	switch {
+	case resp.StatusCode == http.StatusBadRequest:
+		kind = ErrBadRequest
 	case resp.StatusCode == http.StatusNotFound:
 		kind = ErrNotFound
 	case resp.StatusCode == http.StatusUnauthorized:
 		kind = ErrUnauthorized
 	case resp.StatusCode == http.StatusForbidden:
 		kind = ErrForbidden
+	case resp.StatusCode == http.StatusConflict:
+		kind = ErrConflict
+	case resp.StatusCode == http.StatusPreconditionFailed:
+		kind = ErrPrecondition
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 		kind = ErrUnavailable
 	default:
@@ -270,7 +300,7 @@ func responseError(req *http.Request, resp *http.Response) error {
 	if json.Unmarshal(raw, &body) == nil && len(body.Errors) > 0 {
 		msg = body.Errors[0].Message
 	}
-	err := fmt.Errorf("%w: GET %s: %s", kind, req.URL.Path, resp.Status)
+	err := fmt.Errorf("%w: %s %s: %s", kind, req.Method, req.URL.Path, resp.Status)
 	if msg = strings.TrimSpace(msg); msg != "" {
 		err = fmt.Errorf("%w: %s", err, msg)
 	}
