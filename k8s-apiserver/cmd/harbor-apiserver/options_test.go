@@ -12,8 +12,7 @@ import (
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
-
-	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apiserver"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 // fakeKubeAPIServer authenticates "alice-token" as alice and authorizes only alice.
@@ -76,7 +75,7 @@ func TestDelegatesAuthenticationAndAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := apiserver.New(c.Complete(nil))
+	s, err := newServer(c.Complete(nil), fake.NewClientset(), nil, "proj")
 	if err != nil {
 		t.Fatal(err)
 	}

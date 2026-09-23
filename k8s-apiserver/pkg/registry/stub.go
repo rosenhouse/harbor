@@ -1,4 +1,3 @@
-// Package registry serves the API's resources.
 package registry
 
 import (

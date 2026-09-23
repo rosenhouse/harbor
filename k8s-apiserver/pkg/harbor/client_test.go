@@ -40,9 +40,11 @@ func newFakeHarbor(t *testing.T, handler http.HandlerFunc) *fakeHarbor {
 	return f
 }
 
+func robot() (string, string, error) { return "robot$proj+k8s", "secret", nil }
+
 func newClient(t *testing.T, f *fakeHarbor) *harbor.Client {
 	t.Helper()
-	c, err := harbor.NewClient(f.URL+"/", "robot$proj+k8s", "secret", f.Client())
+	c, err := harbor.NewClient(f.URL+"/", robot, f.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,12 +291,58 @@ func TestContextDeadline(t *testing.T) {
 
 func TestNewClientValidation(t *testing.T) {
 	for _, u := range []string{"harbor.example.com", "ftp://harbor.example.com", "https://", "https://h/harbor?x=1", "://"} {
-		if _, err := harbor.NewClient(u, "u", "p", http.DefaultClient); err == nil {
+		if _, err := harbor.NewClient(u, robot, http.DefaultClient); err == nil {
 			t.Errorf("accepted %q", u)
 		}
 	}
-	if _, err := harbor.NewClient("https://h", "u", "p", nil); err == nil {
+	if _, err := harbor.NewClient("https://h", nil, http.DefaultClient); err == nil {
+		t.Error("accepted nil credentials")
+	}
+	if _, err := harbor.NewClient("https://h", robot, nil); err == nil {
 		t.Error("accepted a nil HTTP client")
+	}
+}
+
+func TestCredentialsError(t *testing.T) {
+	f := newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {})
+	unreadable := errors.New("unreadable")
+	c, err := harbor.NewClient(f.URL, func() (string, string, error) { return "", "", unreadable }, f.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ListRepositories(context.Background(), "proj"); !errors.Is(err, unreadable) {
+		t.Errorf("got %v, want %v", err, unreadable)
+	}
+	if len(f.requests) != 0 {
+		t.Errorf("sent %v", f.requests)
+	}
+}
+
+func TestCredentialsForEachRequest(t *testing.T) {
+	var passwords []string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, password, _ := r.BasicAuth()
+		passwords = append(passwords, password)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(s.Close)
+	calls := 0
+	rotating := func() (string, string, error) {
+		calls++
+		return "robot$proj+k8s", "secret" + strconv.Itoa(calls), nil
+	}
+	c, err := harbor.NewClient(s.URL, rotating, s.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 {
+		if _, err := c.GetRepository(context.Background(), "proj", "app"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if diff := cmp.Diff([]string{"secret1", "secret2"}, passwords); diff != "" {
+		t.Errorf("passwords (-want +got):\n%s", diff)
 	}
 }
 

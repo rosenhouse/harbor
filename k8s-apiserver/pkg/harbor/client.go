@@ -76,15 +76,18 @@ type Tag struct {
 	PullTime time.Time `json:"pull_time"`
 }
 
+// Credentials returns a robot account's name and secret.
+type Credentials func() (username, password string, err error)
+
 type Client struct {
-	baseURL            string
-	username, password string
-	http               *http.Client
+	baseURL     string
+	credentials Credentials
+	http        *http.Client
 }
 
-// NewClient returns a client that authenticates as a robot account.
+// NewClient returns a client that authenticates as a robot account, getting its credentials for each request.
 // It refuses redirects, so the credentials go only to baseURL.
-func NewClient(baseURL, username, password string, httpClient *http.Client) (*Client, error) {
+func NewClient(baseURL string, credentials Credentials, httpClient *http.Client) (*Client, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -92,16 +95,18 @@ func NewClient(baseURL, username, password string, httpClient *http.Client) (*Cl
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("harbor URL %q must be http or https with a host and no query", baseURL)
 	}
+	if credentials == nil {
+		return nil, errors.New("harbor client needs credentials")
+	}
 	if httpClient == nil {
 		return nil, errors.New("harbor client needs an HTTP client")
 	}
 	noRedirects := *httpClient
 	noRedirects.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{
-		baseURL:  strings.TrimSuffix(baseURL, "/") + "/api/v2.0",
-		username: username,
-		password: password,
-		http:     &noRedirects,
+		baseURL:     strings.TrimSuffix(baseURL, "/") + "/api/v2.0",
+		credentials: credentials,
+		http:        &noRedirects,
 	}, nil
 }
 
@@ -195,7 +200,11 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, into an
 	if err != nil {
 		return 0, err
 	}
-	req.SetBasicAuth(c.username, c.password)
+	username, password, err := c.credentials()
+	if err != nil {
+		return 0, fmt.Errorf("getting harbor credentials: %w", err)
+	}
+	req.SetBasicAuth(username, password)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)

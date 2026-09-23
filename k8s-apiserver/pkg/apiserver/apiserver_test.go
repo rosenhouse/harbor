@@ -1,6 +1,7 @@
 package apiserver_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	restclient "k8s.io/client-go/rest"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apiserver"
+	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 )
 
 var kinds = []struct{ resource, kind string }{
@@ -19,12 +21,28 @@ var kinds = []struct{ resource, kind string }{
 	{"harborartifacts", "HarborArtifact"},
 }
 
+type fakeHarbor struct{}
+
+func (fakeHarbor) ListRepositories(context.Context, string) ([]harbor.Repository, error) {
+	return []harbor.Repository{{ID: 1, Name: "proj/team/api", ArtifactCount: 2, PullCount: 3}}, nil
+}
+
+func (fakeHarbor) GetRepository(context.Context, string, string) (*harbor.Repository, error) {
+	return &harbor.Repository{ID: 1, Name: "proj/team/api"}, nil
+}
+
+// allowed lets only the "allowed" namespace see the project.
+type allowed struct{}
+
+func (allowed) Allows(ns string) bool { return ns == "allowed" }
+func (allowed) Namespaces() []string  { return []string{"allowed"} }
+
 func newHandler(t *testing.T) http.Handler {
 	t.Helper()
 	c := apiserver.NewConfig()
 	c.ExternalAddress = "localhost:443"
 	c.LoopbackClientConfig = &restclient.Config{}
-	s, err := apiserver.New(c.Complete(nil))
+	s, err := apiserver.New(c.Complete(nil), fakeHarbor{}, "proj", allowed{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,21 +93,16 @@ func TestDiscovery(t *testing.T) {
 	}
 }
 
-func TestListIsEmpty(t *testing.T) {
+func TestListIsEmptyOutsideAllowedNamespaces(t *testing.T) {
 	h := newHandler(t)
 	for _, k := range kinds {
-		for _, path := range []string{
-			"/apis/harbor.goharbor.io/v1alpha1/namespaces/default/" + k.resource,
-			"/apis/harbor.goharbor.io/v1alpha1/" + k.resource,
-		} {
-			var list struct {
-				Kind  string
-				Items []json.RawMessage
-			}
-			decode(t, get(t, h, path), http.StatusOK, &list)
-			if list.Kind != k.kind+"List" || len(list.Items) != 0 {
-				t.Errorf("GET %s: got kind %q with %d items", path, list.Kind, len(list.Items))
-			}
+		var list struct {
+			Kind  string
+			Items []json.RawMessage
+		}
+		decode(t, get(t, h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/default/"+k.resource), http.StatusOK, &list)
+		if list.Kind != k.kind+"List" || len(list.Items) != 0 {
+			t.Errorf("%s: got kind %q with %d items", k.resource, list.Kind, len(list.Items))
 		}
 	}
 }
@@ -101,6 +114,29 @@ func TestGetIsNotFound(t *testing.T) {
 		decode(t, get(t, h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/default/"+k.resource+"/x"), http.StatusNotFound, &status)
 		if status.Reason != metav1.StatusReasonNotFound || status.Details.Group != "harbor.goharbor.io" || status.Details.Kind != k.resource {
 			t.Errorf("%s: reason %q, details %+v", k.resource, status.Reason, status.Details)
+		}
+	}
+}
+
+func TestRepositoryTable(t *testing.T) {
+	var table metav1.Table
+	decode(t, get(t, newHandler(t), "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborrepositories",
+		"application/json;as=Table;v=v1;g=meta.k8s.io"), http.StatusOK, &table)
+	if len(table.Rows) != 1 || table.Rows[0].Cells[0] != "team.api" {
+		t.Errorf("rows %+v", table.Rows)
+	}
+}
+
+func TestFieldSelectors(t *testing.T) {
+	h := newHandler(t)
+	for selector, want := range map[string]int{
+		"metadata.name=team.api":        http.StatusOK,
+		"metadata.namespace=allowed":    http.StatusOK,
+		"status.name=proj%2Fteam%2Fapi": http.StatusBadRequest,
+	} {
+		rec := get(t, h, "/apis/harbor.goharbor.io/v1alpha1/harborrepositories?fieldSelector="+selector)
+		if rec.Code != want {
+			t.Errorf("%s: status %d, want %d: %s", selector, rec.Code, want, rec.Body)
 		}
 	}
 }

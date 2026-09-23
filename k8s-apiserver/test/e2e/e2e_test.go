@@ -42,53 +42,70 @@ func mustKubectl(t *testing.T, args ...string) string {
 	return out
 }
 
+// eventually retries check until it succeeds, and fails the test if it never does.
+func eventually(t *testing.T, check func() error) {
+	t.Helper()
+	deadline := time.Now().Add(time.Minute)
+	for {
+		err := check()
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
 func TestAPIResources(t *testing.T) {
 	want := []metav1.APIResource{
 		{Name: "harborartifacts", SingularName: "harborartifact", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborArtifact", Verbs: []string{"get", "list"}},
 		{Name: "harborrepositories", SingularName: "harborrepository", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborRepository", Verbs: []string{"get", "list"}},
 	}
-	var diff string
 	// kube-apiserver refreshes aggregated discovery shortly after the APIService becomes available.
-	for range 30 {
+	eventually(t, func() error {
+		out, err := kubectl(t, "api-resources", "--api-group=harbor.goharbor.io", "-o", "json")
+		if err != nil {
+			return err
+		}
 		var list metav1.APIResourceList
-		out := mustKubectl(t, "api-resources", "--api-group=harbor.goharbor.io", "-o", "json")
 		if err := json.Unmarshal([]byte(out), &list); err != nil {
-			t.Fatal(err)
+			return err
 		}
-		if diff = cmp.Diff(want, list.APIResources, cmpopts.IgnoreFields(metav1.APIResource{}, "StorageVersionHash")); diff == "" {
-			return
+		if diff := cmp.Diff(want, list.APIResources, cmpopts.IgnoreFields(metav1.APIResource{}, "StorageVersionHash")); diff != "" {
+			return fmt.Errorf("api-resources (-want +got):\n%s", diff)
 		}
-		time.Sleep(time.Second)
-	}
-	t.Errorf("api-resources (-want +got):\n%s", diff)
+		return nil
+	})
 }
 
-func TestListAllNamespaces(t *testing.T) {
-	out := mustKubectl(t, "get", "harborrepositories,harborartifacts", "--all-namespaces", "-o", "name")
-	if out != "" {
-		t.Errorf("got %q, want no objects", out)
-	}
+// newNamespace creates a namespace that is deleted when the test ends.
+func newNamespace(t *testing.T) string {
+	t.Helper()
+	ns := fmt.Sprintf("e2e-%d", time.Now().UnixNano())
+	mustKubectl(t, "create", "namespace", ns)
+	t.Cleanup(func() { _, _ = kubectl(t, "delete", "namespace", ns, "--wait=false") })
+	return ns
 }
 
 // namespaceWithServiceAccounts creates a namespace with a "viewer" bound to the view role and a "nobody" bound to nothing.
 func namespaceWithServiceAccounts(t *testing.T) string {
 	t.Helper()
-	ns := fmt.Sprintf("e2e-%d", time.Now().UnixNano())
-	mustKubectl(t, "create", "namespace", ns)
-	t.Cleanup(func() { _, _ = kubectl(t, "delete", "namespace", ns, "--wait=false") })
+	ns := newNamespace(t)
 	mustKubectl(t, "-n", ns, "create", "serviceaccount", "viewer")
 	mustKubectl(t, "-n", ns, "create", "serviceaccount", "nobody")
 	mustKubectl(t, "-n", ns, "create", "rolebinding", "viewer", "--clusterrole=view", "--serviceaccount="+ns+":viewer")
 
 	// harbor-apiserver caches denials, so wait until RBAC allows the viewer before any test asks.
-	for range 50 {
-		if out, _ := kubectl(t, "-n", ns, "auth", "can-i", "list", "harborrepositories.harbor.goharbor.io", "--as=system:serviceaccount:"+ns+":viewer"); out == "yes" {
-			return ns
+	eventually(t, func() error {
+		out, err := kubectl(t, "-n", ns, "auth", "can-i", "list", "harborrepositories.harbor.goharbor.io", "--as=system:serviceaccount:"+ns+":viewer")
+		if out != "yes" {
+			return fmt.Errorf("can the viewer list harborrepositories? %q, %v", out, err)
 		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	t.Fatal("RBAC never allowed the viewer")
-	return ""
+		return nil
+	})
+	return ns
 }
 
 func TestViewRoleGrantsAccess(t *testing.T) {

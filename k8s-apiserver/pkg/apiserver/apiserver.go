@@ -52,7 +52,8 @@ func NewConfig() *genericapiserver.Config {
 	return c
 }
 
-func New(c genericapiserver.CompletedConfig) (*genericapiserver.GenericAPIServer, error) {
+// New serves Harbor project data to the namespaces that n allows.
+func New(c genericapiserver.CompletedConfig, h registry.Harbor, project string, n registry.Namespaces) (*genericapiserver.GenericAPIServer, error) {
 	s, err := c.New("harbor-apiserver", genericapiserver.NewEmptyDelegate())
 	if err != nil {
 		return nil, err
@@ -61,9 +62,7 @@ func New(c genericapiserver.CompletedConfig) (*genericapiserver.GenericAPIServer
 	group := genericapiserver.NewDefaultAPIGroupInfo(v1alpha1.GroupName, scheme, metav1.ParameterCodec, codecs)
 	group.NegotiatedSerializer = withoutProtobuf{group.NegotiatedSerializer}
 	group.VersionedResourcesStorageMap[v1alpha1.SchemeGroupVersion.Version] = map[string]rest.Storage{
-		"harborrepositories": registry.NewStub(v1alpha1.Resource("harborrepositories"), "harborrepository",
-			func() runtime.Object { return &v1alpha1.HarborRepository{} },
-			func() runtime.Object { return &v1alpha1.HarborRepositoryList{} }),
+		"harborrepositories": registry.NewRepositories(h, project, n),
 		"harborartifacts": registry.NewStub(v1alpha1.Resource("harborartifacts"), "harborartifact",
 			func() runtime.Object { return &v1alpha1.HarborArtifact{} },
 			func() runtime.Object { return &v1alpha1.HarborArtifactList{} }),
