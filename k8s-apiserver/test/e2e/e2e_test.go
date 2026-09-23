@@ -1,6 +1,5 @@
 //go:build e2e
 
-// Package e2e tests a deployed harbor-apiserver through kubectl.
 package e2e
 
 import (
