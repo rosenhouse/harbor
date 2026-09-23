@@ -1,4 +1,4 @@
-// Package v1alpha1 is a read-only view of Harbor repositories and artifacts.
+// Package v1alpha1 views Harbor repositories and artifacts, and optionally replicates artifacts into the project.
 //
 // +k8s:deepcopy-gen=package
 // +k8s:openapi-gen=true

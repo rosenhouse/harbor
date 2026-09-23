@@ -31,6 +31,31 @@ func (in HarborPlatform) OpenAPIModelName() string {
 }
 
 // OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HarborReplication) OpenAPIModelName() string {
+	return "io.goharbor.harbor.v1alpha1.HarborReplication"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HarborReplicationExecution) OpenAPIModelName() string {
+	return "io.goharbor.harbor.v1alpha1.HarborReplicationExecution"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HarborReplicationList) OpenAPIModelName() string {
+	return "io.goharbor.harbor.v1alpha1.HarborReplicationList"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HarborReplicationSpec) OpenAPIModelName() string {
+	return "io.goharbor.harbor.v1alpha1.HarborReplicationSpec"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HarborReplicationStatus) OpenAPIModelName() string {
+	return "io.goharbor.harbor.v1alpha1.HarborReplicationStatus"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
 func (in HarborRepository) OpenAPIModelName() string {
 	return "io.goharbor.harbor.v1alpha1.HarborRepository"
 }

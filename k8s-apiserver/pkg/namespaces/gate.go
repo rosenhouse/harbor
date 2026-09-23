@@ -4,6 +4,7 @@ package namespaces
 import (
 	"slices"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 )
@@ -21,8 +22,18 @@ func NewGate(lister corev1listers.NamespaceLister, project string) *Gate {
 }
 
 func (g *Gate) Allows(namespace string) bool {
-	ns, err := g.lister.Get(namespace)
-	return err == nil && ns.Labels[ProjectLabel] == g.project
+	_, ok := g.Namespace(namespace)
+	return ok
+}
+
+// Namespace returns the named namespace if it sees the project.
+// It is shared with the informer's cache, so callers must not modify it.
+func (g *Gate) Namespace(name string) (*corev1.Namespace, bool) {
+	ns, err := g.lister.Get(name)
+	if err != nil || ns.Labels[ProjectLabel] != g.project {
+		return nil, false
+	}
+	return ns, true
 }
 
 // Namespaces returns the allowed namespaces, sorted.

@@ -22,6 +22,8 @@ func AddToScheme(scheme *runtime.Scheme) error {
 		&HarborRepositoryList{},
 		&HarborArtifact{},
 		&HarborArtifactList{},
+		&HarborReplication{},
+		&HarborReplicationList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return scheme.AddFieldLabelConversionFunc(SchemeGroupVersion.WithKind("HarborArtifact"), artifactFieldLabel)
