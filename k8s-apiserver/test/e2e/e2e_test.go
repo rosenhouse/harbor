@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -124,10 +125,14 @@ func TestViewRoleGrantsAccess(t *testing.T) {
 func TestDelegatedAuthorization(t *testing.T) {
 	ns := namespaceWithServiceAccounts(t)
 	base := portForward(t)
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(secretData(t, "harbor-apiserver", "harbor-apiserver-tls", "ca.crt")) {
+		t.Fatal("no CA certificate in Secret harbor-apiserver-tls")
+	}
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // the serving certificate is self-signed
+			TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "harbor-apiserver.harbor-apiserver.svc"},
 		},
 	}
 

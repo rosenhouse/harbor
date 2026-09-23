@@ -7,8 +7,7 @@ spec:
   version: v1alpha1
   groupPriorityMinimum: 1000
   versionPriority: 15
-  # TODO(#11): verify the serving certificate with caBundle.
-  insecureSkipTLSVerify: true
+  # deploy/cert-manager or hack/gen-serving-cert.sh sets caBundle.
   service:
     name: harbor-apiserver
     namespace: harbor-apiserver

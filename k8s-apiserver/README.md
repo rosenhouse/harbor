@@ -6,8 +6,8 @@ The plan and design decisions are tracked in [issue 1](https://github.com/rosenh
 ## Install
 
 No image is published yet, so build and push your own.
-The server reads one Harbor project as a project robot account that can list and read repositories and artifacts.
-Until [issue 11](https://github.com/rosenhouse/harbor/issues/11), the APIService skips TLS verification of the server.
+The server reads one Harbor project as a project robot account that can list and read repositories and list artifacts.
+The APIService verifies the server with a CA that cert-manager or `hack/gen-serving-cert.sh` manages.
 
 ```sh
 image=registry.example.com/harbor-apiserver:dev
@@ -20,17 +20,20 @@ kubectl -n harbor-apiserver create secret generic harbor-apiserver \
   --from-literal=project=my-project \
   --from-literal=username='robot$my-project+k8s' \
   --from-literal=password="$ROBOT_SECRET"
-kubectl apply -k deploy
+kubectl apply -k deploy/cert-manager                  # with cert-manager
+kubectl apply -k deploy && hack/gen-serving-cert.sh   # without it
 kubectl wait --for=condition=Available apiservice/v1alpha1.harbor.goharbor.io
 kubectl label namespace my-namespace harbor.goharbor.io/project=my-project
 ```
+
+The script issues a serving certificate that lasts a year, and renews it when rerun within 30 days of expiry.
 
 ## Development
 
 ```sh
 go test ./...
 hack/update-codegen.sh   # after changing pkg/apis
-hack/e2e.sh              # needs docker, kind, kubectl, and helm
+hack/e2e.sh              # needs docker, kind, kubectl, helm, and openssl
 ```
 
 If the kind node cannot pull images, set `E2E_PRELOAD_IMAGES=1` so that `hack/e2e.sh` pulls Harbor's images on the host and loads them into kind.
