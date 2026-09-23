@@ -13,22 +13,33 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 )
 
 // robotClient reads Harbor as the robot that the seed command stored for harbor-apiserver.
-func robotClient(t *testing.T, password string) *harbor.Client {
+func robotClient(t *testing.T) *harbor.Client {
 	t.Helper()
-	username := secretValue(t, "username")
-	if password == "" {
-		password = secretValue(t, "password")
-	}
+	return clientAs(t, secretValue(t, "username"), secretValue(t, "password"))
+}
+
+func clientAs(t *testing.T, username, password string) *harbor.Client {
+	t.Helper()
 	c, err := harbor.NewClient(HarborURL, username, password, &http.Client{Timeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return c
+}
+
+func digest(t *testing.T, x interface{ Digest() (v1.Hash, error) }) string {
+	t.Helper()
+	d, err := x.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d.String()
 }
 
 func secretValue(t *testing.T, key string) string {
@@ -43,20 +54,21 @@ func secretValue(t *testing.T, key string) string {
 
 func TestRobotReadsSeededProject(t *testing.T) {
 	ctx := context.Background()
-	c := robotClient(t, "")
+	c := robotClient(t)
 	seed := NewSeed()
 
 	repos, err := c.ListRepositories(ctx, HarborProject)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var names []string
+	artifactCounts := map[string]int64{}
 	for _, r := range repos {
-		names = append(names, r.Name)
+		artifactCounts[r.Name] = r.ArtifactCount
 	}
-	slices.Sort(names)
-	if diff := cmp.Diff([]string{"e2e/app", "e2e/dotted.name_x", "e2e/multi", "e2e/team/api"}, names); diff != "" {
-		t.Errorf("repositories (-want +got):\n%s", diff)
+	// Untagged artifacts count, but an index's children don't.
+	wantCounts := map[string]int64{"e2e/app": 2, "e2e/dotted.name_x": 1, "e2e/multi": 1, "e2e/team/api": 1}
+	if diff := cmp.Diff(wantCounts, artifactCounts); diff != "" {
+		t.Errorf("artifact counts by repository (-want +got):\n%s", diff)
 	}
 
 	repo, err := c.GetRepository(ctx, HarborProject, "team/api")
@@ -72,16 +84,16 @@ func TestRobotReadsSeededProject(t *testing.T) {
 		want []artifactSummary
 	}{
 		{"app", []artifactSummary{
-			{Digest: Digest(seed.App), Tags: []string{"latest", "v1"}},
-			{Digest: Digest(seed.Untagged)},
+			{Digest: digest(t, seed.App), Tags: []string{"latest", "v1"}},
+			{Digest: digest(t, seed.Untagged)},
 		}},
 		{"multi", []artifactSummary{{
-			Digest:     Digest(seed.Multi),
+			Digest:     digest(t, seed.Multi),
 			Tags:       []string{"v1"},
-			References: []string{"amd64=" + Digest(seed.MultiAMD64), "arm64=" + Digest(seed.MultiARM64)},
+			References: []string{"amd64=" + digest(t, seed.MultiAMD64), "arm64=" + digest(t, seed.MultiARM64)},
 		}}},
-		{"team/api", []artifactSummary{{Digest: Digest(seed.TeamAPI), Tags: []string{"v1"}}}},
-		{"dotted.name_x", []artifactSummary{{Digest: Digest(seed.Dotted), Tags: []string{"v1"}}}},
+		{"team/api", []artifactSummary{{Digest: digest(t, seed.TeamAPI), Tags: []string{"v1"}}}},
+		{"dotted.name_x", []artifactSummary{{Digest: digest(t, seed.Dotted), Tags: []string{"v1"}}}},
 	} {
 		artifacts, err := c.ListArtifacts(ctx, HarborProject, tc.repo)
 		if err != nil {
@@ -92,17 +104,17 @@ func TestRobotReadsSeededProject(t *testing.T) {
 		}
 	}
 
-	a, err := c.GetArtifact(ctx, HarborProject, "team/api", Digest(seed.TeamAPI))
+	a, err := c.GetArtifact(ctx, HarborProject, "team/api", digest(t, seed.TeamAPI))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Digest != Digest(seed.TeamAPI) || a.RepositoryName != "e2e/team/api" {
+	if a.Digest != digest(t, seed.TeamAPI) || a.RepositoryName != "e2e/team/api" {
 		t.Errorf("team/api artifact: got %+v", a)
 	}
 }
 
 func TestRobotWithWrongPassword(t *testing.T) {
-	_, err := robotClient(t, "wrong").ListRepositories(context.Background(), HarborProject)
+	_, err := clientAs(t, secretValue(t, "username"), "wrong").ListRepositories(context.Background(), HarborProject)
 	if !errors.Is(err, harbor.ErrUnauthorized) {
 		t.Errorf("got %v, want %v", err, harbor.ErrUnauthorized)
 	}
@@ -123,7 +135,11 @@ func summarize(artifacts []harbor.Artifact) []artifactSummary {
 		}
 		slices.Sort(x.Tags)
 		for _, r := range a.References {
-			x.References = append(x.References, r.Platform.Architecture+"="+r.ChildDigest)
+			arch := "<no platform>"
+			if r.Platform != nil {
+				arch = r.Platform.Architecture
+			}
+			x.References = append(x.References, arch+"="+r.ChildDigest)
 		}
 		slices.Sort(x.References)
 		s = append(s, x)

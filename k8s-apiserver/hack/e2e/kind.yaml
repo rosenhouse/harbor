@@ -6,3 +6,21 @@ nodes:
     extraPortMappings:
       - containerPort: 30002
         hostPort: 30002
+    # certs.d sends Docker Hub pulls to mirror.gcr.io first, which avoids Docker Hub's rate limits.
+    # kind resolves hostPath relative to the working directory, which hack/e2e.sh sets to k8s-apiserver.
+    extraMounts:
+      - hostPath: hack/e2e/certs.d
+        containerPath: /etc/containerd/certs.d
+        readOnly: true
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
+  # This and failCgroupV1 let kind run on hosts with cgroup v1 or without CAP_SYS_RESOURCE.
+  - |-
+    [plugins."io.containerd.grpc.v1.cri"]
+      restrict_oom_score_adj = true
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    failCgroupV1: false

@@ -30,6 +30,7 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       E2E_KUBECONFIG: /tmp/harbor-apiserver-e2e.kubeconfig
     steps:
@@ -55,4 +56,6 @@ jobs:
           kubectl -n harbor-apiserver logs -l app=harbor-apiserver --prefix --tail=200
           kubectl -n harbor-apiserver logs -l app=harbor-apiserver --prefix --tail=200 --previous
           kubectl -n harbor get pods
-          kubectl -n harbor logs -l component=core --tail=200
+          kubectl -n harbor describe pods
+          kubectl -n harbor get events --sort-by=.lastTimestamp
+          kubectl -n harbor logs -l 'app=harbor,component in (core,registry,nginx)' --all-containers --prefix --tail=200

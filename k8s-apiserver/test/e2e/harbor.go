@@ -1,13 +1,16 @@
 //go:build e2e
 
+// Package e2e seeds Harbor and tests a deployed harbor-apiserver.
 package e2e
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -28,9 +31,10 @@ const (
 	// HarborInClusterURL is how harbor-apiserver reaches Harbor.
 	HarborInClusterURL = "http://harbor.harbor.svc"
 	HarborProject      = "e2e"
+	robotName          = "harbor-apiserver"
 )
 
-var admin = authn.Basic{Username: "admin", Password: "Harbor12345"}
+var adminAuth = authn.Basic{Username: "admin", Password: "Harbor12345"}
 
 // Seed is what Harbor holds after seeding. Its images are reproducible, so tests can recompute their digests.
 type Seed struct {
@@ -55,9 +59,16 @@ func NewSeed() Seed {
 	return s
 }
 
-// Push creates the project and pushes the seed images to it.
-func (s Seed) Push() error {
-	if err := harborAdmin(http.MethodPost, "/projects", map[string]any{"project_name": HarborProject}, nil, http.StatusCreated, http.StatusConflict); err != nil {
+// Push replaces the repositories in the e2e project with the seed images.
+func (s Seed) Push(ctx context.Context, a *Admin) error {
+	if err := a.do(ctx, http.MethodPost, "/projects", map[string]any{"project_name": HarborProject}, nil, http.StatusCreated, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := a.deleteRepositories(ctx); err != nil {
+		return err
+	}
+	untagged, err := s.Untagged.Digest()
+	if err != nil {
 		return err
 	}
 	for _, p := range []struct {
@@ -66,25 +77,16 @@ func (s Seed) Push() error {
 	}{
 		{"app:v1", s.App},
 		{"app:latest", s.App},
-		{"app@", s.Untagged},
+		{"app@" + untagged.String(), s.Untagged},
 		{"multi:v1", s.Multi},
 		{"team/api:v1", s.TeamAPI},
 		{"dotted.name_x:v1", s.Dotted},
 	} {
-		if err := push(p.ref, p.t); err != nil {
+		if err := a.push(ctx, p.ref, p.t); err != nil {
 			return fmt.Errorf("pushing %s: %w", p.ref, err)
 		}
 	}
 	return nil
-}
-
-// Digest returns the digest of an image or index, panicking on error.
-func Digest(t interface{ Digest() (v1.Hash, error) }) string {
-	d, err := t.Digest()
-	if err != nil {
-		panic(err)
-	}
-	return d.String()
 }
 
 // image returns a small image whose digest depends only on its arguments.
@@ -107,29 +109,46 @@ func image(content, arch string) v1.Image {
 	return img
 }
 
-// push pushes to repoRef in the e2e project. A reference ending in "@" pushes by digest, leaving the artifact untagged.
-func push(repoRef string, t remote.Taggable) error {
-	s := strings.TrimPrefix(HarborURL, "http://") + "/" + HarborProject + "/" + repoRef
-	if strings.HasSuffix(s, "@") {
-		s += Digest(t.(interface{ Digest() (v1.Hash, error) }))
-	}
-	ref, err := name.ParseReference(s, name.Insecure)
+// Admin calls Harbor as its admin user.
+type Admin struct {
+	url  string
+	http *http.Client
+}
+
+func NewAdmin(harborURL string) *Admin {
+	return &Admin{url: harborURL, http: &http.Client{Timeout: 30 * time.Second}}
+}
+
+// push pushes to ref in the e2e project.
+func (a *Admin) push(ctx context.Context, ref string, t remote.Taggable) error {
+	r, err := name.ParseReference(strings.TrimPrefix(a.url, "http://")+"/"+HarborProject+"/"+ref, name.Insecure)
 	if err != nil {
 		return err
 	}
-	auth := remote.WithAuth(&admin)
-	switch t := t.(type) {
-	case v1.ImageIndex:
-		return remote.WriteIndex(ref, t, auth)
-	case v1.Image:
-		return remote.Write(ref, t, auth)
-	}
-	return fmt.Errorf("cannot push %T", t)
+	return remote.Push(r, t, remote.WithAuth(&adminAuth), remote.WithContext(ctx))
 }
 
-// CreateRobot creates a project robot account with only the permissions harbor-apiserver needs.
+func (a *Admin) deleteRepositories(ctx context.Context) error {
+	var repos []struct{ Name string }
+	if err := a.do(ctx, http.MethodGet, "/projects/"+HarborProject+"/repositories?page_size=100", nil, &repos, http.StatusOK); err != nil {
+		return err
+	}
+	for _, r := range repos {
+		// Harbor requires repository names containing "/" to be encoded twice.
+		escaped := url.PathEscape(url.PathEscape(strings.TrimPrefix(r.Name, HarborProject+"/")))
+		if err := a.do(ctx, http.MethodDelete, "/projects/"+HarborProject+"/repositories/"+escaped, nil, nil, http.StatusOK); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CreateRobot replaces the project robot account for harbor-apiserver, granting only the permissions it needs.
 // It returns the robot's full name and secret.
-func CreateRobot() (name, secret string, err error) {
+func (a *Admin) CreateRobot(ctx context.Context) (name, secret string, err error) {
+	if err := a.deleteRobot(ctx); err != nil {
+		return "", "", err
+	}
 	access := []map[string]string{
 		{"resource": "repository", "action": "list"},
 		{"resource": "repository", "action": "read"},
@@ -137,7 +156,7 @@ func CreateRobot() (name, secret string, err error) {
 		{"resource": "artifact", "action": "read"},
 	}
 	body := map[string]any{
-		"name":     fmt.Sprintf("k8s-%d", time.Now().Unix()),
+		"name":     robotName,
 		"level":    "project",
 		"duration": -1,
 		"permissions": []map[string]any{
@@ -145,22 +164,47 @@ func CreateRobot() (name, secret string, err error) {
 		},
 	}
 	var robot struct{ Name, Secret string }
-	err = harborAdmin(http.MethodPost, "/robots", body, &robot, http.StatusCreated)
+	err = a.do(ctx, http.MethodPost, "/robots", body, &robot, http.StatusCreated)
 	return robot.Name, robot.Secret, err
 }
 
-func harborAdmin(method, path string, body, into any, okStatus ...int) error {
-	b, err := json.Marshal(body)
+func (a *Admin) deleteRobot(ctx context.Context) error {
+	var project struct {
+		ID int64 `json:"project_id"`
+	}
+	if err := a.do(ctx, http.MethodGet, "/projects/"+HarborProject, nil, &project, http.StatusOK); err != nil {
+		return err
+	}
+	// Harbor stores the name as "<project>+<robot>" and unescapes q once more after parsing the query string.
+	q := fmt.Sprintf("Level=project,ProjectID=%d,name=%s", project.ID, url.QueryEscape(HarborProject+"+"+robotName))
+	var robots []struct{ ID int64 }
+	if err := a.do(ctx, http.MethodGet, "/robots?"+url.Values{"q": {q}}.Encode(), nil, &robots, http.StatusOK); err != nil {
+		return err
+	}
+	for _, r := range robots {
+		if err := a.do(ctx, http.MethodDelete, fmt.Sprintf("/robots/%d", r.ID), nil, nil, http.StatusOK); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *Admin) do(ctx context.Context, method, path string, body, into any, okStatus ...int) error {
+	var reqBody io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reqBody = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, a.url+"/api/v2.0"+path, reqBody)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(method, HarborURL+"/api/v2.0"+path, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.SetBasicAuth(admin.Username, admin.Password)
+	req.SetBasicAuth(adminAuth.Username, adminAuth.Password)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := a.http.Do(req)
 	if err != nil {
 		return err
 	}
