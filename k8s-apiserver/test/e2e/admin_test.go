@@ -264,8 +264,7 @@ func TestCreateRobotGrantsOnlyReadAccessToTheProject(t *testing.T) {
 			"access": [
 				{"resource": "repository", "action": "list"},
 				{"resource": "repository", "action": "read"},
-				{"resource": "artifact", "action": "list"},
-				{"resource": "artifact", "action": "read"}
+				{"resource": "artifact", "action": "list"}
 			]
 		}]
 	}`), &want); err != nil {

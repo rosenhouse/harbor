@@ -159,7 +159,6 @@ func (a *Admin) CreateRobot(ctx context.Context) (name, secret string, err error
 		{"resource": "repository", "action": "list"},
 		{"resource": "repository", "action": "read"},
 		{"resource": "artifact", "action": "list"},
-		{"resource": "artifact", "action": "read"},
 	}
 	body := map[string]any{
 		"name":     robotName,

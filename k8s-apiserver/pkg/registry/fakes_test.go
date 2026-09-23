@@ -3,6 +3,9 @@ package registry
 import (
 	"context"
 	"slices"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 )
@@ -10,12 +13,24 @@ import (
 // fakeHarbor serves repositories in project "proj" and records calls.
 type fakeHarbor struct {
 	repositories []harbor.Repository
-	err          error
-	calls        []string
+	// artifacts maps full repository names to their artifacts. Other repositories are not found.
+	artifacts map[string][]harbor.Artifact
+	err       error
+	delay     time.Duration
+
+	mu                    sync.Mutex
+	calls                 []string
+	inFlight, maxInFlight int
+}
+
+func (f *fakeHarbor) record(call string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, call)
 }
 
 func (f *fakeHarbor) ListRepositories(_ context.Context, project string) ([]harbor.Repository, error) {
-	f.calls = append(f.calls, "list "+project)
+	f.record("list " + project)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -23,7 +38,7 @@ func (f *fakeHarbor) ListRepositories(_ context.Context, project string) ([]harb
 }
 
 func (f *fakeHarbor) GetRepository(_ context.Context, project, repository string) (*harbor.Repository, error) {
-	f.calls = append(f.calls, "get "+project+" "+repository)
+	f.record("get " + project + " " + repository)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -32,6 +47,33 @@ func (f *fakeHarbor) GetRepository(_ context.Context, project, repository string
 		return nil, harbor.ErrNotFound
 	}
 	return &f.repositories[i], nil
+}
+
+func (f *fakeHarbor) ListArtifacts(_ context.Context, project, repository, digestPrefix string) ([]harbor.Artifact, error) {
+	f.record(strings.TrimSpace("artifacts " + project + " " + repository + " " + digestPrefix))
+	f.mu.Lock()
+	f.inFlight++
+	f.maxInFlight = max(f.maxInFlight, f.inFlight)
+	f.mu.Unlock()
+	time.Sleep(f.delay)
+	f.mu.Lock()
+	f.inFlight--
+	f.mu.Unlock()
+
+	if f.err != nil {
+		return nil, f.err
+	}
+	artifacts, ok := f.artifacts[project+"/"+repository]
+	if !ok {
+		return nil, harbor.ErrNotFound
+	}
+	var matching []harbor.Artifact
+	for _, a := range artifacts {
+		if strings.HasPrefix(a.Digest, digestPrefix) {
+			matching = append(matching, a)
+		}
+	}
+	return matching, nil
 }
 
 type fakeNamespaces []string

@@ -31,6 +31,13 @@ func (fakeHarbor) GetRepository(context.Context, string, string) (*harbor.Reposi
 	return &harbor.Repository{ID: 1, Name: "proj/team/api"}, nil
 }
 
+func (fakeHarbor) ListArtifacts(_ context.Context, _, repository, _ string) ([]harbor.Artifact, error) {
+	if repository != "team/api" {
+		return nil, harbor.ErrNotFound
+	}
+	return []harbor.Artifact{{ID: 1, Digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Type: "IMAGE"}}, nil
+}
+
 // allowed lets only the "allowed" namespace see the project.
 type allowed struct{}
 
@@ -127,16 +134,48 @@ func TestRepositoryTable(t *testing.T) {
 	}
 }
 
+func TestArtifactTable(t *testing.T) {
+	h := newHandler(t)
+	var table metav1.Table
+	decode(t, get(t, h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborartifacts",
+		"application/json;as=Table;v=v1;g=meta.k8s.io"), http.StatusOK, &table)
+	if len(table.Rows) != 1 || table.Rows[0].Cells[0] != "team.api.sha256-0123456789ab" {
+		t.Errorf("rows %+v", table.Rows)
+	}
+
+	rec := get(t, h, "/apis/harbor.goharbor.io/v1alpha1/namespaces/default/harborartifacts",
+		"application/json;as=Table;v=v1;g=meta.k8s.io")
+	if !strings.Contains(rec.Body.String(), `"rows":[]`) {
+		t.Errorf("empty table: %s", rec.Body)
+	}
+}
+
 func TestFieldSelectors(t *testing.T) {
 	h := newHandler(t)
-	for selector, want := range map[string]int{
-		"metadata.name=team.api":        http.StatusOK,
-		"metadata.namespace=allowed":    http.StatusOK,
-		"status.name=proj%2Fteam%2Fapi": http.StatusBadRequest,
+	for _, tc := range []struct {
+		resource, selector  string
+		wantCode, wantItems int
+	}{
+		{"harborrepositories", "metadata.name=team.api", http.StatusOK, 1},
+		{"harborrepositories", "metadata.namespace=allowed", http.StatusOK, 1},
+		{"harborrepositories", "status.name=proj%2Fteam%2Fapi", http.StatusBadRequest, 0},
+		{"harborartifacts", "metadata.name=team.api.sha256-0123456789ab", http.StatusOK, 1},
+		{"harborartifacts", "metadata.namespace=allowed", http.StatusOK, 1},
+		{"harborartifacts", "status.repository=proj%2Fteam%2Fapi", http.StatusOK, 1},
+		{"harborartifacts", "status.repository=proj%2Fother", http.StatusOK, 0},
+		{"harborartifacts", "status.digest=x", http.StatusBadRequest, 0},
 	} {
-		rec := get(t, h, "/apis/harbor.goharbor.io/v1alpha1/harborrepositories?fieldSelector="+selector)
-		if rec.Code != want {
-			t.Errorf("%s: status %d, want %d: %s", selector, rec.Code, want, rec.Body)
+		rec := get(t, h, "/apis/harbor.goharbor.io/v1alpha1/"+tc.resource+"?fieldSelector="+tc.selector)
+		if rec.Code != tc.wantCode {
+			t.Errorf("%s %s: status %d, want %d: %s", tc.resource, tc.selector, rec.Code, tc.wantCode, rec.Body)
+			continue
+		}
+		var list struct{ Items []json.RawMessage }
+		if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+			t.Fatal(err)
+		}
+		if tc.wantCode == http.StatusOK && len(list.Items) != tc.wantItems {
+			t.Errorf("%s %s: %d items, want %d", tc.resource, tc.selector, len(list.Items), tc.wantItems)
 		}
 	}
 }
