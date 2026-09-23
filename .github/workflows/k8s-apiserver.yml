@@ -42,6 +42,8 @@ jobs:
       - run: |
           curl -fsSLo "$RUNNER_TEMP/kubectl" https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl
           sudo install "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
+          curl -fsSL https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz | tar -xzC "$RUNNER_TEMP"
+          sudo install "$RUNNER_TEMP/linux-amd64/helm" /usr/local/bin/helm
       - run: hack/e2e.sh
       - if: failure()
         env:
@@ -52,3 +54,5 @@ jobs:
           kubectl -n harbor-apiserver describe pods
           kubectl -n harbor-apiserver logs -l app=harbor-apiserver --prefix --tail=200
           kubectl -n harbor-apiserver logs -l app=harbor-apiserver --prefix --tail=200 --previous
+          kubectl -n harbor get pods
+          kubectl -n harbor logs -l component=core --tail=200

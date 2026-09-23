@@ -1,0 +1,9 @@
+expose:
+  type: nodePort
+  tls:
+    enabled: false
+externalURL: http://localhost:30002
+persistence:
+  enabled: false
+trivy:
+  enabled: false

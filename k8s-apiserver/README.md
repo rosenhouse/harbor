@@ -8,5 +8,5 @@ The plan and design decisions are tracked in [issue 1](https://github.com/rosenh
 ```sh
 go test ./...
 hack/update-codegen.sh   # after changing pkg/apis
-hack/e2e.sh              # needs docker, kind, and kubectl
+hack/e2e.sh              # needs docker, kind, kubectl, and helm
 ```
