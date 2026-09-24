@@ -42,6 +42,9 @@ func (suite *PermissionsTestSuite) getPermissions() *models.Permissions {
 	res, err := suite.GetJSON("/permissions", &perms)
 	suite.Require().NoError(err)
 	suite.Require().Equal(http.StatusOK, res.StatusCode)
+	for _, p := range rbac.SystemRobotProjectPolicies {
+		suite.NotContains(perms.Project, &models.Permission{Resource: p.Resource.String(), Action: p.Action.String()})
+	}
 	return &perms
 }
 
@@ -55,7 +58,6 @@ func (suite *PermissionsTestSuite) TestSystemAdminGetsSystemRobotProjectPermissi
 		want = append(want, &models.Permission{Resource: p.Resource.String(), Action: p.Action.String()})
 	}
 	suite.Equal(want, perms.SystemRobotProject)
-	suite.NotContains(perms.Project, &models.Permission{Resource: rbac.ResourceReplicationPolicy.String(), Action: rbac.ActionCreate.String()})
 }
 
 func (suite *PermissionsTestSuite) TestProjectAdminDoesNotGetSystemRobotProjectPermissions() {
