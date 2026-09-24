@@ -543,7 +543,7 @@ func (r *Replications) stopRunning(ctx context.Context, policyID int64, stopped 
 		if stopped[e.ID] {
 			continue
 		}
-		// An execution that ended after the list is gone.
+		// Harbor may have deleted the execution since the list.
 		if err := r.harbor.StopReplicationExecution(ctx, e.ID); err != nil && !errors.Is(err, harbor.ErrNotFound) {
 			return err
 		}

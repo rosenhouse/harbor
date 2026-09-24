@@ -32,7 +32,7 @@ func (r *replicationOptions) addFlags(fs *pflag.FlagSet) {
 		"Anyone who may create replications can copy their content into the project.")
 	fs.StringVar(&r.UsernameFile, "replication-username-file", r.UsernameFile, "File holding the name of the system robot account for replications.")
 	fs.StringVar(&r.PasswordFile, "replication-password-file", r.PasswordFile, "File holding the secret of the system robot account for replications. "+
-		"Whoever has it can pull from any registry endpoint into the project, and delete any replication policy that pulls into it.")
+		"Whoever has it can pull from any registry endpoint into the project, or, with upstream Harbor, replicate between any project and any endpoint.")
 	fs.StringVar(&r.Prefix, "replication-prefix", "k8s", "Path segment in the project that replications copy into, and the prefix of their Harbor policy names. "+
 		"Clusters that share a project need different prefixes.")
 	r.flags = fs

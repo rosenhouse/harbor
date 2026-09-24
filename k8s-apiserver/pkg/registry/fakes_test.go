@@ -167,7 +167,9 @@ type fakeReplicationHarbor struct {
 	busyDeletes int
 	// ignoreStops leaves stopped executions running, as Harbor does until their tasks stop.
 	ignoreStops bool
-	delay       time.Duration
+	// deleteStopped deletes an execution when it is asked to stop, and returns ErrNotFound, as Harbor does after it deletes the execution.
+	deleteStopped bool
+	delay         time.Duration
 	// onCreate runs when a policy is created.
 	onCreate func()
 	// lostReply stores a created policy, then fails with ErrUnavailable, as when Harbor's reply is lost.
@@ -176,7 +178,7 @@ type fakeReplicationHarbor struct {
 	ignorePrefix bool
 	// failEndedRequests fails calls whose context is done, as the Harbor client does.
 	failEndedRequests bool
-	// robotProject hides policies that pull into other projects, as Harbor does for a robot with project permissions.
+	// robotProject drops policies that pull into other projects from lists, as Harbor does for a robot with project permissions.
 	robotProject string
 
 	mu                    sync.Mutex
@@ -407,6 +409,10 @@ func (f *fakeReplicationHarbor) StopReplicationExecution(ctx context.Context, id
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, e := range f.executions {
+		if e.ID == id && f.deleteStopped {
+			f.executions = slices.Delete(f.executions, i, i+1)
+			return harbor.ErrNotFound
+		}
 		if e.ID == id {
 			if !f.ignoreStops {
 				f.executions[i].Status = "Stopped"

@@ -1,6 +1,6 @@
 # Serves the writable HarborReplication kind.
-# Secret harbor-apiserver-replication holds a system-level Harbor robot account with replication permissions on the project.
-# With its credentials, anyone can replace any tag in the project with anything an endpoint's credentials can read, and stop or delete any policy that pulls into the project.
+# Secret harbor-apiserver-replication holds a system-level Harbor robot account.
+# With its credentials, anyone can replace any tag in the project with anything an endpoint's credentials can read, even in a public project, and start, stop, or delete any policy that pulls into the project.
 # With upstream Harbor, they can also replicate any project to any registry endpoint, and stop or delete any replication policy.
 # While Harbor is unavailable, or rejects the robot, such as after it expires, no labeled namespace can finish deleting.
 # Read docs/threat-model.md#the-replication-robot-controls-pulls-into-the-project first.

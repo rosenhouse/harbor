@@ -17,7 +17,7 @@ Read the [threat model](docs/threat-model.md) before you install.
 ## Prerequisites
 
 - A Kubernetes 1.25 or later cluster with the aggregation layer enabled, and cluster-admin access to it.
-- Harbor 2.2 or later, reachable over HTTPS from the cluster's pods. The e2e tests use Harbor 2.15.2 from Helm chart 1.19.2, with core and jobservice built from this fork.
+- Harbor 2.2 or later, reachable over HTTPS from the cluster's pods. The e2e tests use Helm chart 1.19.2 (Harbor 2.15.2), with core and jobservice from this fork.
 - A Harbor project whose name is a valid label value (at most 63 characters).
 - `git`, `kubectl`, `jq`, and Docker with Buildx.
 - A registry that the cluster can pull from.
@@ -314,9 +314,9 @@ Select by field instead.
 
 Replications let Kubernetes users copy images into the project from registry endpoints that you allow.
 They are off by default, because they need a system-level Harbor robot account.
-With Harbor from this fork, the robot can pull from any registry endpoint into the project, and delete any replication policy that pulls into it.
+With Harbor from this fork, the robot can pull from any registry endpoint into the project, and start, stop, or delete any replication policy that pulls into it.
 With upstream Harbor, it can replicate between any project and any endpoint.
-Anyone who can read its Secret, or create pods in `harbor-apiserver`, can use it that way.
+Anyone who can read its Secret, or create pods in `harbor-apiserver`, can do the same.
 Users who can create replications can copy anything that an allowed endpoint's credentials can read into the project, which every labeled namespace shares.
 Read the [threat model](docs/threat-model.md#the-replication-robot-controls-pulls-into-the-project) before you enable them.
 
@@ -338,17 +338,16 @@ Give the robot only these permissions:
 | Project | Replication | List, Create |
 
 The server lists registry endpoints to find their IDs.
-Only Harbor core and jobservice built from this fork's `agg` branch let a system-level robot hold the replication permissions on a project.
-With upstream Harbor, grant the same actions as system permissions instead, in **Administration** > **Robot Accounts** > **New Robot Account**.
+Only Harbor core from this fork's `agg` branch lets a system-level robot hold replication permissions on a project.
+Run jobservice from the fork too, or a pull can mount any blob in Harbor that the source manifest names.
 
-Keep the robot's name and secret in a private directory until you create the Secret below:
+Harbor's UI can't grant the project permissions yet ([issue 31](https://github.com/rosenhouse/harbor/issues/31)), and editing the robot in the UI drops them.
+So create the robot through the API, as a Harbor system administrator.
+Keep its name and secret in a private directory until you create the Secret below:
 
 ```sh
 dir=$(mktemp -d)
 ```
-
-Harbor's UI can't grant the project permissions yet ([issue 31](https://github.com/rosenhouse/harbor/issues/31)).
-As a Harbor system administrator, use the API:
 
 ```sh
 curl -fsS -u my-harbor-admin -H 'Content-Type: application/json' \
@@ -369,6 +368,8 @@ curl -fsS -u my-harbor-admin -H 'Content-Type: application/json' \
 jq -r .name "$dir/robot.json" >"$dir/username"
 jq -r .secret "$dir/robot.json" >"$dir/password"
 ```
+
+Upstream Harbor accepts replication permissions only at the system level, so move the project entry's actions into the system entry.
 
 ### Create the replication Secret
 

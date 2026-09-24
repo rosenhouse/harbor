@@ -861,12 +861,15 @@ func TestDeleteReplicationWhileAnOlderExecutionRuns(t *testing.T) {
 	}
 }
 
-func TestDeleteReplicationWhoseExecutionEndsBeforeTheStop(t *testing.T) {
+func TestDeleteReplicationWhoseExecutionHarborDeletedBeforeTheStop(t *testing.T) {
 	r, h, _ := newReplications()
 	create(t, r, "ns1", replication("nginx"))
-	h.errs = map[string]error{"StopReplicationExecution": harbor.ErrNotFound}
-	if _, err := deleteReplication(r, "ns1", "nginx", nil); !apierrors.IsConflict(err) {
-		t.Errorf("got %v, want the Conflict of a policy whose executions have not stopped", err)
+	h.deleteStopped = true
+	if _, err := deleteReplication(r, "ns1", "nginx", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := h.policy("k8s.proj.ns1.nginx"); ok {
+		t.Error("the policy remains")
 	}
 }
 
