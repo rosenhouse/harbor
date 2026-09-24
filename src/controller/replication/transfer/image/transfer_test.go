@@ -28,6 +28,7 @@ import (
 
 	trans "github.com/goharbor/harbor/src/controller/replication/transfer"
 	"github.com/goharbor/harbor/src/lib/log"
+	_ "github.com/goharbor/harbor/src/pkg/reg/adapter/native"
 	"github.com/goharbor/harbor/src/pkg/reg/model"
 )
 
@@ -132,15 +133,91 @@ func (m *mountingRegistry) MountBlob(string, string, string) error {
 	return nil
 }
 
-func TestTryMountBlobOnlyFromTheDestinationProject(t *testing.T) {
-	for candidate, mounts := range map[string]bool{"p/other": true, "q/secret": false, "p2/secret": false} {
-		dst := &mountingRegistry{candidate: candidate}
-		tr := &transfer{logger: log.DefaultLogger(), isStopped: func() bool { return false }, dst: dst}
+func TestTryMountBlob(t *testing.T) {
+	cases := []struct {
+		dstIsLocal     bool
+		dst, candidate string
+		mounts         bool
+	}{
+		{true, "p/x", "p/other", true},
+		{true, "p/x", "q/secret", false},
+		{true, "p/x", "p2/secret", false},
+		{true, "p2/x", "p/secret", false},
+		{false, "p/x", "q/other", true},
+	}
+	for _, c := range cases {
+		dst := &mountingRegistry{candidate: c.candidate}
+		tr := &transfer{logger: log.DefaultLogger(), isStopped: func() bool { return false }, dst: dst, dstIsLocal: c.dstIsLocal}
 
-		mounted, err := tr.tryMountBlob("source", "p/x", "sha256:0")
+		mounted, err := tr.tryMountBlob("source", c.dst, "sha256:0")
 		require.NoError(t, err)
-		assert.Equal(t, mounts, mounted, candidate)
-		assert.Equal(t, mounts, dst.mounted, candidate)
+		assert.Equal(t, c.mounts, mounted, "%+v", c)
+		assert.Equal(t, c.mounts, dst.mounted, "%+v", c)
+	}
+}
+
+func TestInitializeRecognizesTheLocalRegistry(t *testing.T) {
+	for credential, local := range map[string]bool{model.CredentialTypeSecret: true, model.CredentialTypeBasic: false} {
+		registry := &model.Registry{Type: model.RegistryTypeDockerRegistry, URL: "http://registry.test", Credential: &model.Credential{Type: credential}}
+		tr := &transfer{logger: log.DefaultLogger()}
+
+		require.NoError(t, tr.initialize(&model.Resource{Registry: registry}, &model.Resource{Registry: registry}))
+		assert.Equal(t, local, tr.dstIsLocal, credential)
+	}
+}
+
+type recordingRegistry struct {
+	fakeRegistry
+	calls []string
+}
+
+func (r *recordingRegistry) ManifestExist(repository, reference string) (bool, *distribution.Descriptor, error) {
+	r.calls = append(r.calls, "ManifestExist")
+	return r.fakeRegistry.ManifestExist(repository, reference)
+}
+
+func (r *recordingRegistry) PullManifest(repository, reference string, accepttedMediaTypes ...string) (distribution.Manifest, string, error) {
+	r.calls = append(r.calls, "PullManifest")
+	return r.fakeRegistry.PullManifest(repository, reference, accepttedMediaTypes...)
+}
+
+func (r *recordingRegistry) BlobExist(repository, digest string) (bool, error) {
+	r.calls = append(r.calls, "BlobExist")
+	return r.fakeRegistry.BlobExist(repository, digest)
+}
+
+var invalidReferences = []string{"a/b", "latest?x=y", "../../../victim/img/manifests/latest", "sha256:0&from=victim/img"}
+
+func TestCopyArtifactRejectsInvalidReferences(t *testing.T) {
+	for _, ref := range invalidReferences {
+		src, dst := &recordingRegistry{}, &recordingRegistry{}
+		tr := &transfer{logger: log.DefaultLogger(), isStopped: func() bool { return false }, src: src, dst: dst}
+
+		assert.Error(t, tr.copyArtifact("source", ref, "p/x", "latest", false, trans.NewOptions()), ref)
+		assert.Error(t, tr.copyArtifact("source", "latest", "p/x", ref, false, trans.NewOptions()), ref)
+		assert.Empty(t, src.calls, ref)
+		assert.Empty(t, dst.calls, ref)
+	}
+}
+
+func TestCopyArtifactByTagAndDigest(t *testing.T) {
+	tr := &transfer{logger: log.DefaultLogger(), isStopped: func() bool { return false }, src: &fakeRegistry{}, dst: &fakeRegistry{}}
+	d := "sha256:c6b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7"
+
+	assert.NoError(t, tr.copyArtifact("source", "v1.0_rc-1", "p/x", "V1.0_RC-1", false, trans.NewOptions()))
+	assert.NoError(t, tr.copyArtifact("source", d, "p/x", d, false, trans.NewOptions()))
+}
+
+func TestCopyContentRejectsInvalidDigests(t *testing.T) {
+	for _, mediaType := range []string{schema2.MediaTypeLayer, v1.MediaTypeImageIndex} {
+		for _, ref := range invalidReferences {
+			src, dst := &recordingRegistry{}, &recordingRegistry{}
+			tr := &transfer{logger: log.DefaultLogger(), isStopped: func() bool { return false }, src: src, dst: dst}
+
+			content := distribution.Descriptor{MediaType: mediaType, Digest: digest.Digest(ref)}
+			assert.Error(t, tr.copyContent(content, "source", "p/x", trans.NewOptions()), ref)
+			assert.Empty(t, dst.calls, ref)
+		}
 	}
 }
 

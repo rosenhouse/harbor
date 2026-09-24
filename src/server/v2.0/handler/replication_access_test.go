@@ -185,7 +185,7 @@ type accessCase struct {
 	onExecution  bool   // whether {id} is an execution
 }
 
-// id returns the ID in the request about the policy.
+// id returns the ID of the policy, or of its execution when the request is about an execution.
 func (c accessCase) id(policy int64) int64 {
 	if c.onExecution {
 		return policy * 10
@@ -193,22 +193,17 @@ func (c accessCase) id(policy int64) int64 {
 	return policy
 }
 
-var (
-	policyCases = []accessCase{
-		{http.MethodGet, "/replication/policies/{id}", nil, "replication-policy", "read", "", false},
-		{http.MethodDelete, "/replication/policies/{id}", nil, "replication-policy", "delete", "DeletePolicy", false},
-		{http.MethodPut, "/replication/policies/{id}", pullPolicy("p/moved"), "replication-policy", "update", "UpdatePolicy", false},
-		{http.MethodPost, "/replication/executions", map[string]string{"policy_id": "{id}"}, "replication", "create", "Start", false},
-		{http.MethodGet, "/replication/executions?policy_id={id}", nil, "replication", "list", "ListExecutions", false},
-	}
-	executionCases = []accessCase{
-		{http.MethodPut, "/replication/executions/{id}", nil, "replication", "create", "Stop", true},
-		{http.MethodGet, "/replication/executions/{id}", nil, "replication", "read", "", true},
-		{http.MethodGet, "/replication/executions/{id}/tasks", nil, "replication", "list", "ListTasks", true},
-		{http.MethodGet, "/replication/executions/{id}/tasks/1/log", nil, "replication", "read", "GetTaskLog", true},
-	}
-	allCases = slices.Concat(policyCases, executionCases)
-)
+var allCases = []accessCase{
+	{method: http.MethodGet, path: "/replication/policies/{id}", resource: "replication-policy", action: "read"},
+	{method: http.MethodDelete, path: "/replication/policies/{id}", resource: "replication-policy", action: "delete", calls: "DeletePolicy"},
+	{method: http.MethodPut, path: "/replication/policies/{id}", body: pullPolicy("p/moved"), resource: "replication-policy", action: "update", calls: "UpdatePolicy"},
+	{method: http.MethodPost, path: "/replication/executions", body: map[string]string{"policy_id": "{id}"}, resource: "replication", action: "create", calls: "Start"},
+	{method: http.MethodGet, path: "/replication/executions?policy_id={id}", resource: "replication", action: "list", calls: "ListExecutions"},
+	{method: http.MethodPut, path: "/replication/executions/{id}", resource: "replication", action: "create", calls: "Stop", onExecution: true},
+	{method: http.MethodGet, path: "/replication/executions/{id}", resource: "replication", action: "read", onExecution: true},
+	{method: http.MethodGet, path: "/replication/executions/{id}/tasks", resource: "replication", action: "list", calls: "ListTasks", onExecution: true},
+	{method: http.MethodGet, path: "/replication/executions/{id}/tasks/1/log", resource: "replication", action: "read", calls: "GetTaskLog", onExecution: true},
+}
 
 func (s *replicationAccessTestSuite) do(c accessCase, id int64) *http.Response {
 	path := strings.ReplaceAll(c.path, "{id}", strconv.FormatInt(id, 10))
@@ -468,8 +463,7 @@ func (s *replicationAccessTestSuite) TestListAsProjectRobotIsForbidden() {
 	s.False(s.called("ListPolicies"))
 }
 
-func (s *replicationAccessTestSuite) TestListAsAnotherCallerIsForbidden() {
-	s.Security.On("Name").Return("local")
+func (s *replicationAccessTestSuite) TestListAsNonRobotIsForbidden() {
 	s.grant("/project/7/replication-policy", "list")
 
 	_, res := s.listPolicies("/replication/policies")

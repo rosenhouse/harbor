@@ -16,8 +16,10 @@ package image // nolint:revive
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +28,8 @@ import (
 	"github.com/docker/distribution/manifest/manifestlist"
 	"github.com/docker/distribution/manifest/schema1"
 	"github.com/docker/distribution/manifest/schema2"
+	"github.com/docker/distribution/reference"
+	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
 	common_http "github.com/goharbor/harbor/src/common/http"
@@ -81,10 +85,11 @@ func factory(logger trans.Logger, stopFunc trans.StopFunc) (trans.Transfer, erro
 }
 
 type transfer struct {
-	logger    trans.Logger
-	isStopped trans.StopFunc
-	src       adapter.ArtifactRegistry
-	dst       adapter.ArtifactRegistry
+	logger     trans.Logger
+	isStopped  trans.StopFunc
+	src        adapter.ArtifactRegistry
+	dst        adapter.ArtifactRegistry
+	dstIsLocal bool
 }
 
 func (t *transfer) Transfer(src *model.Resource, dst *model.Resource, opts *trans.Options) error {
@@ -147,6 +152,7 @@ func (t *transfer) initialize(src *model.Resource, dst *model.Resource) error {
 		return err
 	}
 	t.dst = dstReg
+	t.dstIsLocal = dst.Registry.Credential != nil && dst.Registry.Credential.Type == model.CredentialTypeSecret
 	t.logger.Infof("client for destination registry [type: %s, URL: %s, insecure: %v] created",
 		dst.Registry.Type, dst.Registry.URL, dst.Registry.Insecure)
 
@@ -207,7 +213,19 @@ func (t *transfer) copy(src *repository, dst *repository, override bool, opts *t
 	return nil
 }
 
+var tagRe = regexp.MustCompile("^" + reference.TagRegexp.String() + "$")
+
+// validReference reports whether a registry URL keeps the tag or digest intact.
+func validReference(ref string) bool {
+	return tagRe.MatchString(ref) || digest.Digest(ref).Validate() == nil
+}
+
 func (t *transfer) copyArtifact(srcRepo, srcRef, dstRepo, dstRef string, override bool, opts *trans.Options) error {
+	for _, ref := range []string{srcRef, dstRef} {
+		if !validReference(ref) {
+			return fmt.Errorf("invalid tag or digest %q", ref)
+		}
+	}
 	t.logger.Infof("copying %s:%s(source registry) to %s:%s(destination registry)...",
 		srcRepo, srcRef, dstRepo, dstRef)
 	// pull the manifest from the source registry
@@ -258,6 +276,9 @@ func (t *transfer) copyArtifact(srcRepo, srcRef, dstRepo, dstRef string, overrid
 
 // copy the content from source registry to destination according to its media type
 func (t *transfer) copyContent(content distribution.Descriptor, srcRepo, dstRepo string, opts *trans.Options) error {
+	if err := content.Digest.Validate(); err != nil {
+		return fmt.Errorf("invalid digest %q: %v", content.Digest, err)
+	}
 	digest := content.Digest.String()
 	switch content.MediaType {
 	// when the media type of pulled manifest is index,
@@ -347,8 +368,8 @@ func (t *transfer) tryMountBlob(_, dstRepo, digest string) (bool, error) {
 		t.logger.Errorf("failed to check whether the blob %s can be mounted on the destination registry: %v", digest, err)
 		return false, err
 	}
-	// Harbor authorizes a local mount as the job service, which can read every project.
-	if mount && sameProject(repository, dstRepo) {
+	// Harbor authorizes a mount into itself as the job service, which can read every project.
+	if mount && (!t.dstIsLocal || sameProject(repository, dstRepo)) {
 		if err = t.dst.MountBlob(repository, digest, dstRepo); err != nil {
 			t.logger.Errorf("failed to mount the blob %s on the destination registry: %v", digest, err)
 			return false, err
