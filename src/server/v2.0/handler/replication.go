@@ -24,6 +24,8 @@ import (
 	"github.com/go-openapi/strfmt"
 
 	"github.com/goharbor/harbor/src/common/rbac"
+	"github.com/goharbor/harbor/src/common/security"
+	robotSec "github.com/goharbor/harbor/src/common/security/robot"
 	"github.com/goharbor/harbor/src/controller/replication"
 	repctlmodel "github.com/goharbor/harbor/src/controller/replication/model"
 	"github.com/goharbor/harbor/src/jobservice/job"
@@ -266,7 +268,7 @@ func (r *replicationAPI) UpdateReplicationPolicy(ctx context.Context, params ope
 
 func (r *replicationAPI) ListReplicationPolicies(ctx context.Context, params operation.ListReplicationPoliciesParams) middleware.Responder {
 	systemErr := r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplicationPolicy)
-	if systemErr != nil && !errors.IsErr(systemErr, errors.ForbiddenCode) {
+	if systemErr != nil && (!errors.IsErr(systemErr, errors.ForbiddenCode) || !isSystemRobot(ctx)) {
 		return r.SendError(ctx, systemErr)
 	}
 	query, err := r.BuildQuery(ctx, params.Q, params.Sort, params.Page, params.PageSize)
@@ -335,11 +337,23 @@ func (r *replicationAPI) listProjectPolicies(ctx context.Context, query *q.Query
 	return result, nil
 }
 
+// isSystemRobot reports whether the caller is a system-level robot.
+// Only these robots can hold replication permissions on projects.
+func isSystemRobot(ctx context.Context) bool {
+	sc, _ := security.FromContext(ctx)
+	robot, ok := sc.(*robotSec.SecurityContext)
+	return ok && robot.User().IsSysLevel()
+}
+
 func page[T any](items []T, number, size int64) []T {
 	if size <= 0 {
 		return items
 	}
-	start := min(max(number-1, 0)*size, int64(len(items)))
+	skip := max(number-1, 0)
+	if skip > int64(len(items))/size {
+		return nil
+	}
+	start := skip * size
 	return items[start:min(start+size, int64(len(items)))]
 }
 
@@ -406,7 +420,7 @@ func (r *replicationAPI) ListReplicationExecutions(ctx context.Context, params o
 		err = r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplication)
 	}
 	if errors.IsNotFoundErr(err) {
-		// Only callers with the system permission see the executions of a deleted policy.
+		// A missing policy has no executions.
 		return operation.NewListReplicationExecutionsOK().WithXTotalCount(0).WithPayload([]*models.ReplicationExecution{})
 	}
 	if err != nil {

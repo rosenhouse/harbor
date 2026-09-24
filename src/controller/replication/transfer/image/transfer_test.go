@@ -117,6 +117,33 @@ func (f *fakeRegistry) ListReferrers(repository, digest string, rawQuery string)
 	return nil, nil, nil
 }
 
+type mountingRegistry struct {
+	fakeRegistry
+	candidate string
+	mounted   bool
+}
+
+func (m *mountingRegistry) CanBeMount(string) (bool, string, error) {
+	return true, m.candidate, nil
+}
+
+func (m *mountingRegistry) MountBlob(string, string, string) error {
+	m.mounted = true
+	return nil
+}
+
+func TestTryMountBlobOnlyFromTheDestinationProject(t *testing.T) {
+	for candidate, mounts := range map[string]bool{"p/other": true, "q/secret": false, "p2/secret": false} {
+		dst := &mountingRegistry{candidate: candidate}
+		tr := &transfer{logger: log.DefaultLogger(), isStopped: func() bool { return false }, dst: dst}
+
+		mounted, err := tr.tryMountBlob("source", "p/x", "sha256:0")
+		require.NoError(t, err)
+		assert.Equal(t, mounts, mounted, candidate)
+		assert.Equal(t, mounts, dst.mounted, candidate)
+	}
+}
+
 func TestFactory(t *testing.T) {
 	tr, err := factory(nil, nil)
 	require.Nil(t, err)

@@ -15,7 +15,7 @@ defaults:
     working-directory: src
 
 jobs:
-  # Runs the tests of the packages that this fork changes. They need no database.
+  # This job tests the src packages that this fork changes. They need no database.
   test:
     runs-on: ubuntu-latest
     steps:

@@ -17,8 +17,12 @@ package flow
 import (
 	"fmt"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/docker/distribution/reference"
+	"github.com/opencontainers/go-digest"
 
 	repctlmodel "github.com/goharbor/harbor/src/controller/replication/model"
 	"github.com/goharbor/harbor/src/lib/errors"
@@ -87,6 +91,9 @@ func assembleDestinationResources(resources []*model.Resource,
 	policy *repctlmodel.Policy, dstRepoComponentPathType string) ([]*model.Resource, error) {
 	var result []*model.Resource
 	for _, resource := range resources {
+		if err := validateReferences(resource.Metadata); err != nil {
+			return nil, err
+		}
 		name, err := replaceNamespace(resource.Metadata.Repository.Name, policy.DestNamespace, policy.DestNamespaceReplaceCount, dstRepoComponentPathType)
 		if err != nil {
 			return nil, err
@@ -112,6 +119,30 @@ func assembleDestinationResources(resources []*model.Resource,
 	}
 	log.Debug("assemble the destination resources completed")
 	return result, nil
+}
+
+var tagRe = regexp.MustCompile("^" + reference.TagRegexp.String() + "$")
+
+// validateReferences rejects tags and digests that a registry URL would misread.
+func validateReferences(metadata *model.ResourceMetadata) error {
+	tags := slices.Clone(metadata.Vtags)
+	for _, artifact := range metadata.Artifacts {
+		tags = append(tags, artifact.Tags...)
+		if len(artifact.Tags) > 0 || artifact.Digest == "" {
+			continue
+		}
+		if _, err := digest.Parse(artifact.Digest); err != nil {
+			return errors.New(nil).WithCode(errors.BadRequestCode).
+				WithMessagef("the repository %q has an invalid digest %q", metadata.Repository.Name, artifact.Digest)
+		}
+	}
+	for _, tag := range tags {
+		if !tagRe.MatchString(tag) {
+			return errors.New(nil).WithCode(errors.BadRequestCode).
+				WithMessagef("the repository %q has an invalid tag %q", metadata.Repository.Name, tag)
+		}
+	}
+	return nil
 }
 
 // do the prepare work for pushing/uploading the resources: create the namespace or repository

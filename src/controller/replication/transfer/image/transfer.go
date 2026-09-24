@@ -347,7 +347,8 @@ func (t *transfer) tryMountBlob(_, dstRepo, digest string) (bool, error) {
 		t.logger.Errorf("failed to check whether the blob %s can be mounted on the destination registry: %v", digest, err)
 		return false, err
 	}
-	if mount {
+	// Harbor authorizes a local mount as the job service, which can read every project.
+	if mount && sameProject(repository, dstRepo) {
 		if err = t.dst.MountBlob(repository, digest, dstRepo); err != nil {
 			t.logger.Errorf("failed to mount the blob %s on the destination registry: %v", digest, err)
 			return false, err
@@ -357,6 +358,10 @@ func (t *transfer) tryMountBlob(_, dstRepo, digest string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func sameProject(repository1, repository2 string) bool {
+	return strings.Split(repository1, "/")[0] == strings.Split(repository2, "/")[0]
 }
 
 // copy the layer or artifact config from the source registry to destination

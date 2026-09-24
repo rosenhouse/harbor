@@ -115,6 +115,33 @@ func (s *stageTestSuite) TestAssembleDestinationResources() {
 	s.Equal("latest", res[0].Metadata.Vtags[0])
 }
 
+func (s *stageTestSuite) TestAssembleDestinationResourcesRejectsInvalidReferences() {
+	policy := &repctlmodel.Policy{DestRegistry: &model.Registry{}, DestNamespace: "p"}
+	for _, metadata := range []*model.ResourceMetadata{
+		{Vtags: []string{"a/b"}},
+		{Artifacts: []*model.Artifact{{Tags: []string{"latest", "../../../victim/img/manifests/latest"}}}},
+		{Artifacts: []*model.Artifact{{Tags: []string{"latest?x=y"}}}},
+		{Artifacts: []*model.Artifact{{Digest: "../x"}}},
+	} {
+		metadata.Repository = &model.Repository{Name: "library/img"}
+		_, err := assembleDestinationResources([]*model.Resource{{Metadata: metadata}}, policy, "")
+		s.Error(err, "%+v", metadata)
+	}
+}
+
+func (s *stageTestSuite) TestAssembleDestinationResourcesAcceptsTagsAndDigests() {
+	policy := &repctlmodel.Policy{DestRegistry: &model.Registry{}, DestNamespace: "p"}
+	metadata := &model.ResourceMetadata{
+		Repository: &model.Repository{Name: "library/img"},
+		Artifacts: []*model.Artifact{
+			{Tags: []string{"v1.0_rc-1", "latest"}},
+			{Digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		},
+	}
+	_, err := assembleDestinationResources([]*model.Resource{{Metadata: metadata}}, policy, "")
+	s.NoError(err)
+}
+
 func (s *stageTestSuite) TestReplaceNamespace() {
 	// empty namespace
 	var (
