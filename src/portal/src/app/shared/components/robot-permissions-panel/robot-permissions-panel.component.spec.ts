@@ -58,9 +58,8 @@ describe('RobotPermissionsPanelComponent', () => {
     });
 });
 
-describe('RobotPermissionsPanelComponent select all', () => {
-    const candidate = { resource: 'repository', action: 'pull' };
-    const nonCandidate = { resource: 'replication-policy', action: 'create' };
+describe('RobotPermissionsPanelComponent dropdown in a datagrid', () => {
+    const menuHeight = 200;
     let panel: RobotPermissionsPanelComponent;
     beforeEach(async () => {
         await TestBed.configureTestingModule({
@@ -70,16 +69,30 @@ describe('RobotPermissionsPanelComponent select all', () => {
         panel = TestBed.createComponent(
             RobotPermissionsPanelComponent
         ).componentInstance;
-        panel.candidatePermissions = [candidate];
-        panel.initCandidates();
-        panel.permissionsModel = [nonCandidate];
+        panel.dropdownMenuAppeared = true;
+        panel.dropdownMenu = {
+            el: {
+                nativeElement: { offsetWidth: 300, offsetHeight: menuHeight },
+            },
+        };
     });
 
-    it('keeps permissions that are not candidates', () => {
-        panel.selectAllOrUnselectAll();
-        expect(panel.permissionsModel).toEqual([nonCandidate, candidate]);
-        panel.selectAllOrUnselectAll();
-        expect(panel.permissionsModel).toEqual([nonCandidate]);
+    function translateYForTriggerAt(y: number): string {
+        panel.dropdown = {
+            nativeElement: { getBoundingClientRect: () => ({ x: 400, y }) },
+        };
+        return panel.getTransform().split(' ')[1];
+    }
+
+    it('centers the menu on its trigger', () => {
+        expect(translateYForTriggerAt(300)).toEqual('translateY(200px)');
+    });
+
+    it('keeps the menu inside the viewport', () => {
+        expect(translateYForTriggerAt(10)).toEqual('translateY(0px)');
+        expect(translateYForTriggerAt(window.innerHeight - 10)).toEqual(
+            `translateY(${window.innerHeight - menuHeight}px)`
+        );
     });
 });
 
