@@ -23,6 +23,7 @@ import { ProjectService } from '../../../../../../ng-swagger-gen/services/projec
 import { PermissionSelectPanelModes } from '../../../../shared/components/robot-permissions-panel/robot-permissions-panel.component';
 import { RobotPermission } from '../../../../../../ng-swagger-gen/models/robot-permission';
 import { Permissions } from '../../../../../../ng-swagger-gen/models/permissions';
+import { Permission } from '../../../../../../ng-swagger-gen/models/permission';
 
 const FIRST_PROJECTS_PAGE_SIZE: number = 100;
 
@@ -43,8 +44,14 @@ export class ListAllProjectsComponent implements OnInit {
     showSelectAll: boolean = true;
     myNameFilterValue: string;
 
+    candidatePermissions: Permission[] = [];
     @Input()
-    robotMetadata: Permissions;
+    set robotMetadata(metadata: Permissions) {
+        this.candidatePermissions = [
+            ...(metadata?.project ?? []),
+            ...(metadata?.system_robot_project ?? []),
+        ];
+    }
 
     initialAccess: Access[] = [];
     selectedProjectPermissionMap: { [key: string]: Access[] } = {};

@@ -72,39 +72,23 @@ func (p *permissionsAPI) GetPermissions(ctx context.Context, _ permissions.GetPe
 	}
 
 	provider := rbac.GetPermissionProvider()
-	sysPermissions := make([]*types.Policy, 0)
-	proPermissions := provider.GetPermissions(rbac.ScopeProject)
+	res := &models.Permissions{Project: toPermissionModels(provider.GetPermissions(rbac.ScopeProject))}
 	if isSystemAdmin {
 		// project admin cannot see the system level permissions
-		sysPermissions = provider.GetPermissions(rbac.ScopeSystem)
+		res.System = toPermissionModels(provider.GetPermissions(rbac.ScopeSystem))
+		res.SystemRobotProject = toPermissionModels(rbac.SystemRobotProjectPolicies)
 	}
 
-	return permissions.NewGetPermissionsOK().WithPayload(p.convertPermissions(sysPermissions, proPermissions))
+	return permissions.NewGetPermissionsOK().WithPayload(res)
 }
 
-func (p *permissionsAPI) convertPermissions(system, project []*types.Policy) *models.Permissions {
-	res := &models.Permissions{}
-	if len(system) > 0 {
-		var sysPermission []*models.Permission
-		for _, item := range system {
-			sysPermission = append(sysPermission, &models.Permission{
-				Resource: item.Resource.String(),
-				Action:   item.Action.String(),
-			})
-		}
-		res.System = sysPermission
+func toPermissionModels(policies []*types.Policy) []*models.Permission {
+	var res []*models.Permission
+	for _, item := range policies {
+		res = append(res, &models.Permission{
+			Resource: item.Resource.String(),
+			Action:   item.Action.String(),
+		})
 	}
-
-	if len(project) > 0 {
-		var proPermission []*models.Permission
-		for _, item := range project {
-			proPermission = append(proPermission, &models.Permission{
-				Resource: item.Resource.String(),
-				Action:   item.Action.String(),
-			})
-		}
-		res.Project = proPermission
-	}
-
 	return res
 }

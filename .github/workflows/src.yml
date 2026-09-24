@@ -30,3 +30,24 @@ jobs:
           --template-dir=../tools/swagger/templates --exclude-main
           --additional-initialism=CVE --additional-initialism=GC --additional-initialism=OIDC
       - run: go test ./common/rbac/... ./controller/replication/... ./server/v2.0/handler/...
+
+  # This job tests the portal specs that this fork changes.
+  portal:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/portal
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: src/portal/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx ng lint
+      - run: >-
+          npx ng test --watch=false --no-progress --browsers=ChromeHeadlessNoSandbox
+          --include='src/app/shared/components/robot-permissions-panel/**/*.spec.ts'
+          --include='src/app/base/left-side-nav/system-robot-accounts/**/*.spec.ts'
+          --include='src/app/base/project/robot-account/**/*.spec.ts'

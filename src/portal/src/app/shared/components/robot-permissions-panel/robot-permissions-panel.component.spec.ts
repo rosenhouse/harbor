@@ -58,6 +58,31 @@ describe('RobotPermissionsPanelComponent', () => {
     });
 });
 
+describe('RobotPermissionsPanelComponent select all', () => {
+    const candidate = { resource: 'repository', action: 'pull' };
+    const nonCandidate = { resource: 'replication-policy', action: 'create' };
+    let panel: RobotPermissionsPanelComponent;
+    beforeEach(async () => {
+        await TestBed.configureTestingModule({
+            imports: [SharedTestingModule],
+            declarations: [RobotPermissionsPanelComponent],
+        }).compileComponents();
+        panel = TestBed.createComponent(
+            RobotPermissionsPanelComponent
+        ).componentInstance;
+        panel.candidatePermissions = [candidate];
+        panel.initCandidates();
+        panel.permissionsModel = [nonCandidate];
+    });
+
+    it('keeps permissions that are not candidates', () => {
+        panel.selectAllOrUnselectAll();
+        expect(panel.permissionsModel).toEqual([nonCandidate, candidate]);
+        panel.selectAllOrUnselectAll();
+        expect(panel.permissionsModel).toEqual([nonCandidate]);
+    });
+});
+
 // mock a TestHostComponent for RobotPermissionsPanelComponent
 @Component({
     template: `

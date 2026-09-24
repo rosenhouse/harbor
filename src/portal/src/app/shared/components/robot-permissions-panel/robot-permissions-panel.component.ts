@@ -147,10 +147,11 @@ export class RobotPermissionsPanelComponent implements OnChanges, DoCheck {
     }
 
     selectAllOrUnselectAll() {
-        if (this.isAllSelected()) {
-            this.permissionsModel = [];
-        } else {
-            this.permissionsModel = [];
+        const selectAll = !this.isAllSelected();
+        this.permissionsModel = (this.permissionsModel ?? []).filter(
+            item => !isCandidate(this.candidatePermissions, item)
+        );
+        if (selectAll) {
             this.candidateActions.forEach(action => {
                 this.candidateResources.forEach(resource => {
                     if (this.isCandidate(resource, action)) {

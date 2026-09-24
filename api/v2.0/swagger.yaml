@@ -9917,6 +9917,11 @@ definitions:
         description: The project level permissions
         items:
           $ref: '#/definitions/Permission'
+      system_robot_project:
+        type: array
+        description: The project level permissions that only system level robots can hold
+        items:
+          $ref: '#/definitions/Permission'
   OIDCCliSecretReq:
     type: object
     properties:
