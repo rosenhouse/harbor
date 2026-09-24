@@ -78,9 +78,11 @@ export class RobotPermissionsPanelComponent implements OnChanges, DoCheck {
             const width = this.dropdownMenu.el.nativeElement.offsetWidth;
             const height = this.dropdownMenu.el.nativeElement.offsetHeight;
             const bcr = this.dropdown.nativeElement.getBoundingClientRect();
-            return `translateX(${bcr.x - width}px) translateY(${
-                bcr.y - height / 2
-            }px)`;
+            const y = Math.max(
+                0,
+                Math.min(bcr.y - height / 2, window.innerHeight - height)
+            );
+            return `translateX(${bcr.x - width}px) translateY(${y}px)`;
         }
         return 'unset';
     }

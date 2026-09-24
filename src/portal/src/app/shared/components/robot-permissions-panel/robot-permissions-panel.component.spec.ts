@@ -58,6 +58,44 @@ describe('RobotPermissionsPanelComponent', () => {
     });
 });
 
+describe('RobotPermissionsPanelComponent dropdown in a datagrid', () => {
+    const menuHeight = 200;
+    let panel: RobotPermissionsPanelComponent;
+    beforeEach(async () => {
+        await TestBed.configureTestingModule({
+            imports: [SharedTestingModule],
+            declarations: [RobotPermissionsPanelComponent],
+        }).compileComponents();
+        panel = TestBed.createComponent(
+            RobotPermissionsPanelComponent
+        ).componentInstance;
+        panel.dropdownMenuAppeared = true;
+        panel.dropdownMenu = {
+            el: {
+                nativeElement: { offsetWidth: 300, offsetHeight: menuHeight },
+            },
+        };
+    });
+
+    function translateYForTriggerAt(y: number): string {
+        panel.dropdown = {
+            nativeElement: { getBoundingClientRect: () => ({ x: 400, y }) },
+        };
+        return panel.getTransform().split(' ')[1];
+    }
+
+    it('centers the menu on its trigger', () => {
+        expect(translateYForTriggerAt(300)).toEqual('translateY(200px)');
+    });
+
+    it('keeps the menu inside the viewport', () => {
+        expect(translateYForTriggerAt(10)).toEqual('translateY(0px)');
+        expect(translateYForTriggerAt(window.innerHeight - 10)).toEqual(
+            `translateY(${window.innerHeight - menuHeight}px)`
+        );
+    });
+});
+
 // mock a TestHostComponent for RobotPermissionsPanelComponent
 @Component({
     template: `

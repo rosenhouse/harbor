@@ -15,6 +15,8 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { ListAllProjectsComponent } from './list-all-projects.component';
 import { Project } from '../../../../../../ng-swagger-gen/models/project';
 import { SharedTestingModule } from '../../../../shared/shared.module';
+import { By } from '@angular/platform-browser';
+import { RobotPermissionsPanelComponent } from '../../../../shared/components/robot-permissions-panel/robot-permissions-panel.component';
 
 describe('ListAllProjectsComponent', () => {
     let component: ListAllProjectsComponent;
@@ -53,5 +55,29 @@ describe('ListAllProjectsComponent', () => {
         await fixture.whenStable();
         const rows = fixture.nativeElement.querySelectorAll('clr-dg-row');
         expect(rows.length).toEqual(3);
+    });
+    it('should offer permissions that only system robots can hold', async () => {
+        const projectPermission = { resource: 'repository', action: 'pull' };
+        const systemRobotProjectPermission = {
+            resource: 'replication-policy',
+            action: 'create',
+        };
+        component.robotMetadata = {
+            project: [projectPermission],
+            system_robot_project: [systemRobotProjectPermission],
+        };
+        component.projects = [project1];
+        fixture.detectChanges();
+        await fixture.whenStable();
+        const panels = fixture.debugElement.queryAll(
+            By.directive(RobotPermissionsPanelComponent)
+        );
+        expect(panels.length).toEqual(2);
+        panels.forEach(panel => {
+            expect(
+                (panel.componentInstance as RobotPermissionsPanelComponent)
+                    .candidatePermissions
+            ).toEqual([projectPermission, systemRobotProjectPermission]);
+        });
     });
 });

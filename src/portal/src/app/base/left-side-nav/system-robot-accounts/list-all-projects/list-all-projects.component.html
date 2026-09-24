@@ -9,7 +9,7 @@
             [mode]="PermissionSelectPanelModes.DROPDOWN"
             [(permissionsModel)]="initialAccess"
             (permissionsModelChange)="resetAccess(initialAccess)"
-            [candidatePermissions]="robotMetadata?.project">
+            [candidatePermissions]="candidatePermissions">
             <button class="btn btn-secondary btn-sm m-0">
                 {{ 'SYSTEM_ROBOT.RESET_PERMISSION' | translate }}
                 <clr-icon size="12" shape="caret" direction="down"></clr-icon>
@@ -50,7 +50,7 @@
                 [usedInDatagrid]="true"
                 [mode]="PermissionSelectPanelModes.DROPDOWN"
                 [(permissionsModel)]="selectedProjectPermissionMap[p.name]"
-                [candidatePermissions]="robotMetadata?.project">
+                [candidatePermissions]="candidatePermissions">
                 <button class="btn btn-link btn-sm m-0 p-0">
                     {{ selectedProjectPermissionMap[p.name]?.length || 0 }}
                     {{ 'SYSTEM_ROBOT.PERMISSIONS' | translate }}

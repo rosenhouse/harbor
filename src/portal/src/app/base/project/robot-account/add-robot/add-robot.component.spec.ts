@@ -20,6 +20,8 @@ import { RobotService } from '../../../../../../ng-swagger-gen/services/robot.se
 import { OperationService } from '../../../../shared/components/operation/operation.service';
 import { NO_ERRORS_SCHEMA } from '@angular/core';
 import { SharedTestingModule } from '../../../../shared/shared.module';
+import { By } from '@angular/platform-browser';
+import { RobotPermissionsPanelComponent } from '../../../../shared/components/robot-permissions-panel/robot-permissions-panel.component';
 
 describe('AddRobotComponent', () => {
     let component: AddRobotComponent;
@@ -57,5 +59,24 @@ describe('AddRobotComponent', () => {
 
     it('should create', () => {
         expect(component).toBeTruthy();
+    });
+    it('should not offer permissions that only system robots can hold', async () => {
+        const projectPermission = { resource: 'repository', action: 'pull' };
+        component.robotMetadata = {
+            project: [projectPermission],
+            system_robot_project: [
+                { resource: 'replication-policy', action: 'create' },
+            ],
+        };
+        component.addRobotOpened = true;
+        fixture.detectChanges();
+        await fixture.whenStable();
+        const panel = fixture.debugElement.query(
+            By.directive(RobotPermissionsPanelComponent)
+        );
+        expect(
+            (panel.componentInstance as RobotPermissionsPanelComponent)
+                .candidatePermissions
+        ).toEqual([projectPermission]);
     });
 });
