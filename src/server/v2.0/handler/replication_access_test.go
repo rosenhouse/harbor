@@ -504,15 +504,23 @@ func (s *replicationAccessTestSuite) TestListFailsWhenTheProjectLookupFails() {
 	s.Equal(http.StatusInternalServerError, res.StatusCode)
 }
 
+// A robot that can list policies in no project gets 403, so that it can't mistake lost permissions for no policies.
 func (s *replicationAccessTestSuite) TestListWithoutPermission() {
+	s.grant("/project/7/replication-policy", "read")
+
+	_, res := s.listPolicies("/replication/policies")
+	s.Equal(http.StatusForbidden, res.StatusCode)
+	s.ctl.AssertNotCalled(s.T(), "ListPolicies", mock.Anything, mock.Anything)
+}
+
+func (s *replicationAccessTestSuite) TestListWithPermissionOnAnotherProject() {
 	s.ctl.On("ListPolicies", mock.Anything, mock.Anything).Return([]*repctlmodel.Policy{storedPull(1, "p")}, nil)
 
-	s.grant("/project/7/replication-policy", "read")
+	s.grant("/project/8/replication-policy", "list")
 
 	policies, res := s.listPolicies("/replication/policies")
 	s.Equal(http.StatusOK, res.StatusCode)
 	s.Empty(policies)
-	s.Equal("0", res.Header.Get("X-Total-Count"))
 }
 
 func (s *replicationAccessTestSuite) TestListWithSystemPermission() {

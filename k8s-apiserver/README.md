@@ -17,7 +17,7 @@ Read the [threat model](docs/threat-model.md) before you install.
 ## Prerequisites
 
 - A Kubernetes 1.25 or later cluster with the aggregation layer enabled, and cluster-admin access to it.
-- Harbor 2.2 or later, reachable over HTTPS from the cluster's pods. The e2e tests use Helm chart 1.19.2 (Harbor 2.15.2), with core and jobservice from this fork.
+- Harbor 2.2 or later, reachable over HTTPS from the cluster's pods. The e2e tests use Helm chart 1.19.2 (Harbor 2.15.2), with core and jobservice from this fork, and don't test upstream core.
 - A Harbor project whose name is a valid label value (at most 63 characters).
 - `git`, `kubectl`, `jq`, and Docker with Buildx.
 - A registry that the cluster can pull from.
@@ -313,9 +313,8 @@ Select by field instead.
 ## Enable replications
 
 Replications let Kubernetes users copy images into the project from registry endpoints that you allow.
-They are off by default, because they need a system-level Harbor robot account.
-With Harbor from this fork, the robot can pull from any registry endpoint into the project, and start, stop, or delete any replication policy that pulls into it.
-With upstream Harbor, it can replicate between any project and any endpoint.
+They are off by default, because they need a system-level Harbor robot account that can pull from any registry endpoint into the project.
+With upstream Harbor, the robot can replicate between any project and any endpoint.
 Anyone who can read its Secret, or create pods in `harbor-apiserver`, can do the same.
 Users who can create replications can copy anything that an allowed endpoint's credentials can read into the project, which every labeled namespace shares.
 Read the [threat model](docs/threat-model.md#the-replication-robot-controls-pulls-into-the-project) before you enable them.
@@ -338,8 +337,12 @@ Give the robot only these permissions:
 | Project | Replication | List, Create |
 
 The server lists registry endpoints to find their IDs.
-Only Harbor core from this fork's `agg` branch lets a system-level robot hold replication permissions on a project.
+Grant the project permissions on the `project` of Secret `harbor-apiserver`.
+On another project, the server sees no replications, and namespaces finish deleting while their policies keep running.
+
+Only Harbor core from this fork lets a system-level robot hold replication permissions on a project.
 Run jobservice from the fork too, or a pull can mount any blob in Harbor that the source manifest names.
+The fork's core migrates Harbor's database to the schema of Harbor 2.16, and the core of an older release can't use it.
 
 Harbor's UI can't grant the project permissions yet ([issue 31](https://github.com/rosenhouse/harbor/issues/31)), and editing the robot in the UI drops them.
 So create the robot through the API, as a Harbor system administrator.
@@ -370,6 +373,9 @@ jq -r .secret "$dir/robot.json" >"$dir/password"
 ```
 
 Upstream Harbor accepts replication permissions only at the system level, so move the project entry's actions into the system entry.
+
+A robot that an earlier install created with system replication permissions keeps them.
+To narrow it, create a robot as above, replace the Secret's `username` and `password`, restart the pods, and delete the old robot.
 
 ### Create the replication Secret
 
@@ -512,7 +518,8 @@ The ownerReference only shows where the artifacts came from. Deleting the replic
 - Removing a namespace's label, an endpoint from `registries`, or the component hides the affected replications, but their schedules keep running in Harbor.
   Delete the replications first.
 - A policy that the server hides blocks its namespace and name until a Harbor administrator deletes it.
-  Examples are a policy from an earlier namespace of the same name, one that someone changed in Harbor, and one that pulls into another project (see the [threat model](docs/threat-model.md#removing-the-label-leaves-replications-running)).
+  Examples are a policy from an earlier namespace of the same name, and one that someone changed in Harbor (see the [threat model](docs/threat-model.md#removing-the-label-leaves-replications-running)).
+  A policy with the same name that pulls into another project blocks it too, because Harbor hides that policy from the robot.
   Creating the replication fails with AlreadyExists, and the message names the policy.
 - The server needs Harbor 2.3 or later. Before Harbor 2.14, a run can start while the previous one is still running.
 - A schedule has 6 fields separated by single spaces: seconds, minutes, hours, day of month, month, and day of week, in UTC.

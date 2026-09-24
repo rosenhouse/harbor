@@ -15,11 +15,12 @@ export KUBECONFIG=${E2E_KUBECONFIG:-${TMPDIR:-/tmp}/$cluster.kubeconfig}
 
 harbor_build_log=$(mktemp)
 for component in core jobservice; do
+  # Without provenance, an unchanged build keeps its image ID.
   docker build ${ca_bundle:+--secret "id=ca-bundle,src=$ca_bundle"} --build-arg "harbor_image_version=$harbor_image_version" \
-    --target "$component" -t "harbor-$component:e2e" -f hack/e2e/harbor.Dockerfile .. || exit
+    --provenance=false --target "$component" -t "harbor-$component:e2e" -f hack/e2e/harbor.Dockerfile .. || exit
 done >"$harbor_build_log" 2>&1 &
 harbor_build=$!
-trap 'kill "$harbor_build" 2>/dev/null || true; rm -f "$harbor_build_log"' EXIT
+trap 'pkill -P "$harbor_build" 2>/dev/null || true; rm -f "$harbor_build_log"' EXIT
 
 if ! kind get clusters | grep -x "$cluster" >/dev/null; then
   kind create cluster --name "$cluster" --config hack/e2e/kind.yaml --wait 2m
@@ -33,7 +34,7 @@ kind export kubeconfig --name "$cluster"
 build_log=$(mktemp)
 docker build ${ca_bundle:+--secret "id=ca-bundle,src=$ca_bundle"} -t "$image" . >"$build_log" 2>&1 &
 build=$!
-trap 'kill "$harbor_build" "$build" 2>/dev/null || true; rm -f "$harbor_build_log" "$build_log"' EXIT
+trap 'pkill -P "$harbor_build" 2>/dev/null; kill "$build" 2>/dev/null || true; rm -f "$harbor_build_log" "$build_log"' EXIT
 
 # An interrupted TestHarborOutageIsServiceUnavailable leaves Harbor scaled down.
 if kubectl -n harbor get deployment harbor-nginx >/dev/null 2>&1; then

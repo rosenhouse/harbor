@@ -6,7 +6,7 @@ ARG harbor_image_version
 FROM golang:1.26.4 AS build
 WORKDIR /harbor/src
 COPY src/go.mod src/go.sum ./
-RUN --mount=type=secret,id=ca-bundle,required=false --mount=type=cache,target=/go/pkg/mod \
+RUN --mount=type=secret,id=ca-bundle,required=false \
     export SSL_CERT_FILE=$(test -f /run/secrets/ca-bundle && echo /run/secrets/ca-bundle || echo /etc/ssl/certs/ca-certificates.crt) && \
     go install github.com/go-swagger/go-swagger/cmd/swagger@v0.33.1 && \
     go mod download
@@ -17,7 +17,7 @@ RUN rm -rf server/v2.0/models server/v2.0/restapi && swagger generate server -q 
     --template-dir=../tools/swagger/templates --exclude-main \
     --additional-initialism=CVE --additional-initialism=GC --additional-initialism=OIDC
 COPY VERSION /harbor/
-RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -buildvcs=false -ldflags "-w -s -X github.com/goharbor/harbor/src/pkg/version.ReleaseVersion=$(cat ../VERSION)" -o /out/harbor_core ./core && \
     go build -buildvcs=false -ldflags "-w -s" -o /out/harbor_jobservice ./jobservice
 

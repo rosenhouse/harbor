@@ -433,7 +433,7 @@ func TestPolicyInAnotherProjectTakesTheName(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const want = "which the server can't read. If a retry fails, a Harbor administrator must delete it"
+	want := "policy " + policyPrefix(ns) + "taken, which the server can't read"
 	eventually(t, func() error {
 		_, err := apply(t, replicationManifest(ns, "taken", v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v1"}))
 		if err == nil || !strings.Contains(err.Error(), want) {

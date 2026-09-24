@@ -246,7 +246,7 @@ func TestCreateReplicationOverPolicyInAnotherProject(t *testing.T) {
 
 	_, err := r.Create(inNamespace("ns1"), replication("nginx"), nil, &metav1.CreateOptions{})
 
-	if !apierrors.IsAlreadyExists(err) || !strings.Contains(err.Error(), "policy k8s.proj.ns1.nginx") || !strings.Contains(err.Error(), "a Harbor administrator must delete it") {
+	if !apierrors.IsAlreadyExists(err) || !strings.Contains(err.Error(), "policy k8s.proj.ns1.nginx, which the server can't read") {
 		t.Errorf("got %v, want AlreadyExists that names the unreadable policy", err)
 	}
 }
@@ -861,18 +861,6 @@ func TestDeleteReplicationWhileAnOlderExecutionRuns(t *testing.T) {
 	}
 }
 
-func TestDeleteReplicationWhoseExecutionHarborDeletedBeforeTheStop(t *testing.T) {
-	r, h, _ := newReplications()
-	create(t, r, "ns1", replication("nginx"))
-	h.deleteStopped = true
-	if _, err := deleteReplication(r, "ns1", "nginx", nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := h.policy("k8s.proj.ns1.nginx"); ok {
-		t.Error("the policy remains")
-	}
-}
-
 func TestDeleteReplicationWhileItStops(t *testing.T) {
 	r, h, _ := newReplications()
 	create(t, r, "ns1", replication("nginx"))
@@ -999,6 +987,7 @@ func TestDeleteReplicationHarborErrors(t *testing.T) {
 	}{
 		{"ListRunningReplicationExecutions", harbor.ErrUnavailable, apierrors.IsServiceUnavailable},
 		{"StopReplicationExecution", harbor.ErrUnavailable, apierrors.IsServiceUnavailable},
+		{"StopReplicationExecution", harbor.ErrNotFound, apierrors.IsNotFound},
 		{"DeleteReplicationPolicy", harbor.ErrUnavailable, apierrors.IsServiceUnavailable},
 		{"DeleteReplicationPolicy", harbor.ErrNotFound, apierrors.IsNotFound},
 	} {

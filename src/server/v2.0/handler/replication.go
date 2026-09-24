@@ -28,6 +28,7 @@ import (
 	robotSec "github.com/goharbor/harbor/src/common/security/robot"
 	"github.com/goharbor/harbor/src/controller/replication"
 	repctlmodel "github.com/goharbor/harbor/src/controller/replication/model"
+	robotctl "github.com/goharbor/harbor/src/controller/robot"
 	"github.com/goharbor/harbor/src/jobservice/job"
 	"github.com/goharbor/harbor/src/lib/errors"
 	"github.com/goharbor/harbor/src/lib/q"
@@ -58,6 +59,23 @@ func fallsBackToProject(ctx context.Context, systemErr error) bool {
 	sc, _ := security.FromContext(ctx)
 	robot, ok := sc.(*robotSec.SecurityContext)
 	return errors.IsErr(systemErr, errors.ForbiddenCode) && ok && robot.User().IsSysLevel()
+}
+
+// holdsOnAProject reports whether the caller, a robot, holds the permission on any project.
+func holdsOnAProject(ctx context.Context, action rbac.Action, resource rbac.Resource) bool {
+	sc, _ := security.FromContext(ctx)
+	robot, _ := sc.(*robotSec.SecurityContext)
+	for _, p := range robot.User().Permissions {
+		if !strings.HasPrefix(p.Scope, robotctl.SCOPEPROJECT) {
+			continue
+		}
+		for _, a := range p.Access {
+			if a.Resource == resource && a.Action == action {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // requireAccess passes callers with the system permission, and system-level robots with the permission on
@@ -276,7 +294,7 @@ func (r *replicationAPI) UpdateReplicationPolicy(ctx context.Context, params ope
 
 func (r *replicationAPI) ListReplicationPolicies(ctx context.Context, params operation.ListReplicationPoliciesParams) middleware.Responder {
 	systemErr := r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplicationPolicy)
-	if systemErr != nil && !fallsBackToProject(ctx, systemErr) {
+	if systemErr != nil && !(fallsBackToProject(ctx, systemErr) && holdsOnAProject(ctx, rbac.ActionList, rbac.ResourceReplicationPolicy)) {
 		return r.SendError(ctx, systemErr)
 	}
 	query, err := r.BuildQuery(ctx, params.Q, params.Sort, params.Page, params.PageSize)

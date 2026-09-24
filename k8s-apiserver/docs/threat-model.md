@@ -207,7 +207,7 @@ Keep the front-proxy CA separate from the cluster CA, and set `--requestheader-a
 
 Harbor core from this fork lets a system-level robot hold replication permissions on a project ([replication.go](../../src/server/v2.0/handler/replication.go)).
 With them, the robot manages only the policies that pull from a registry endpoint into that project, and their executions.
-Core keeps each pull inside the project's namespace ([stage.go](../../src/controller/replication/flow/stage.go)), and jobservice from this fork keeps it from mounting blobs from other projects ([transfer.go](../../src/controller/replication/transfer/image/transfer.go)).
+Core keeps each pull inside the project ([stage.go](../../src/controller/replication/flow/stage.go)), and jobservice from this fork keeps it from mounting blobs from other projects ([transfer.go](../../src/controller/replication/transfer/image/transfer.go)).
 Harbor cannot limit the robot to one endpoint, or to a path in the project.
 With this fork, anyone with the robot's credentials can:
 
@@ -228,7 +228,11 @@ With them, anyone with the robot's credentials can also:
 - Pull into any project, or into a new project, which Harbor creates ([adapter.go](../../src/pkg/reg/adapter/harbor/base/adapter.go)).
 - Start, stop, or delete any replication policy, and read every policy's description.
 
-With upstream jobservice, a pull into the project can also copy any blob in Harbor that a source manifest names.
+With upstream jobservice, any pull into the project can copy any blob in Harbor that its source manifest names.
+So a replication creator who controls a source repository can copy blobs from private projects into the project.
+
+Policy names are unique across Harbor.
+So anyone who can create a policy in another project can take the name of a replication in this project, and block it until a Harbor administrator deletes that policy.
 
 The server uses the robot more narrowly ([replication_policy.go](../pkg/registry/replication_policy.go), [replications.go](../pkg/registry/replications.go)):
 
@@ -297,7 +301,7 @@ A Harbor administrator can find the policies by their name prefix, `<prefix>.<pr
 
 Each policy's description holds its replication's namespace, namespace UID, name, UID, labels, annotations, and spec, as JSON ([replication_policy.go](../pkg/registry/replication_policy.go)).
 After `kubectl apply`, the annotations include `kubectl.kubernetes.io/last-applied-configuration`, which repeats the object.
-Harbor system admins, and robots that can read replication policies, including the replication robot, can read the descriptions of the policies that they may read, in Harbor's UI under **Administration** > **Replications** or through its API.
+Harbor system admins, and robots that may read a policy, such as the replication robot, can read its description, in Harbor's UI under **Administration** > **Replications** or through its API.
 
 Mitigation: don't put secrets in a replication's labels or annotations.
 
@@ -324,6 +328,8 @@ The namespace stays Terminating until every delete succeeds.
 Listing a labeled namespace's replications calls Harbor, even when there are none.
 It lists only that namespace's policies, so other namespaces' replications cannot delay its deletion.
 So while Harbor is unavailable, or rejects the replication robot, such as after it expires, no labeled namespace can finish deleting.
+Harbor from this fork also rejects a robot that can list policies in no project.
+But if the robot's project permissions are on another project, the server sees no replications, and namespaces finish deleting while their policies keep running.
 
 Mitigations: track the replication robot's expiry.
 If Harbor cannot recover, removing a Terminating namespace's label lets it finish deleting, and leaves its policies in Harbor for a Harbor administrator to delete.

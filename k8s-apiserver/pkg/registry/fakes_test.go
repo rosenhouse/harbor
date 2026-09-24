@@ -167,9 +167,7 @@ type fakeReplicationHarbor struct {
 	busyDeletes int
 	// ignoreStops leaves stopped executions running, as Harbor does until their tasks stop.
 	ignoreStops bool
-	// deleteStopped deletes an execution when it is asked to stop, and returns ErrNotFound, as Harbor does after it deletes the execution.
-	deleteStopped bool
-	delay         time.Duration
+	delay       time.Duration
 	// onCreate runs when a policy is created.
 	onCreate func()
 	// lostReply stores a created policy, then fails with ErrUnavailable, as when Harbor's reply is lost.
@@ -409,10 +407,6 @@ func (f *fakeReplicationHarbor) StopReplicationExecution(ctx context.Context, id
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, e := range f.executions {
-		if e.ID == id && f.deleteStopped {
-			f.executions = slices.Delete(f.executions, i, i+1)
-			return harbor.ErrNotFound
-		}
 		if e.ID == id {
 			if !f.ignoreStops {
 				f.executions[i].Status = "Stopped"

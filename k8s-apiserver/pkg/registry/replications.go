@@ -257,7 +257,7 @@ func (r *Replications) create(ctx context.Context, obj *v1alpha1.HarborReplicati
 		}
 		// The robot can't read the policy, or Harbor deleted it after the conflict.
 		exists := apierrors.NewAlreadyExists(replicationsResource, obj.Name)
-		exists.ErrStatus.Message += fmt.Sprintf(" as Harbor replication policy %s, which the server can't read. If a retry fails, a Harbor administrator must delete it", p.Name)
+		exists.ErrStatus.Message += fmt.Sprintf(" as Harbor replication policy %s, which the server can't read, or which Harbor has since deleted. If a retry fails, a Harbor administrator must delete it", p.Name)
 		return nil, rest.CheckGeneratedNameError(ctx, r.strategy, exists, obj)
 	case errors.Is(err, harbor.ErrBadRequest):
 		klog.ErrorS(err, "Harbor rejected a replication policy", "namespace", obj.Namespace, "name", obj.Name)
@@ -543,8 +543,7 @@ func (r *Replications) stopRunning(ctx context.Context, policyID int64, stopped 
 		if stopped[e.ID] {
 			continue
 		}
-		// Harbor may have deleted the execution since the list.
-		if err := r.harbor.StopReplicationExecution(ctx, e.ID); err != nil && !errors.Is(err, harbor.ErrNotFound) {
+		if err := r.harbor.StopReplicationExecution(ctx, e.ID); err != nil {
 			return err
 		}
 		stopped[e.ID] = true
