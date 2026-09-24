@@ -239,6 +239,18 @@ func TestCreateReplicationOverHiddenPolicy(t *testing.T) {
 	}
 }
 
+func TestCreateReplicationOverPolicyInAnotherProject(t *testing.T) {
+	r, h, _ := newReplications()
+	h.robotProject = "proj"
+	h.put(harbor.ReplicationPolicy{ID: 99, Name: "k8s.proj.ns1.nginx", DestNamespace: "other/k8s/ns1/nginx"})
+
+	_, err := r.Create(inNamespace("ns1"), replication("nginx"), nil, &metav1.CreateOptions{})
+
+	if !apierrors.IsAlreadyExists(err) || !strings.Contains(err.Error(), "policy k8s.proj.ns1.nginx") || !strings.Contains(err.Error(), "a Harbor administrator must delete it") {
+		t.Errorf("got %v, want AlreadyExists that names the unreadable policy", err)
+	}
+}
+
 func TestCreateInvalidReplication(t *testing.T) {
 	r, h, _ := newReplications()
 	obj := replication("nginx")

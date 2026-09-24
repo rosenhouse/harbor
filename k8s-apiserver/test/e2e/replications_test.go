@@ -412,3 +412,36 @@ func TestReplicationRejections(t *testing.T) {
 		t.Errorf("viewer list: %q", out)
 	}
 }
+
+// TestPolicyInAnotherProjectTakesTheName checks a policy that the replication robot can't read, because it pulls into another project.
+func TestPolicyInAnotherProjectTakesTheName(t *testing.T) {
+	ns := replicationNamespace(t)
+	admin := NewAdmin(HarborURL)
+	var registries []struct{ ID int64 }
+	query := url.Values{"q": {"name=" + ReplicationRegistry}}
+	if err := admin.do(t.Context(), http.MethodGet, "/registries?"+query.Encode(), nil, &registries, http.StatusOK); err != nil || len(registries) != 1 {
+		t.Fatalf("registries %v, %v", registries, err)
+	}
+	policy := map[string]any{
+		"name":           policyPrefix(ns) + "taken",
+		"src_registry":   map[string]int64{"id": registries[0].ID},
+		"dest_namespace": SourceProject + "/" + ns,
+		"trigger":        map[string]string{"type": "manual"},
+		"filters":        []map[string]string{{"type": "name", "value": sourceApp}},
+	}
+	if err := admin.do(t.Context(), http.MethodPost, "/replication/policies", policy, nil, http.StatusCreated); err != nil {
+		t.Fatal(err)
+	}
+
+	const want = "which the server can't read. If a retry fails, a Harbor administrator must delete it"
+	eventually(t, func() error {
+		_, err := apply(t, replicationManifest(ns, "taken", v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v1"}))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			return fmt.Errorf("got %v, want an error containing %q", err, want)
+		}
+		return nil
+	})
+	if out := mustKubectl(t, "-n", ns, "get", "harborreplications"); out != "" {
+		t.Errorf("list: %q", out)
+	}
+}

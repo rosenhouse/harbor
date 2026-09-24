@@ -255,8 +255,10 @@ func (r *Replications) create(ctx context.Context, obj *v1alpha1.HarborReplicati
 		if err := r.checkNameFree(ctx, obj, p.Name); err != nil {
 			return nil, err
 		}
-		// Harbor deleted the policy after the conflict.
-		return nil, rest.CheckGeneratedNameError(ctx, r.strategy, apierrors.NewAlreadyExists(replicationsResource, obj.Name), obj)
+		// The robot can't read the policy, or Harbor deleted it after the conflict.
+		exists := apierrors.NewAlreadyExists(replicationsResource, obj.Name)
+		exists.ErrStatus.Message += fmt.Sprintf(" as Harbor replication policy %s, which the server can't read. If a retry fails, a Harbor administrator must delete it", p.Name)
+		return nil, rest.CheckGeneratedNameError(ctx, r.strategy, exists, obj)
 	case errors.Is(err, harbor.ErrBadRequest):
 		klog.ErrorS(err, "Harbor rejected a replication policy", "namespace", obj.Namespace, "name", obj.Name)
 		return nil, apierrors.NewBadRequest("harbor rejected the replication policy")
