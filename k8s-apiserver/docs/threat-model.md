@@ -49,8 +49,9 @@ This model covers an install from `deploy/`, with or without that component, as 
    The ServiceAccount can list and watch namespaces, create TokenReviews and SubjectAccessReviews, and read ConfigMap `kube-system/extension-apiserver-authentication` ([rbac.yaml](../deploy/base/rbac.yaml)).
 6. **harbor-apiserver to Harbor, as the replication robot.**
    Replication requests, and each poll's list of replication policies, carry the replication robot's credentials to the same URL as in boundary 4.
-   Harbor authorizes them by system permission alone, and checks neither the project nor the registry endpoints of a policy ([replication.go](../../src/server/v2.0/handler/replication.go)).
-   The server enforces those itself.
+   Harbor from this fork checks that a policy pulls into the project, but not its registry endpoint ([replication.go](../../src/server/v2.0/handler/replication.go)).
+   Upstream Harbor checks neither.
+   The server checks both itself.
    For each run, harbor-core lists the source repository's tags at the endpoint, and matches them against the tag pattern.
    Harbor's job service then pulls from the endpoint with the endpoint's credentials, and writes into the project as Harbor.
 
@@ -204,7 +205,7 @@ Keep the front-proxy CA separate from the cluster CA, and set `--requestheader-a
 
 ### The replication robot controls pulls into the project
 
-Harbor core from this fork lets a system-level robot hold replication permissions on a project ([replication.go](../../src/server/v2.0/handler/replication.go)).
+Harbor core and jobservice from this fork let a system-level robot hold replication permissions on a project ([replication.go](../../src/server/v2.0/handler/replication.go)).
 With them, the robot manages only the policies that pull from a registry endpoint into that project, and their executions.
 Harbor cannot limit the robot to one endpoint, or to a path in the project.
 With the robot's credentials, anyone can:
@@ -215,6 +216,7 @@ With the robot's credentials, anyone can:
   Through an endpoint that points back at this Harbor, that includes every private project that the endpoint's credentials can read.
 - Start, stop, or delete any policy that pulls into the project, including those that Harbor admins created.
 - Keep the project from being deleted, because Harbor refuses to delete a project that a pull policy writes into.
+- Schedule policies to run every minute, which the server's validation would refuse.
 - List the registry endpoints, with their URLs and access keys, but not their secrets.
 - Read the description of every policy that pulls into the project (see [Harbor admins see replication metadata](#harbor-admins-see-replication-metadata)).
 
@@ -241,7 +243,7 @@ The server uses the robot more narrowly ([replication_policy.go](../pkg/registry
 Mitigations:
 
 - Enable replications only where you need them. The base install holds no such credentials.
-- Run Harbor core from this fork, and give the robot only the README's permissions, and an expiration.
+- Run Harbor core and jobservice from this fork, and give the robot only the README's permissions, and an expiration.
 - Give every registry endpoint in Harbor credentials that can only read content that anyone who can reach Harbor may see, or none.
   Then no policy can push through an endpoint, or expose private content by copying it.
   Never give an endpoint that points back at this Harbor the credentials of an account that can read private projects.

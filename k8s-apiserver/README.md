@@ -313,7 +313,9 @@ Select by field instead.
 ## Enable replications
 
 Replications let Kubernetes users copy images into the project from registry endpoints that you allow.
-They are off by default, because they need a Harbor robot account that can pull from any registry endpoint into the project, and delete any replication policy that pulls into it.
+They are off by default, because they need a system-level Harbor robot account.
+With Harbor from this fork, the robot can pull from any registry endpoint into the project, and delete any replication policy that pulls into it.
+With upstream Harbor, it can replicate between any project and any endpoint.
 Anyone who can read its Secret, or create pods in `harbor-apiserver`, can use it that way.
 Users who can create replications can copy anything that an allowed endpoint's credentials can read into the project, which every labeled namespace shares.
 Read the [threat model](docs/threat-model.md#the-replication-robot-controls-pulls-into-the-project) before you enable them.
@@ -336,9 +338,8 @@ Give the robot only these permissions:
 | Project | Replication | List, Create |
 
 The server lists registry endpoints to find their IDs.
-Only Harbor core built from this fork's `agg` branch lets a system-level robot hold the replication permissions on a project.
-Upstream Harbor accepts them only as system permissions, which let the robot replicate across all of Harbor.
-The server works with either.
+Only Harbor core and jobservice built from this fork's `agg` branch let a system-level robot hold the replication permissions on a project.
+With upstream Harbor, grant the same actions as system permissions instead, in **Administration** > **Robot Accounts** > **New Robot Account**.
 
 Keep the robot's name and secret in a private directory until you create the Secret below:
 

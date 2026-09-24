@@ -861,6 +861,15 @@ func TestDeleteReplicationWhileAnOlderExecutionRuns(t *testing.T) {
 	}
 }
 
+func TestDeleteReplicationWhoseExecutionEndsBeforeTheStop(t *testing.T) {
+	r, h, _ := newReplications()
+	create(t, r, "ns1", replication("nginx"))
+	h.errs = map[string]error{"StopReplicationExecution": harbor.ErrNotFound}
+	if _, err := deleteReplication(r, "ns1", "nginx", nil); !apierrors.IsConflict(err) {
+		t.Errorf("got %v, want the Conflict of a policy whose executions have not stopped", err)
+	}
+}
+
 func TestDeleteReplicationWhileItStops(t *testing.T) {
 	r, h, _ := newReplications()
 	create(t, r, "ns1", replication("nginx"))
@@ -987,7 +996,6 @@ func TestDeleteReplicationHarborErrors(t *testing.T) {
 	}{
 		{"ListRunningReplicationExecutions", harbor.ErrUnavailable, apierrors.IsServiceUnavailable},
 		{"StopReplicationExecution", harbor.ErrUnavailable, apierrors.IsServiceUnavailable},
-		{"StopReplicationExecution", harbor.ErrNotFound, apierrors.IsNotFound},
 		{"DeleteReplicationPolicy", harbor.ErrUnavailable, apierrors.IsServiceUnavailable},
 		{"DeleteReplicationPolicy", harbor.ErrNotFound, apierrors.IsNotFound},
 	} {

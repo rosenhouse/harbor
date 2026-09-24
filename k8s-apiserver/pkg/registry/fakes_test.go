@@ -279,9 +279,6 @@ func (f *fakeReplicationHarbor) GetReplicationPolicy(ctx context.Context, id int
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, p := range f.policies {
-		if p.ID == id && !f.readable(p) {
-			return nil, harbor.ErrForbidden
-		}
 		if p.ID == id {
 			c := clone(p)
 			return &c, nil
