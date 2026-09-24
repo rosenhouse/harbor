@@ -15,11 +15,10 @@ import (
 type Registry struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name,omitempty"`
-	Type string `json:"type,omitempty"`
 }
 
 // ReplicationPolicy copies artifacts between registries.
-// Harbor fills in the name and type of both registries when it returns a policy.
+// Harbor fills in the name of both registries when it returns a policy.
 type ReplicationPolicy struct {
 	ID            int64     `json:"id,omitempty"`
 	Name          string    `json:"name"`
@@ -37,7 +36,6 @@ type ReplicationPolicy struct {
 	Enabled                   bool                `json:"enabled"`
 	SingleActiveReplication   bool                `json:"single_active_replication"`
 	CreationTime              time.Time           `json:"creation_time,omitzero"`
-	UpdateTime                time.Time           `json:"update_time,omitzero"`
 }
 
 type ReplicationTrigger struct {
@@ -119,20 +117,32 @@ func (c *Client) StartReplication(ctx context.Context, policyID int64) (int64, e
 	return createdID(header)
 }
 
-// LatestReplicationExecution returns nil if the policy has never run.
+// executionPageSize is how many executions LatestReplicationExecution reads at once.
+// A run as long as 10 schedule intervals needs a second page.
+const executionPageSize = 10
+
+// LatestReplicationExecution returns the policy's newest execution that Harbor did not skip, or nil if there is none.
+// Harbor 2.14 records a run that it skips, because the previous run is still going, as a newer failed execution.
 func (c *Client) LatestReplicationExecution(ctx context.Context, policyID int64) (*ReplicationExecution, error) {
-	query := url.Values{"policy_id": {strconv.FormatInt(policyID, 10)}, "sort": {"-id"}, "page": {"1"}, "page_size": {"1"}}
-	var executions []ReplicationExecution
-	if _, err := c.do(ctx, http.MethodGet, "/replication/executions", query, nil, http.StatusOK, &executions); err != nil {
-		return nil, err
+	for page := 1; page <= maxPages; page++ {
+		query := url.Values{"policy_id": {strconv.FormatInt(policyID, 10)}, "sort": {"-id"}, "page": {strconv.Itoa(page)}, "page_size": {strconv.Itoa(executionPageSize)}}
+		var executions []ReplicationExecution
+		if _, err := c.do(ctx, http.MethodGet, "/replication/executions", query, nil, http.StatusOK, &executions); err != nil {
+			return nil, err
+		}
+		for i, e := range executions {
+			if e.PolicyID != policyID {
+				return nil, fmt.Errorf("harbor returned execution %d of policy %d, not of policy %d", e.ID, e.PolicyID, policyID)
+			}
+			if !strings.HasPrefix(e.StatusText, "Execution skipped") {
+				return &executions[i], nil
+			}
+		}
+		if len(executions) < executionPageSize {
+			return nil, nil
+		}
 	}
-	if len(executions) == 0 {
-		return nil, nil
-	}
-	if e := executions[0]; e.PolicyID != policyID {
-		return nil, fmt.Errorf("harbor returned execution %d of policy %d, not of policy %d", e.ID, e.PolicyID, policyID)
-	}
-	return &executions[0], nil
+	return nil, fmt.Errorf("GET /replication/executions: more than %d pages of skipped executions", maxPages)
 }
 
 // ListRunningReplicationExecutions lists a policy's executions whose status is InProgress.

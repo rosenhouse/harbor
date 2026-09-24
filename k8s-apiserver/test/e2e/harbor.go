@@ -43,6 +43,16 @@ const (
 	replicationPrefix = "k8s"
 )
 
+// policyPrefix starts the names of a namespace's replication policies.
+func policyPrefix(namespace string) string {
+	return replicationPrefix + "." + HarborProject + "." + namespace + "."
+}
+
+// destination is where a replication copies to.
+func destination(namespace, name string) string {
+	return HarborProject + "/" + replicationPrefix + "/" + namespace + "/" + name
+}
+
 var adminAuth = authn.Basic{Username: "admin", Password: "Harbor12345"}
 
 // requestTimeout bounds each Harbor API call.
@@ -199,7 +209,7 @@ func (a *Admin) deleteRepository(ctx context.Context, project, repository string
 
 // deleteReplications deletes the policies that harbor-apiserver created for a namespace, and the repositories they copied into.
 func (a *Admin) deleteReplications(ctx context.Context, namespace string) error {
-	if err := a.deleteReplicationPolicies(ctx, replicationPrefix+"."+HarborProject+"."+namespace+"."); err != nil {
+	if err := a.deleteReplicationPolicies(ctx, policyPrefix(namespace)); err != nil {
 		return err
 	}
 	return a.deleteRepositories(ctx, HarborProject, replicationPrefix+"/"+namespace+"/")

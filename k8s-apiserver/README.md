@@ -430,7 +430,7 @@ Changing the prefix hides existing replications, so set it before you create any
 The component adds two ClusterRoles:
 
 - `harbor.goharbor.io:view-replications` grants `get` and `list` on replications, and aggregates into `view`, like `harbor.goharbor.io:view`.
-- `harbor.goharbor.io:replicate` grants `create` and `delete`. It does not aggregate, so bind it explicitly:
+- `harbor.goharbor.io:replicate` grants `create`, `update`, `patch`, and `delete`. It does not aggregate, so bind it explicitly:
 
   ```sh
   kubectl -n my-namespace create rolebinding harbor-replicators --clusterrole=harbor.goharbor.io:replicate --group=my-team
@@ -442,7 +442,7 @@ To narrow who can view replications, remove the aggregation label of `harbor.goh
 ### Replicate
 
 ```sh
-kubectl apply --validate=false -f - <<'EOF'
+kubectl apply -f - <<'EOF'
 apiVersion: harbor.goharbor.io/v1alpha1
 kind: HarborReplication
 metadata:
@@ -461,8 +461,6 @@ EOF
 - `tag` is Harbor's tag filter, a pattern such as `1.27.*`. `*` copies every tag.
 - `schedule` is optional. Here, it reruns the replication daily at 03:00 UTC.
 
-Without `--validate=false`, kubectl lists CRDs to validate a replication, which `view`, `edit`, and `admin` do not allow.
-
 The replication runs once when you create it.
 Poll with `kubectl get` until its phase is no longer `InProgress`:
 
@@ -475,7 +473,10 @@ my-project/k8s/my-namespace/nginx
 ```
 
 The phase is the last run's: `InProgress`, `Succeeded`, `Failed`, or `Stopped`.
+A run that Harbor skips, because the previous run is still going, does not count.
+A run that copies nothing, such as when the repository does not exist or no tag matches, is `Succeeded` with `total` 0 and the message `no resources need to be replicated`.
 `status.lastExecution` also holds the run's counts and Harbor's message.
+That message can hold endpoint URLs and the source registry's responses, and anyone who can view the replication can read it.
 A source repository keeps its path under `status.destination`.
 
 In the replication's namespace, the copied artifacts have the label `harbor.goharbor.io/replication` and an ownerReference to the replication:
@@ -487,13 +488,22 @@ k8s.my-namespace.nginx.library.nginx.sha256-6784fb0834aa   my-project/k8s/my-nam
 ```
 
 Other labeled namespaces see these artifacts too, but without the label or the ownerReference.
+The ownerReference only shows where the artifacts came from. Deleting the replication leaves them.
 
 ### Limits
 
-- The server supports no `update` or `patch`, and so no server-side apply, which Flux requires.
-  Client-side `kubectl apply` creates a replication, but cannot change one. To change it, delete and recreate it.
-  Without `patch`, kubectl validates a replication by listing CRDs, so users who cannot list CRDs need `--validate=false`.
-- There is no `watch`, so `kubectl wait` does not work.
+- A replication cannot change, not even its labels and annotations.
+  `update` and `patch` accept only requests that change nothing. They let server-side apply create and re-apply a replication, and let kubectl validate one without listing CRDs.
+  Any change, such as a new spec or label, fails with `field is immutable`.
+  So does a server-side apply whose manifest lacks a field or label of the replication, because the server keeps no managed fields.
+  Server-side apply without `--force-conflicts` reports a changed value as a conflict with `before-first-apply` instead.
+  To change a replication, delete and recreate it, such as with `kubectl apply --force`. Flux changes a replication only with `spec.force: true`, which recreates it.
+  Helm charts often change labels such as `helm.sh/chart` in each version, so `helm upgrade` fails on a replication with such labels. Leave them off replications.
+- The server ignores changes to the annotation `kubectl.kubernetes.io/last-applied-configuration`, which kubectl and other tools add, rewrite, and remove.
+  So client-side `kubectl apply` of a replication that it did not create warns that the annotation is missing, and reports `configured` without a change.
+- There is no watch. `kubectl get -w` fails, and `kubectl wait` logs watch errors and notices changes late.
+- The status has no conditions. So health checks that read conditions, such as Flux's `wait`, count a replication as ready whatever its last run did.
+- The server does not keep `generateName`.
 - There is no way to rerun a replication on demand yet.
 - Deleting a replication stops its runs, and deletes its policy and run history from Harbor.
   It leaves the copied artifacts.
@@ -503,13 +513,18 @@ Other labeled namespaces see these artifacts too, but without the label or the o
 - Removing a namespace's label, an endpoint from `registries`, or the component hides the affected replications, but their schedules keep running in Harbor.
   Delete the replications first. Before you remove the component, run `kubectl delete harborreplications --all --all-namespaces`.
 - A policy that the server hides blocks its namespace and name until a Harbor administrator deletes it.
-  Examples are a policy from an earlier namespace of the same name, and one whose description, source, destination, filters, or trigger someone changed in Harbor.
+  Examples are a policy from an earlier namespace of the same name, and one whose source, destination, filters, or trigger someone changed in Harbor, or whose description's namespace, namespace UID, name, or spec someone changed.
   Creating the replication fails with AlreadyExists, and the message names the policy.
+  A change in Harbor to the description's UID, labels, or annotations doesn't hide the policy, but changes the replication.
 - The server needs Harbor 2.3 or later. Before Harbor 2.14, a run can start while the previous one is still running.
 - A schedule has 6 fields separated by single spaces: seconds, minutes, hours, day of month, month, and day of week, in UTC.
   Seconds must be `0`, and minutes a single number, so a replication runs at most once an hour. It must be at most 64 characters.
+  It must match a date that exists, because Harbor's job service loops forever on a schedule such as `0 0 0 30 2 *`.
+- A tag pattern holds only letters, digits, and the characters `_.-*?[]^{},`.
+  It has at most two `*` and one `{}` group, and no `{`, `}`, or `,` in a character class, so that Harbor matches each tag in milliseconds.
 - The destination repository, `<project>/<prefix>/<namespace>/<name>/<repository>`, must fit in 255 characters.
 - A replication's labels and annotations together must fit in 8192 bytes, because its Harbor policy holds them.
+  Client-side `kubectl apply` adds an annotation that holds the whole manifest, so apply a large manifest with `kubectl create` or `--server-side`.
 
 ## Flags
 
@@ -602,14 +617,15 @@ Requests for replications call Harbor with the replication robot, and report its
 - `harbor rejected the replication policy` (400): the logs give Harbor's reason.
 - `unexpected error from harbor` (500): see the logs.
 
-A create in a namespace without the label fails with Forbidden.
+A create in a namespace that does not exist, or lacks the label, fails with Forbidden.
 `spec.registry: Unsupported value` means that the endpoint is not in `registries`, and `spec.registry: Not found` means that Harbor has no endpoint with that name.
 
-If Harbor fails to start the first run, the create still succeeds, without `status.lastExecution`, and the server logs `"Starting a replication failed"`.
+If a create fails after Harbor stored the policy, such as when Harbor fails to start the first run, the server deletes the policy, so that a retry creates it again.
+If that delete fails too, the server logs `"Deleting the policy of a failed create failed, so the replication may exist without a run"`. Delete and recreate the replication.
 `status.lastExecution.message` says why a run failed, and Harbor shows each task's log under **Administration** > **Replications**.
 
-When a poll cannot list the replication policies, the server logs `"Listing replication policies failed, so artifacts keep the replications that they were linked to before until the staleness limit"`.
-Artifacts keep their labels and ownerReferences from the last list that succeeded.
+When a poll cannot list the replication policies, the server logs `"Listing replication policies failed, so artifacts keep their links from the last list that succeeded"`.
+Artifacts keep their labels and ownerReferences from that list.
 Once that list is older than `--harbor-staleness-limit`, lists of artifacts by the `harbor.goharbor.io/replication` label fail with a 503 that starts with `listing replication policies failed`.
 
 ## Uninstall

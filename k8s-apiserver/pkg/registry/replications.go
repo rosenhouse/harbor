@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -13,7 +14,9 @@ import (
 	"github.com/robfig/cron/v3"
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	genericvalidation "k8s.io/apimachinery/pkg/api/validation"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -25,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	storagenames "k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/apiserver/pkg/util/dryrun"
@@ -68,6 +72,7 @@ var (
 	_ rest.Getter               = &Replications{}
 	_ rest.Lister               = &Replications{}
 	_ rest.Creater              = &Replications{} //nolint:misspell // Kubernetes spells it so.
+	_ rest.Patcher              = &Replications{}
 	_ rest.GracefulDeleter      = &Replications{}
 	_ rest.Scoper               = &Replications{}
 	_ rest.SingularNameProvider = &Replications{}
@@ -256,7 +261,10 @@ func (r *Replications) create(ctx context.Context, obj *v1alpha1.HarborReplicati
 		klog.ErrorS(err, "Harbor rejected a replication policy", "namespace", obj.Namespace, "name", obj.Name)
 		return nil, apierrors.NewBadRequest("harbor rejected the replication policy")
 	case err != nil:
-		return nil, replicationError(err, "Creating a replication policy failed", "namespace", obj.Namespace, "name", obj.Name)
+		err = replicationError(err, "Creating a replication policy failed", "namespace", obj.Namespace, "name", obj.Name)
+		// Harbor may have stored the policy, and failed to reply.
+		r.abandon(ctx, obj, 0)
+		return nil, err
 	}
 	return r.start(ctx, obj, id)
 }
@@ -279,23 +287,59 @@ func (r *Replications) checkNameFree(ctx context.Context, obj *v1alpha1.HarborRe
 	return rest.CheckGeneratedNameError(ctx, r.strategy, exists, obj)
 }
 
-// start reads back a created policy, and starts it if the server shows it. Otherwise it deletes the policy.
+// start reads back a created policy, and starts it if the server shows it. Otherwise, or if that fails, it deletes the policy.
 func (r *Replications) start(ctx context.Context, obj *v1alpha1.HarborReplication, id int64) (*v1alpha1.HarborReplication, error) {
 	p, err := r.harbor.GetReplicationPolicy(ctx, id)
 	if err != nil {
-		return nil, replicationError(err, "Reading a created replication policy failed", "namespace", obj.Namespace, "name", obj.Name)
+		err = replicationError(err, "Reading a created replication policy failed", "namespace", obj.Namespace, "name", obj.Name)
+		r.abandon(ctx, obj, id)
+		return nil, err
 	}
 	d, ok := r.config.visible(p, r.namespaces)
 	if !ok {
 		return nil, r.deleteHidden(ctx, obj, p, id)
 	}
-	var e *harbor.ReplicationExecution
 	if _, err := r.harbor.StartReplication(ctx, id); err != nil {
-		klog.ErrorS(err, "Starting a replication failed", "namespace", obj.Namespace, "name", obj.Name)
-	} else if e, err = r.harbor.LatestReplicationExecution(ctx, id); err != nil {
+		err = replicationError(err, "Starting a replication failed", "namespace", obj.Namespace, "name", obj.Name)
+		r.abandon(ctx, obj, id)
+		return nil, err
+	}
+	e, err := r.harbor.LatestReplicationExecution(ctx, id)
+	if err != nil {
 		klog.ErrorS(err, "Reading a replication execution failed", "namespace", obj.Namespace, "name", obj.Name)
 	}
 	return replicationObject(p, d, e), nil
+}
+
+// abandon deletes the policy of a create that failed, so that a retry can create and start it.
+// If Harbor may have stored the policy without returning its ID, id is 0, and abandon looks for a policy with the replication's UID.
+func (r *Replications) abandon(ctx context.Context, obj *v1alpha1.HarborReplication, id int64) {
+	// The create may have failed because its request ended.
+	ctx = context.WithoutCancel(ctx)
+	var err error
+	if id == 0 {
+		id, err = r.storedPolicy(ctx, obj)
+	}
+	if id != 0 {
+		err = r.deletePolicy(ctx, id)
+	}
+	if err != nil {
+		klog.ErrorS(err, "Deleting the policy of a failed create failed, so the replication may exist without a run", "namespace", obj.Namespace, "name", obj.Name)
+	}
+}
+
+// storedPolicy returns the ID of obj's policy, or 0 if Harbor has none.
+func (r *Replications) storedPolicy(ctx context.Context, obj *v1alpha1.HarborReplication) (int64, error) {
+	policies, err := r.harbor.ListReplicationPolicies(ctx, r.config.policyName(obj.Namespace, obj.Name))
+	if err != nil {
+		return 0, err
+	}
+	for i := range policies {
+		if d, ok := r.config.visible(&policies[i], r.namespaces); ok && d.UID == obj.UID {
+			return policies[i].ID, nil
+		}
+	}
+	return 0, nil
 }
 
 // deleteHidden deletes a created policy that the server hides, and returns why the create failed.
@@ -315,7 +359,7 @@ func (r *Replications) deleteHidden(ctx context.Context, obj *v1alpha1.HarborRep
 func creatableNamespace(n Namespaces, obj *v1alpha1.HarborReplication) (*corev1.Namespace, error) {
 	ns, ok := n.Namespace(obj.Namespace)
 	if !ok {
-		return nil, apierrors.NewForbidden(replicationsResource, obj.Name, fmt.Errorf("namespace %s is not labeled %s with this server's Harbor project", obj.Namespace, namespaces.ProjectLabel))
+		return nil, apierrors.NewForbidden(replicationsResource, obj.Name, fmt.Errorf("namespace %s does not exist, or is not labeled %s with this server's Harbor project", obj.Namespace, namespaces.ProjectLabel))
 	}
 	if ns.DeletionTimestamp != nil || ns.Status.Phase == corev1.NamespaceTerminating {
 		// This matches kube-apiserver's NamespaceLifecycle admission.
@@ -341,6 +385,90 @@ func (r *Replications) registryID(ctx context.Context, obj *v1alpha1.HarborRepli
 		}
 	}
 	return 0, apierrors.NewInvalid(replicationKind, obj.Name, field.ErrorList{field.NotFound(field.NewPath("spec", "registry"), obj.Spec.Registry)})
+}
+
+// Update serves update and patch, which let server-side apply create and re-apply a replication, and let kubectl validate one on the server.
+// A replication cannot change, so Update fails if the request changes it, and otherwise does nothing.
+// It creates a missing replication only for server-side apply, which sets forceAllowCreate.
+func (r *Replications) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	namespace := genericapirequest.NamespaceValue(ctx)
+	current, _, err := r.find(ctx, namespace, name)
+	if apierrors.IsNotFound(err) && forceAllowCreate {
+		var created runtime.Object
+		if created, err = r.createMissing(ctx, objInfo, createValidation, options); !apierrors.IsAlreadyExists(err) {
+			return created, err == nil, err
+		}
+		// Another request created the replication first, so update that one.
+		exists := err
+		if current, _, err = r.find(ctx, namespace, name); apierrors.IsNotFound(err) {
+			err = exists
+		}
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if p := objInfo.Preconditions(); p != nil && p.UID != nil && *p.UID != current.UID {
+		return nil, false, apierrors.NewConflict(replicationsResource, name, fmt.Errorf("the UID in the precondition (%s) does not match the UID in record (%s). The object might have been deleted and then recreated", *p.UID, current.UID))
+	}
+	obj, err := objInfo.UpdatedObject(ctx, current.DeepCopy())
+	if err != nil {
+		return nil, false, err
+	}
+	updated, err := r.checkUnchanged(ctx, obj, current)
+	if err != nil {
+		return nil, false, err
+	}
+	// Server-side apply keeps the fields that its configuration leaves out, because the server stores no managed fields.
+	// So check the object that the configuration alone makes, which apply builds when the current object has no UID.
+	// Other patches then fail with NotFound, and an update returns its object again.
+	if alone, err := objInfo.UpdatedObject(ctx, r.New()); err == nil && !onlyLastApplied(alone) {
+		if _, err := r.checkUnchanged(ctx, alone, current); err != nil {
+			return nil, false, err
+		}
+	}
+	if updateValidation != nil {
+		if err := updateValidation(ctx, updated.DeepCopyObject(), current.DeepCopyObject()); err != nil {
+			return nil, false, err
+		}
+	}
+	return current, false, nil
+}
+
+func (r *Replications) createMissing(ctx context.Context, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, options *metav1.UpdateOptions) (runtime.Object, error) {
+	obj, err := objInfo.UpdatedObject(ctx, r.New())
+	if err != nil {
+		return nil, err
+	}
+	return r.Create(ctx, obj, createValidation, &metav1.CreateOptions{DryRun: options.DryRun})
+}
+
+// onlyLastApplied returns whether obj holds only its name, its namespace, and kubectl's last-applied configuration.
+// kubectl's server-side apply sends that configuration to keep the annotation, which the server keeps anyway.
+func onlyLastApplied(obj runtime.Object) bool {
+	repl, ok := obj.(*v1alpha1.HarborReplication)
+	if !ok || !metav1.HasAnnotation(repl.ObjectMeta, corev1.LastAppliedConfigAnnotation) {
+		return false
+	}
+	others := repl.DeepCopy()
+	delete(others.Annotations, corev1.LastAppliedConfigAnnotation)
+	others.TypeMeta, others.ManagedFields = metav1.TypeMeta{}, nil
+	return apiequality.Semantic.DeepEqual(others, &v1alpha1.HarborReplication{ObjectMeta: metav1.ObjectMeta{Name: repl.Name, Namespace: repl.Namespace}})
+}
+
+// checkUnchanged returns obj, prepared for update, if it differs from current only in what the server ignores.
+func (r *Replications) checkUnchanged(ctx context.Context, obj runtime.Object, current *v1alpha1.HarborReplication) (*v1alpha1.HarborReplication, error) {
+	updated, ok := obj.(*v1alpha1.HarborReplication)
+	if !ok {
+		return nil, apierrors.NewBadRequest(fmt.Sprintf("not a HarborReplication: %T", obj))
+	}
+	switch updated.ResourceVersion {
+	case current.ResourceVersion:
+	case "":
+		updated.ResourceVersion = current.ResourceVersion
+	default:
+		return nil, apierrors.NewConflict(replicationsResource, current.Name, errors.New(genericregistry.OptimisticLockErrorMsg))
+	}
+	return updated, rest.BeforeUpdate(r.strategy, ctx, updated, current)
 }
 
 // Delete stops a replication's executions, and deletes its policy. It leaves the replicated artifacts.
@@ -429,7 +557,7 @@ func replicationError(err error, msg string, keysAndValues ...any) error {
 	return apierrors.NewInternalError(errors.New("unexpected error from harbor"))
 }
 
-// replicationStrategy prepares and validates a new HarborReplication for rest.BeforeCreate, and checks a delete for rest.BeforeDelete.
+// replicationStrategy prepares and validates a HarborReplication for rest.BeforeCreate and rest.BeforeUpdate, and checks a delete for rest.BeforeDelete.
 type replicationStrategy struct {
 	runtime.ObjectTyper
 	storagenames.NameGenerator
@@ -449,8 +577,54 @@ func (s replicationStrategy) Validate(_ context.Context, obj runtime.Object) fie
 	return s.config.validate(obj.(*v1alpha1.HarborReplication))
 }
 
+// PrepareForUpdate drops what the server does not store, and keeps the status.
+// It also keeps kubectl's last-applied configuration, which kubectl and other tools add, rewrite, or remove on objects that they did not change.
+func (replicationStrategy) PrepareForUpdate(_ context.Context, obj, old runtime.Object) {
+	repl, current := obj.(*v1alpha1.HarborReplication), old.(*v1alpha1.HarborReplication)
+	repl.ManagedFields = nil
+	repl.Status = current.Status
+	if applied, ok := current.Annotations[corev1.LastAppliedConfigAnnotation]; ok {
+		metav1.SetMetaDataAnnotation(&repl.ObjectMeta, corev1.LastAppliedConfigAnnotation, applied)
+	} else {
+		delete(repl.Annotations, corev1.LastAppliedConfigAnnotation)
+	}
+}
+
+// ValidateUpdate rejects every change, because the server never updates a policy.
+func (replicationStrategy) ValidateUpdate(_ context.Context, obj, old runtime.Object) field.ErrorList {
+	n, o := obj.(*v1alpha1.HarborReplication), old.(*v1alpha1.HarborReplication)
+	metadata := field.NewPath("metadata")
+	var errs field.ErrorList
+	for _, f := range []struct {
+		name              string
+		updated, previous any
+	}{
+		{"labels", n.Labels, o.Labels},
+		{"annotations", n.Annotations, o.Annotations},
+		{"finalizers", n.Finalizers, o.Finalizers},
+		{"ownerReferences", n.OwnerReferences, o.OwnerReferences},
+	} {
+		if !apiequality.Semantic.DeepEqual(f.updated, f.previous) {
+			// The value could be long, such as kubectl's last-applied-configuration annotation.
+			errs = append(errs, field.Invalid(metadata.Child(f.name), field.OmitValueType{}, genericvalidation.FieldImmutableErrorMsg))
+		}
+	}
+	errs = append(errs, genericvalidation.ValidateImmutableField(n.Spec, o.Spec, field.NewPath("spec"))...)
+	for _, err := range errs {
+		err.Detail += "; delete and recreate the replication to change it"
+	}
+	return errs
+}
+
+// Only genericregistry.Store reads these, but Update behaves as they say.
+func (replicationStrategy) AllowCreateOnUpdate(context.Context) bool      { return false }
+func (replicationStrategy) AllowUnconditionalUpdate(context.Context) bool { return true }
+
 func (replicationStrategy) WarningsOnCreate(context.Context, runtime.Object) []string { return nil }
-func (replicationStrategy) Canonicalize(runtime.Object)                               {}
+func (replicationStrategy) WarningsOnUpdate(context.Context, runtime.Object, runtime.Object) []string {
+	return nil
+}
+func (replicationStrategy) Canonicalize(runtime.Object) {}
 
 const (
 	maxRepositoryLength = 255
@@ -468,7 +642,32 @@ var (
 	// cronParser parses a schedule as Harbor's utils.CronParser does.
 	cronParser   = cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	singleNumber = regexp.MustCompile(`^[0-9]+$`)
+	// tagPattern holds the characters of tags and of Harbor's tag patterns, which JSON does not escape.
+	// So a policy's filters fit in Harbor's column for them.
+	tagPattern = regexp.MustCompile(`^[A-Za-z0-9_.*?\[\]^{},-]+$`)
+	// braceInClass finds a {, }, or , in a character class.
+	braceInClass = regexp.MustCompile(`\[[^\]]*[{},]`)
 )
+
+// tagPatternError returns why Harbor's doublestar matcher could fail a run on a pattern that matches tagPattern, or match it slowly.
+// That matcher tries every way to match a tag. Each * multiplies its time by up to the tag's length, and each {} group by its number of alternatives.
+// Its {} groups end at the first }, even in a character class.
+func tagPatternError(pattern string) string {
+	switch {
+	case strings.Count(pattern, "*") > 2:
+		return "must have at most two *"
+	case strings.Count(pattern, "{") > 1:
+		return "must have at most one {} group"
+	case braceInClass.MatchString(pattern):
+		return "must not have {, }, or , in a character class"
+	}
+	// path.Match checks the whole pattern, and has the same character classes.
+	_, err := path.Match(pattern, "")
+	if _, group, braced := strings.Cut(pattern, "{"); err != nil || braced && !strings.Contains(group, "}") {
+		return "must be a valid pattern"
+	}
+	return ""
+}
 
 func (c ReplicationConfig) validate(obj *v1alpha1.HarborReplication) field.ErrorList {
 	var errs field.ErrorList
@@ -500,11 +699,15 @@ func (c ReplicationConfig) validate(obj *v1alpha1.HarborReplication) field.Error
 	case len(destination) > maxRepositoryLength:
 		errs = append(errs, field.Invalid(spec.Child("repository"), obj.Spec.Repository, fmt.Sprintf("the destination repository %s must be at most %d characters", destination, maxRepositoryLength)))
 	}
-	switch {
+	switch tagMsg := tagPatternError(obj.Spec.Tag); {
 	case obj.Spec.Tag == "":
 		errs = append(errs, field.Required(spec.Child("tag"), "use * to copy every tag"))
 	case len(obj.Spec.Tag) > maxTagLength:
 		errs = append(errs, field.TooLong(spec.Child("tag"), obj.Spec.Tag, maxTagLength))
+	case !tagPattern.MatchString(obj.Spec.Tag):
+		errs = append(errs, field.Invalid(spec.Child("tag"), obj.Spec.Tag, "must hold only letters, digits, and the characters _.-*?[]^{},"))
+	case tagMsg != "":
+		errs = append(errs, field.Invalid(spec.Child("tag"), obj.Spec.Tag, tagMsg))
 	}
 	switch msg := scheduleError(obj.Spec.Schedule); {
 	case obj.Spec.Schedule == "":
@@ -525,14 +728,19 @@ func metadataBytes(m map[string]string) int {
 	return n
 }
 
-// scheduleError returns why Harbor would reject a schedule, or why it could run more than once an hour.
+// scheduleError returns why Harbor would reject a schedule, why it could run more than once an hour, or why it never runs.
 func scheduleError(schedule string) string {
 	fields := strings.Split(schedule, " ")
 	if len(fields) != 6 {
 		return "must be 6 fields separated by single spaces: seconds, minutes, hours, day of month, month, and day of week"
 	}
-	if _, err := cronParser.Parse(schedule); err != nil {
+	s, err := cronParser.Parse(schedule)
+	if err != nil {
 		return err.Error()
+	}
+	// Harbor's job service loops forever on a schedule that never runs.
+	if s.Next(time.Now()).IsZero() {
+		return "must match a date that exists"
 	}
 	if fields[0] != "0" {
 		return "seconds must be 0"

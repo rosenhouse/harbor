@@ -451,7 +451,7 @@ type replicationFixture struct {
 func newUnreadReplicationFixture() *replicationFixture {
 	h, r := replicatedHarbor(), &fakeReplicationHarbor{}
 	r.put(*storedPolicy())
-	n := namespaceObjects{"ns1": namespace("ns1"), "ns2": namespace("ns2")}
+	n := namespacesNamed("ns1", "ns2")
 	s := NewStore("proj", stalenessLimit, n)
 	c := testingclock.NewFakeClock(time.Now())
 	s.clock = c

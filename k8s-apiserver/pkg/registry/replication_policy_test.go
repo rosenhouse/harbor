@@ -71,8 +71,8 @@ func TestUnscheduledReplicationPolicy(t *testing.T) {
 func storedPolicy() *harbor.ReplicationPolicy {
 	p := replicationConfig.policy(describe(nginxReplication(), "uid-ns1"), 3)
 	p.ID = 7
-	p.SrcRegistry = &harbor.Registry{ID: 3, Name: "hub", Type: "docker-hub"}
-	p.DestRegistry = &harbor.Registry{ID: 0, Name: "Local", Type: "harbor"}
+	p.SrcRegistry = &harbor.Registry{ID: 3, Name: "hub"}
+	p.DestRegistry = &harbor.Registry{ID: 0, Name: "Local"}
 	p.CreationTime = created
 	return p
 }
@@ -91,7 +91,7 @@ func withDescription(p *harbor.ReplicationPolicy, change func(*policyDescription
 }
 
 func TestVisiblePolicy(t *testing.T) {
-	d, ok := replicationConfig.visible(storedPolicy(), namespaceObjects{"ns1": namespace("ns1")})
+	d, ok := replicationConfig.visible(storedPolicy(), namespacesNamed("ns1"))
 	if !ok {
 		t.Fatal("not visible")
 	}
@@ -101,7 +101,7 @@ func TestVisiblePolicy(t *testing.T) {
 
 	p := storedPolicy()
 	p.DestRegistry = nil
-	if _, ok := replicationConfig.visible(p, namespaceObjects{"ns1": namespace("ns1")}); !ok {
+	if _, ok := replicationConfig.visible(p, namespacesNamed("ns1")); !ok {
 		t.Error("a policy without a destination registry is not visible")
 	}
 }
@@ -177,7 +177,7 @@ func TestInvisiblePolicies(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			p, n := storedPolicy(), namespaceObjects{"ns1": namespace("ns1")}
+			p, n := storedPolicy(), namespacesNamed("ns1")
 			change(p, n)
 			if d, ok := replicationConfig.visible(p, n); ok {
 				t.Errorf("visible as %+v", d)
@@ -193,7 +193,7 @@ func TestReplicationObject(t *testing.T) {
 		StartTime: start, Total: 5, Failed: 1, Succeed: 2, InProgress: 1, Stopped: 1,
 	}
 	p := storedPolicy()
-	d, _ := replicationConfig.visible(p, namespaceObjects{"ns1": namespace("ns1")})
+	d, _ := replicationConfig.visible(p, namespacesNamed("ns1"))
 	got := replicationObject(p, d, e)
 
 	want := nginxReplication()

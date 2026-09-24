@@ -24,6 +24,13 @@ import (
 // kubectl returns stdout. Its error includes stderr.
 func kubectl(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	out, _, err := kubectlWithStderr(t, args...)
+	return out, err
+}
+
+// kubectlWithStderr returns stdout and stderr. Its error includes stderr.
+func kubectlWithStderr(t *testing.T, args ...string) (string, string, error) {
+	t.Helper()
 	cmd := exec.Command("kubectl", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -31,7 +38,7 @@ func kubectl(t *testing.T, args ...string) (string, error) {
 	if err != nil {
 		err = fmt.Errorf("kubectl %s: %w: %s", strings.Join(args, " "), err, stderr.String())
 	}
-	return strings.TrimSpace(string(out)), err
+	return strings.TrimSpace(string(out)), stderr.String(), err
 }
 
 func mustKubectl(t *testing.T, args ...string) string {
@@ -68,7 +75,7 @@ func eventuallyWithin(t *testing.T, timeout time.Duration, check func() error) {
 func TestAPIResources(t *testing.T) {
 	want := []metav1.APIResource{
 		{Name: "harborartifacts", SingularName: "harborartifact", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborArtifact", Verbs: []string{"get", "list"}},
-		{Name: "harborreplications", SingularName: "harborreplication", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborReplication", Verbs: []string{"create", "delete", "get", "list"}},
+		{Name: "harborreplications", SingularName: "harborreplication", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborReplication", Verbs: []string{"create", "delete", "get", "list", "patch", "update"}},
 		{Name: "harborrepositories", SingularName: "harborrepository", Namespaced: true, Group: "harbor.goharbor.io", Version: "v1alpha1", Kind: "HarborRepository", Verbs: []string{"get", "list"}},
 	}
 	// kube-apiserver refreshes aggregated discovery shortly after the APIService becomes available.

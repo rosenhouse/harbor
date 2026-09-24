@@ -383,7 +383,7 @@ func schema_pkg_apis_harbor_v1alpha1_HarborReplication(ref common.ReferenceCallb
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "HarborReplication copies artifacts from a remote registry into the project that the namespace is labeled with. It is a Harbor replication policy in pull mode. It runs once when created, and then on its schedule. It cannot be updated. Delete and recreate it to change it.",
+				Description: "HarborReplication copies artifacts from a remote registry into the project that the namespace is labeled with. It is a Harbor replication policy in pull mode. It runs once when created, and then on its schedule. Updates cannot change it. Delete and recreate it to change it.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -409,8 +409,9 @@ func schema_pkg_apis_harbor_v1alpha1_HarborReplication(ref common.ReferenceCallb
 					},
 					"spec": {
 						SchemaProps: spec.SchemaProps{
-							Default: map[string]interface{}{},
-							Ref:     ref(v1alpha1.HarborReplicationSpec{}.OpenAPIModelName()),
+							Description: "Spec is what to copy, and when.",
+							Default:     map[string]interface{}{},
+							Ref:         ref(v1alpha1.HarborReplicationSpec{}.OpenAPIModelName()),
 						},
 					},
 					"status": {
@@ -446,7 +447,7 @@ func schema_pkg_apis_harbor_v1alpha1_HarborReplicationExecution(ref common.Refer
 					},
 					"trigger": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Possible enum values:\n - `\"Manual\"` is a run started on request, such as the run when the replication is created.\n - `\"Scheduled\"` is a run on the schedule.\n - `\"Unknown\"` is a trigger that the server doesn't recognize.",
+							Description: "Trigger is what started the run.\n\nPossible enum values:\n - `\"Manual\"` is a run started on request, such as the run when the replication is created.\n - `\"Scheduled\"` is a run on the schedule.\n - `\"Unknown\"` is a trigger that the server doesn't recognize.",
 							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
@@ -455,7 +456,7 @@ func schema_pkg_apis_harbor_v1alpha1_HarborReplicationExecution(ref common.Refer
 					},
 					"phase": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Possible enum values:\n - `\"Failed\"`\n - `\"InProgress\"`\n - `\"Stopped\"`\n - `\"Succeeded\"`\n - `\"Unknown\"` is a state that the server doesn't recognize.",
+							Description: "Phase is the state of the run.\n\nPossible enum values:\n - `\"Failed\"`\n - `\"InProgress\"`\n - `\"Stopped\"`\n - `\"Succeeded\"`\n - `\"Unknown\"` is a state that the server doesn't recognize.",
 							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
@@ -464,19 +465,21 @@ func schema_pkg_apis_harbor_v1alpha1_HarborReplicationExecution(ref common.Refer
 					},
 					"message": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Message is Harbor's status text.",
+							Description: "Message is Harbor's status text, such as why the run failed.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"startTime": {
 						SchemaProps: spec.SchemaProps{
-							Ref: ref(v1.Time{}.OpenAPIModelName()),
+							Description: "StartTime is when the run started.",
+							Ref:         ref(v1.Time{}.OpenAPIModelName()),
 						},
 					},
 					"endTime": {
 						SchemaProps: spec.SchemaProps{
-							Ref: ref(v1.Time{}.OpenAPIModelName()),
+							Description: "EndTime is when the run ended.",
+							Ref:         ref(v1.Time{}.OpenAPIModelName()),
 						},
 					},
 					"total": {
@@ -602,7 +605,7 @@ func schema_pkg_apis_harbor_v1alpha1_HarborReplicationSpec(ref common.ReferenceC
 					},
 					"tag": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Tag is a Harbor tag filter, a glob such as 1.27*. Use * to copy every tag.",
+							Description: "Tag is a Harbor tag filter, a glob such as 1.27*. Use * to copy every tag. It has at most two * and one {} group, so that Harbor matches it quickly.",
 							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
@@ -638,7 +641,7 @@ func schema_pkg_apis_harbor_v1alpha1_HarborReplicationStatus(ref common.Referenc
 					},
 					"lastExecution": {
 						SchemaProps: spec.SchemaProps{
-							Description: "LastExecution is the newest run. It is empty until the first run starts.",
+							Description: "LastExecution is the newest run that Harbor did not skip. It is empty until the first run starts.",
 							Ref:         ref(v1alpha1.HarborReplicationExecution{}.OpenAPIModelName()),
 						},
 					},

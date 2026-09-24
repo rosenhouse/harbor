@@ -20,13 +20,22 @@ import (
 )
 
 var (
-	scheme = runtime.NewScheme()
+	// served names the kinds of the OpenAPI definitions, with only the served version.
+	served = newScheme()
+	// scheme also registers HarborReplication as its internal version, which patches convert through.
+	scheme = newScheme()
 	codecs = serializer.NewCodecFactory(scheme)
 )
 
 func init() {
-	utilruntime.Must(v1alpha1.AddToScheme(scheme))
-	metav1.AddToGroupVersion(scheme, schema.GroupVersion{Version: "v1"})
+	scheme.AddKnownTypes(schema.GroupVersion{Group: v1alpha1.GroupName, Version: runtime.APIVersionInternal}, &v1alpha1.HarborReplication{})
+}
+
+func newScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	utilruntime.Must(v1alpha1.AddToScheme(s))
+	metav1.AddToGroupVersion(s, schema.GroupVersion{Version: "v1"})
+	return s
 }
 
 // withoutProtobuf stops clients from negotiating protobuf, which the types don't implement.
@@ -43,7 +52,7 @@ func (w withoutProtobuf) SupportedMediaTypes() []runtime.SerializerInfo {
 // NewConfig returns a server config without serving, authentication, or authorization.
 func NewConfig() *genericapiserver.Config {
 	c := genericapiserver.NewConfig(codecs)
-	namer := openapi.NewDefinitionNamer(scheme)
+	namer := openapi.NewDefinitionNamer(served)
 	c.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(generatedopenapi.GetOpenAPIDefinitions, namer)
 	c.OpenAPIConfig.Info.Title = "Harbor"
 	c.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(generatedopenapi.GetOpenAPIDefinitions, namer)

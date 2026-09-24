@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/utils/ptr"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apis/harbor/v1alpha1"
@@ -27,11 +29,11 @@ import (
 
 func newReplications() (*Replications, *fakeReplicationHarbor, namespaceObjects) {
 	h := &fakeReplicationHarbor{registries: []harbor.Registry{
-		{ID: 3, Name: "hub", Type: "docker-hub"},
-		{ID: 5, Name: "quay", Type: "quay"},
-		{ID: 9, Name: "other", Type: "harbor"},
+		{ID: 3, Name: "hub"},
+		{ID: 5, Name: "quay"},
+		{ID: 9, Name: "other"},
 	}}
-	n := namespaceObjects{"ns1": namespace("ns1"), "ns2": namespace("ns2")}
+	n := namespacesNamed("ns1", "ns2")
 	r := NewReplications(h, n, replicationConfig)
 	r.retryInterval, r.stopWait = time.Millisecond, 50*time.Millisecond
 	return r, h, n
@@ -277,22 +279,46 @@ func TestValidateReplication(t *testing.T) {
 		"long destination": {change: func(o *v1alpha1.HarborReplication) {
 			o.Spec.Repository = strings.Repeat("a", 255-len("proj/k8s/ns1/nginx/")+1)
 		}, want: []string{"spec.repository"}},
-		"no tag":                       {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "" }, want: []string{"spec.tag"}},
-		"long tag":                     {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = strings.Repeat("a", 129) }, want: []string{"spec.tag"}},
-		"five schedule fields":         {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 3 * * *" }, want: []string{"spec.schedule"}},
-		"seven schedule fields":        {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 3 * * * 2026" }, want: []string{"spec.schedule"}},
-		"schedule time zone":           {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "TZ=UTC 0 0 3 * * *" }, want: []string{"spec.schedule"}},
-		"schedule descriptor":          {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "@hourly" }, want: []string{"spec.schedule"}},
-		"double space in schedule":     {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0  0 3 * * *" }, want: []string{"spec.schedule"}},
-		"trailing space in schedule":   {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 3 * * * " }, want: []string{"spec.schedule"}},
-		"schedule out of range":        {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 24 * * *" }, want: []string{"spec.schedule"}},
-		"schedule minute out of range": {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 60 3 * * *" }, want: []string{"spec.schedule"}},
-		"schedule seconds":             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "30 0 3 * * *" }, want: []string{"spec.schedule"}},
-		"schedule every minute":        {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 * 3 * * *" }, want: []string{"spec.schedule"}},
-		"schedule minute step":         {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 */5 3 * * *" }, want: []string{"spec.schedule"}},
-		"schedule minute list":         {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0,30 3 * * *" }, want: []string{"spec.schedule"}},
-		"schedule minute range":        {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 1-2 3 * * *" }, want: []string{"spec.schedule"}},
-		"schedule minute with a sign":  {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 +5 3 * * *" }, want: []string{"spec.schedule"}},
+		"no tag":                               {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "" }, want: []string{"spec.tag"}},
+		"long tag":                             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = strings.Repeat("a", 129) }, want: []string{"spec.tag"}},
+		"tag pattern":                          {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "V_[0-9][^a-z]?.{1,2*}-*" }},
+		"tag pattern with three stars":         {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "*?*?*Z" }, want: []string{"spec.tag"}},
+		"tag pattern with many stars":          {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = strings.Repeat("*?", 12) + "Z" }, want: []string{"spec.tag"}},
+		"two alternatives":                     {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "{a,b}{c,d}" }, want: []string{"spec.tag"}},
+		"many alternatives":                    {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = strings.Repeat("{a,a}", 25) }, want: []string{"spec.tag"}},
+		"nested alternatives":                  {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "{a,{b,c}}" }, want: []string{"spec.tag"}},
+		"brace in character class":             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "[{]" }, want: []string{"spec.tag"}},
+		"alternatives in character class":      {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "{[}]" }, want: []string{"spec.tag"}},
+		"alternative ends in character class":  {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v{1,[}]" }, want: []string{"spec.tag"}},
+		"comma in character class":             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "{[a,b]}" }, want: []string{"spec.tag"}},
+		"unclosed character class":             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v[" }, want: []string{"spec.tag"}},
+		"empty character class":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v[]" }, want: []string{"spec.tag"}},
+		"open character range":                 {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v[0-]" }, want: []string{"spec.tag"}},
+		"unclosed alternatives":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v{1,{2}" }, want: []string{"spec.tag"}},
+		"unclosed group":                       {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v{1,2" }, want: []string{"spec.tag"}},
+		"unopened alternatives":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "}{1,2}" }},
+		"tag that JSON escapes":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "<" }, want: []string{"spec.tag"}},
+		"tag with a space":                     {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "1 2" }, want: []string{"spec.tag"}},
+		"tag with a slash":                     {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "a/b" }, want: []string{"spec.tag"}},
+		"tag with an escape":                   {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = `\*` }, want: []string{"spec.tag"}},
+		"five schedule fields":                 {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 3 * * *" }, want: []string{"spec.schedule"}},
+		"seven schedule fields":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 3 * * * 2026" }, want: []string{"spec.schedule"}},
+		"schedule time zone":                   {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "TZ=UTC 0 0 3 * * *" }, want: []string{"spec.schedule"}},
+		"schedule descriptor":                  {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "@hourly" }, want: []string{"spec.schedule"}},
+		"double space in schedule":             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0  0 3 * * *" }, want: []string{"spec.schedule"}},
+		"trailing space in schedule":           {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 3 * * * " }, want: []string{"spec.schedule"}},
+		"schedule out of range":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 24 * * *" }, want: []string{"spec.schedule"}},
+		"schedule minute out of range":         {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 60 3 * * *" }, want: []string{"spec.schedule"}},
+		"schedule seconds":                     {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "30 0 3 * * *" }, want: []string{"spec.schedule"}},
+		"schedule every minute":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 * 3 * * *" }, want: []string{"spec.schedule"}},
+		"schedule minute step":                 {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 */5 3 * * *" }, want: []string{"spec.schedule"}},
+		"schedule minute list":                 {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0,30 3 * * *" }, want: []string{"spec.schedule"}},
+		"schedule minute range":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 1-2 3 * * *" }, want: []string{"spec.schedule"}},
+		"schedule minute with a sign":          {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 +5 3 * * *" }, want: []string{"spec.schedule"}},
+		"schedule on February 29":              {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 0 29 2 *" }},
+		"schedule on February 30":              {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 0 30 2 *" }, want: []string{"spec.schedule"}},
+		"schedule on April 31":                 {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 0 31 4 *" }, want: []string{"spec.schedule"}},
+		"schedule on a weekday of February 30": {change: func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 0 30 2 1" }},
 		"schedule that fits in length": {change: func(o *v1alpha1.HarborReplication) {
 			o.Spec.Schedule = "0 5 0,2,4,6,8,10,12,14,16,18,20,22 1,8,15,22 1,2,3,4,5,6,7,8,9 *"
 		}},
@@ -330,7 +356,7 @@ func TestValidateReplication(t *testing.T) {
 func TestCreateReplicationInNamespaceWithoutProject(t *testing.T) {
 	r, h, _ := newReplications()
 	_, err := r.Create(inNamespace("ns3"), replication("nginx"), nil, &metav1.CreateOptions{})
-	if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "namespace ns3 is not labeled") {
+	if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "namespace ns3 does not exist, or is not labeled") {
 		t.Errorf("got %v, want Forbidden", err)
 	}
 	if len(h.calls) != 0 {
@@ -442,19 +468,64 @@ func TestCreateReplicationThatHarborStoresDifferently(t *testing.T) {
 	}
 }
 
-func TestCreateReplicationThatDoesNotStart(t *testing.T) {
-	for _, method := range []string{"StartReplication", "LatestReplicationExecution"} {
-		t.Run(method, func(t *testing.T) {
+func TestCreateReplicationWhoseExecutionCannotBeRead(t *testing.T) {
+	r, h, _ := newReplications()
+	h.errs = map[string]error{"LatestReplicationExecution": harbor.ErrUnavailable}
+	out := create(t, r, "ns1", replication("nginx"))
+	if out.Status.LastExecution != nil {
+		t.Errorf("last execution %+v, want none", out.Status.LastExecution)
+	}
+	if diff := cmp.Diff([]string{"CreateReplicationPolicy k8s.proj.ns1.nginx", "StartReplication 1"}, h.writes()); diff != "" {
+		t.Errorf("writes (-want +got):\n%s", diff)
+	}
+}
+
+// A create that fails after Harbor may have stored the policy deletes the policy, so that a retry creates and starts it.
+func TestCreateReplicationThatFailsInHarbor(t *testing.T) {
+	for name, tc := range map[string]struct {
+		errs      map[string]error
+		lostReply bool
+		writes    []string
+	}{
+		"policy not stored":           {map[string]error{"CreateReplicationPolicy": harbor.ErrUnavailable}, false, []string{"CreateReplicationPolicy k8s.proj.ns1.nginx"}},
+		"reply to the create lost":    {nil, true, []string{"CreateReplicationPolicy k8s.proj.ns1.nginx", "DeleteReplicationPolicy 1"}},
+		"reply lost, policy unlisted": {map[string]error{"ListReplicationPolicies": harbor.ErrUnavailable}, true, []string{"CreateReplicationPolicy k8s.proj.ns1.nginx"}},
+		"policy unreadable":           {map[string]error{"GetReplicationPolicy": harbor.ErrUnavailable}, false, []string{"CreateReplicationPolicy k8s.proj.ns1.nginx", "DeleteReplicationPolicy 1"}},
+		"run not started":             {map[string]error{"StartReplication": harbor.ErrUnavailable}, false, []string{"CreateReplicationPolicy k8s.proj.ns1.nginx", "StartReplication 1", "DeleteReplicationPolicy 1"}},
+		"run not started, undeleted":  {map[string]error{"StartReplication": harbor.ErrUnavailable, "DeleteReplicationPolicy": harbor.ErrUnavailable}, false, []string{"CreateReplicationPolicy k8s.proj.ns1.nginx", "StartReplication 1", "DeleteReplicationPolicy 1"}},
+	} {
+		t.Run(name, func(t *testing.T) {
 			r, h, _ := newReplications()
-			h.errs = map[string]error{method: harbor.ErrUnavailable}
-			out := create(t, r, "ns1", replication("nginx"))
-			if out.Status.LastExecution != nil {
-				t.Errorf("last execution %+v, want none", out.Status.LastExecution)
-			}
-			if _, ok := h.policy("k8s.proj.ns1.nginx"); !ok {
-				t.Error("the policy is gone")
+			h.errs, h.lostReply = tc.errs, tc.lostReply
+			_, err := r.Create(inNamespace("ns1"), replication("nginx"), nil, &metav1.CreateOptions{})
+			checkHarborError(t, err, http.StatusServiceUnavailable, "harbor is unavailable")
+			if diff := cmp.Diff(tc.writes, h.writes()); diff != "" {
+				t.Errorf("writes (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestCreateReplicationWhoseRequestEnds(t *testing.T) {
+	r, h, _ := newReplications()
+	ctx, cancel := context.WithCancel(inNamespace("ns1"))
+	h.failEndedRequests, h.onCreate = true, cancel
+	_, err := r.Create(ctx, replication("nginx"), nil, &metav1.CreateOptions{})
+	checkHarborError(t, err, http.StatusServiceUnavailable, "harbor is unavailable")
+	if _, ok := h.policy("k8s.proj.ns1.nginx"); ok {
+		t.Error("the policy is left")
+	}
+}
+
+func TestCreateReplicationThatFailsKeepsAnotherRequestsPolicy(t *testing.T) {
+	r, h, _ := newReplications()
+	create(t, r, "ns1", replication("nginx"))
+	h.calls = nil
+	h.errs = map[string]error{"CreateReplicationPolicy": harbor.ErrUnavailable}
+	_, err := r.Create(inNamespace("ns1"), replication("nginx"), nil, &metav1.CreateOptions{})
+	checkHarborError(t, err, http.StatusServiceUnavailable, "harbor is unavailable")
+	if diff := cmp.Diff([]string{"CreateReplicationPolicy k8s.proj.ns1.nginx"}, h.writes()); diff != "" {
+		t.Errorf("writes (-want +got):\n%s", diff)
 	}
 }
 
@@ -527,6 +598,19 @@ func TestGetReplication(t *testing.T) {
 	n["ns1"] = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns1", UID: "recreated"}}
 	if _, err := getReplication(r, "ns1", "nginx"); !apierrors.IsNotFound(err) {
 		t.Errorf("in a recreated namespace: got %v, want NotFound", err)
+	}
+}
+
+// Requests in one namespace never reach another's replications, even from a Harbor client that ignores the name prefix.
+func TestReplicationsStayInTheirNamespace(t *testing.T) {
+	r, h, _ := newReplications()
+	create(t, r, "ns2", replication("nginx"))
+	h.ignorePrefix = true
+	if _, err := getReplication(r, "ns1", "nginx"); !apierrors.IsNotFound(err) {
+		t.Errorf("get: got %v, want NotFound", err)
+	}
+	if got := listReplications(t, r, "ns1", nil); len(got) != 0 {
+		t.Errorf("list: got %v", got)
 	}
 }
 
@@ -730,9 +814,6 @@ func TestDeleteReplicationWhileAnOlderExecutionRuns(t *testing.T) {
 	if _, err := h.StartReplication(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := getReplication(r, "ns1", "nginx"); got.Status.LastExecution.Phase != v1alpha1.ReplicationPhaseFailed {
-		t.Fatalf("latest execution %+v, want the skipped one", got.Status.LastExecution)
-	}
 	h.calls = nil
 	if _, err := deleteReplication(r, "ns1", "nginx", nil); err != nil {
 		t.Fatal(err)
@@ -882,13 +963,356 @@ func TestDeleteReplicationHarborErrors(t *testing.T) {
 	}
 }
 
+// patch returns what the API server passes to Update for a patch that changes the current object.
+// Like the API server's, it fails with NotFound on an object without a UID.
+func patch(change func(*v1alpha1.HarborReplication)) rest.UpdatedObjectInfo {
+	return rest.DefaultUpdatedObjectInfo(nil, func(_ context.Context, _, current runtime.Object) (runtime.Object, error) {
+		obj := current.(*v1alpha1.HarborReplication).DeepCopy()
+		if obj.UID == "" {
+			return nil, apierrors.NewNotFound(replicationsResource, obj.Name)
+		}
+		change(obj)
+		return obj, nil
+	})
+}
+
+func updateReplication(r *Replications, namespace, name string, objInfo rest.UpdatedObjectInfo, forceAllowCreate bool, options *metav1.UpdateOptions) (*v1alpha1.HarborReplication, error) {
+	obj, created, err := r.Update(inNamespace(namespace), name, objInfo, nil, nil, forceAllowCreate, options)
+	if err != nil {
+		return nil, err
+	}
+	if created {
+		return nil, errors.New("created")
+	}
+	return obj.(*v1alpha1.HarborReplication), nil
+}
+
+// labeledReplication creates ns1/nginx with labels and annotations, and ends its execution.
+func labeledReplication(t *testing.T) (*Replications, *fakeReplicationHarbor, *v1alpha1.HarborReplication) {
+	t.Helper()
+	r, h, _ := newReplications()
+	obj := replication("nginx")
+	obj.Labels = map[string]string{"app": "web"}
+	obj.Annotations = map[string]string{"note": "x"}
+	create(t, r, "ns1", obj)
+	h.finish("Succeed")
+	current, err := getReplication(r, "ns1", "nginx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.calls = nil
+	return r, h, current
+}
+
+func TestUpdateReplicationWithoutChanges(t *testing.T) {
+	for name, change := range map[string]func(*v1alpha1.HarborReplication){
+		"nothing": func(*v1alpha1.HarborReplication) {},
+		"managed fields": func(o *v1alpha1.HarborReplication) {
+			o.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "kubectl", Operation: metav1.ManagedFieldsOperationApply}}
+		},
+		"status": func(o *v1alpha1.HarborReplication) {
+			o.Status = v1alpha1.HarborReplicationStatus{Destination: "elsewhere"}
+		},
+		"no resource version": func(o *v1alpha1.HarborReplication) { o.ResourceVersion = "" },
+		"empty finalizers":    func(o *v1alpha1.HarborReplication) { o.Finalizers = []string{} },
+		"manifest": func(o *v1alpha1.HarborReplication) {
+			*o = v1alpha1.HarborReplication{ObjectMeta: metav1.ObjectMeta{Name: o.Name, Labels: o.Labels, Annotations: o.Annotations}, Spec: o.Spec}
+		},
+		// Client-side kubectl apply adds it to a replication that it did not create.
+		"kubectl's last-applied configuration": func(o *v1alpha1.HarborReplication) {
+			o.Annotations[corev1.LastAppliedConfigAnnotation] = "{}"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, h, current := labeledReplication(t)
+			got, err := updateReplication(r, "ns1", "nginx", patch(change), true, &metav1.UpdateOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(current, got); diff != "" {
+				t.Errorf("(-want +got):\n%s", diff)
+			}
+			if w := h.writes(); len(w) != 0 {
+				t.Errorf("writes %v, want none", w)
+			}
+		})
+	}
+}
+
+func TestUpdateChangedReplication(t *testing.T) {
+	for name, tc := range map[string]struct {
+		change func(*v1alpha1.HarborReplication)
+		fields []string
+	}{
+		"tag":         {func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "1.28*" }, []string{"spec"}},
+		"schedule":    {func(o *v1alpha1.HarborReplication) { o.Spec.Schedule = "0 0 3 * * *" }, []string{"spec"}},
+		"new label":   {func(o *v1alpha1.HarborReplication) { o.Labels["team"] = "a" }, []string{"metadata.labels"}},
+		"no labels":   {func(o *v1alpha1.HarborReplication) { o.Labels = nil }, []string{"metadata.labels"}},
+		"annotations": {func(o *v1alpha1.HarborReplication) { o.Annotations["note"] = "y" }, []string{"metadata.annotations"}},
+		"finalizers":  {func(o *v1alpha1.HarborReplication) { o.Finalizers = []string{"example.com/x"} }, []string{"metadata.finalizers"}},
+		"owner references": {func(o *v1alpha1.HarborReplication) {
+			o.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "x", UID: "u"}}
+		}, []string{"metadata.ownerReferences"}},
+		"uid":            {func(o *v1alpha1.HarborReplication) { o.UID = "other" }, []string{"metadata.uid"}},
+		"spec and label": {func(o *v1alpha1.HarborReplication) { o.Spec.Tag, o.Labels = "*", nil }, []string{"metadata.labels", "spec"}},
+	} {
+		for _, options := range []*metav1.UpdateOptions{{}, {DryRun: []string{metav1.DryRunAll}}} {
+			t.Run(fmt.Sprintf("%s %v", name, options.DryRun), func(t *testing.T) {
+				r, h, _ := labeledReplication(t)
+				_, err := updateReplication(r, "ns1", "nginx", patch(tc.change), false, options)
+				var status apierrors.APIStatus
+				if !apierrors.IsInvalid(err) || !errors.As(err, &status) {
+					t.Fatalf("got %v, want Invalid", err)
+				}
+				var fields []string
+				for _, c := range status.Status().Details.Causes {
+					fields = append(fields, c.Field)
+					if !strings.Contains(c.Message, ": field is immutable") {
+						t.Errorf("%s: message %q, want the standard immutable message", c.Field, c.Message)
+					}
+				}
+				if diff := cmp.Diff(tc.fields, fields); diff != "" {
+					t.Errorf("fields (-want +got):\n%s", diff)
+				}
+				if w := h.writes(); len(w) != 0 {
+					t.Errorf("writes %v, want none", w)
+				}
+			})
+		}
+	}
+}
+
+func TestUpdateChangedReplicationSaysHowToChangeIt(t *testing.T) {
+	r, _, _ := labeledReplication(t)
+	_, err := updateReplication(r, "ns1", "nginx", patch(func(o *v1alpha1.HarborReplication) {
+		o.Spec.Tag = "1.28*"
+		o.Annotations["note"] = strings.Repeat("y", 100)
+	}), false, &metav1.UpdateOptions{})
+	want := `HarborReplication.harbor.goharbor.io "nginx" is invalid: [` +
+		`metadata.annotations: Invalid value: field is immutable; delete and recreate the replication to change it, ` +
+		`spec: Invalid value: {"registry":"hub","repository":"library/nginx","tag":"1.28*"}: field is immutable; delete and recreate the replication to change it]`
+	if err == nil || err.Error() != want {
+		t.Errorf("got %v\nwant %s", err, want)
+	}
+}
+
+func TestUpdateReplicationWithResourceVersion(t *testing.T) {
+	r, h, current := labeledReplication(t)
+	if _, err := updateReplication(r, "ns1", "nginx", patch(func(*v1alpha1.HarborReplication) {}), false, &metav1.UpdateOptions{}); err != nil {
+		t.Errorf("current resource version: %v", err)
+	}
+	h.finish("Failed")
+	_, err := updateReplication(r, "ns1", "nginx", patch(func(o *v1alpha1.HarborReplication) { o.ResourceVersion = current.ResourceVersion }), false, &metav1.UpdateOptions{})
+	if !apierrors.IsConflict(err) || !strings.Contains(err.Error(), "the object has been modified") {
+		t.Errorf("stale resource version: got %v, want Conflict", err)
+	}
+}
+
+// An update's body sets a UID precondition.
+func TestUpdateReplicationWithUIDPrecondition(t *testing.T) {
+	r, h, current := labeledReplication(t)
+	obj := current.DeepCopy()
+	obj.UID = "other"
+	_, err := updateReplication(r, "ns1", "nginx", rest.DefaultUpdatedObjectInfo(obj), false, &metav1.UpdateOptions{})
+	if !apierrors.IsConflict(err) || !strings.Contains(err.Error(), "the UID in the precondition (other) does not match the UID in record ("+string(current.UID)+")") {
+		t.Errorf("got %v, want Conflict", err)
+	}
+	if w := h.writes(); len(w) != 0 {
+		t.Errorf("writes %v, want none", w)
+	}
+}
+
+// Admission sees the current replication, even when the request leaves out or changes what the server fills in or ignores.
+func TestUpdateReplicationThatAdmissionRejects(t *testing.T) {
+	r, _, current := labeledReplication(t)
+	rejected := apierrors.NewForbidden(replicationsResource, "nginx", errors.New("no"))
+	var validated, validatedOld runtime.Object
+	manifest := patch(func(o *v1alpha1.HarborReplication) {
+		o.UID, o.ResourceVersion, o.CreationTimestamp, o.Generation = "", "", metav1.Time{}, 0
+		o.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "kubectl", Operation: metav1.ManagedFieldsOperationApply}}
+		o.Status = v1alpha1.HarborReplicationStatus{}
+	})
+	_, _, err := r.Update(inNamespace("ns1"), "nginx", manifest, nil, func(_ context.Context, o, old runtime.Object) error {
+		validated, validatedOld = o, old
+		return rejected
+	}, false, &metav1.UpdateOptions{})
+	if err != rejected {
+		t.Errorf("got %v, want %v", err, rejected)
+	}
+	if diff := cmp.Diff(current, validated); diff != "" {
+		t.Errorf("validated object (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(current, validatedOld); diff != "" {
+		t.Errorf("validated old object (-want +got):\n%s", diff)
+	}
+}
+
+func TestUpdateMissingReplication(t *testing.T) {
+	r, h, _ := newReplications()
+	for _, tc := range []struct{ namespace, name string }{{"ns1", "nginx"}, {"ns3", "nginx"}, {"ns1", "a.b"}} {
+		if _, err := updateReplication(r, tc.namespace, tc.name, rest.DefaultUpdatedObjectInfo(replication(tc.name)), false, &metav1.UpdateOptions{}); !apierrors.IsNotFound(err) {
+			t.Errorf("%s/%s: got %v, want NotFound", tc.namespace, tc.name, err)
+		}
+	}
+	if w := h.writes(); len(w) != 0 {
+		t.Errorf("writes %v, want none", w)
+	}
+}
+
+func TestUpdateCreatesMissingReplicationWhenForced(t *testing.T) {
+	r, h, _ := newReplications()
+	obj := replication("nginx")
+	obj.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "kubectl", Operation: metav1.ManagedFieldsOperationApply}}
+	var validated *v1alpha1.HarborReplication
+	createValidation := func(_ context.Context, o runtime.Object) error {
+		validated = o.(*v1alpha1.HarborReplication)
+		return nil
+	}
+	// Like genericregistry.Store, Update gives an empty old object, from which apply builds the new one.
+	var old runtime.Object
+	apply := rest.DefaultUpdatedObjectInfo(obj, func(_ context.Context, obj, o runtime.Object) (runtime.Object, error) {
+		old = o
+		return obj, nil
+	})
+	out, created, err := r.Update(inNamespace("ns1"), "nginx", apply, createValidation, nil, true, &metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(runtime.Object(&v1alpha1.HarborReplication{}), old); diff != "" {
+		t.Errorf("old object (-want +got):\n%s", diff)
+	}
+	if !created {
+		t.Error("not created")
+	}
+	if diff := cmp.Diff([]string{"CreateReplicationPolicy k8s.proj.ns1.nginx", "StartReplication 1"}, h.writes()); diff != "" {
+		t.Errorf("writes (-want +got):\n%s", diff)
+	}
+	if validated == nil || validated.UID == "" || validated.ManagedFields != nil {
+		t.Errorf("validated %+v, want a prepared object", validated)
+	}
+	got, err := getReplication(r, "ns1", "nginx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(got, out); diff != "" {
+		t.Errorf("(-get +update):\n%s", diff)
+	}
+}
+
+// Two server-side applies can race to create a replication. The one that loses applies to the replication that the other created.
+func TestUpdateCreatesReplicationThatAnotherRequestCreates(t *testing.T) {
+	for name, tc := range map[string]struct {
+		other *v1alpha1.HarborReplication
+		check func(error) bool
+	}{
+		"same":      {replication("nginx"), func(err error) bool { return err == nil }},
+		"different": {replication("web"), apierrors.IsInvalid},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, _, _ := newReplications()
+			tc.other.Name = "nginx"
+			var once sync.Once
+			apply := rest.DefaultUpdatedObjectInfo(nil, func(_ context.Context, _, old runtime.Object) (runtime.Object, error) {
+				once.Do(func() { create(t, r, "ns1", tc.other) })
+				obj := old.(*v1alpha1.HarborReplication).DeepCopy()
+				obj.Name, obj.Spec = "nginx", replication("nginx").Spec
+				return obj, nil
+			})
+			out, err := updateReplication(r, "ns1", "nginx", apply, true, &metav1.UpdateOptions{})
+			if !tc.check(err) {
+				t.Fatalf("got %v", err)
+			}
+			if err != nil {
+				return
+			}
+			got, err := getReplication(r, "ns1", "nginx")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(got, out); diff != "" {
+				t.Errorf("(-get +update):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestUpdateCreatesMissingReplicationOverHiddenPolicy(t *testing.T) {
+	r, _, n := newReplications()
+	create(t, r, "ns1", replication("nginx"))
+	n["ns1"] = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns1", UID: "recreated"}}
+	_, _, err := r.Update(inNamespace("ns1"), "nginx", rest.DefaultUpdatedObjectInfo(replication("nginx")), nil, nil, true, &metav1.UpdateOptions{})
+	if !apierrors.IsAlreadyExists(err) || !strings.Contains(err.Error(), "A Harbor administrator must delete it") {
+		t.Errorf("got %v, want AlreadyExists that names the hidden policy", err)
+	}
+}
+
+func TestUpdateCreatesMissingReplicationAsCreateDoes(t *testing.T) {
+	invalid := replication("nginx")
+	invalid.Spec.Registry = "other"
+	rejected := apierrors.NewForbidden(replicationsResource, "nginx", errors.New("no"))
+	for name, tc := range map[string]struct {
+		obj              runtime.Object
+		namespace        string
+		createValidation rest.ValidateObjectFunc
+		check            func(error) bool
+	}{
+		"invalid":           {invalid, "ns1", nil, apierrors.IsInvalid},
+		"other kind":        {&v1alpha1.HarborArtifact{}, "ns1", nil, apierrors.IsBadRequest},
+		"unlabeled":         {replication("nginx"), "ns3", nil, apierrors.IsForbidden},
+		"admission rejects": {replication("nginx"), "ns1", func(context.Context, runtime.Object) error { return rejected }, func(err error) bool { return err == rejected }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, h, _ := newReplications()
+			_, _, err := r.Update(inNamespace(tc.namespace), "nginx", rest.DefaultUpdatedObjectInfo(tc.obj), tc.createValidation, nil, true, &metav1.UpdateOptions{})
+			if !tc.check(err) {
+				t.Errorf("got %v", err)
+			}
+			if w := h.writes(); len(w) != 0 {
+				t.Errorf("writes %v, want none", w)
+			}
+		})
+	}
+}
+
+func TestUpdateCreatesMissingReplicationDryRun(t *testing.T) {
+	r, h, _ := newReplications()
+	out, created, err := r.Update(inNamespace("ns1"), "nginx", rest.DefaultUpdatedObjectInfo(replication("nginx")), nil, nil, true, &metav1.UpdateOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || out.(*v1alpha1.HarborReplication).Status.Destination != "proj/k8s/ns1/nginx" {
+		t.Errorf("created %v, %+v", created, out)
+	}
+	if w := h.writes(); len(w) != 0 {
+		t.Errorf("writes %v, want none", w)
+	}
+}
+
+func TestUpdateReplicationHarborErrors(t *testing.T) {
+	r, h, _ := labeledReplication(t)
+	h.errs = map[string]error{"ListReplicationPolicies": fmt.Errorf("%w: %w", harbor.ErrUnavailable, errLeak)}
+	_, _, err := r.Update(inNamespace("ns1"), "nginx", rest.DefaultUpdatedObjectInfo(replication("nginx")), nil, nil, true, &metav1.UpdateOptions{})
+	checkHarborError(t, err, http.StatusServiceUnavailable, "harbor is unavailable")
+	if w := h.writes(); len(w) != 0 {
+		t.Errorf("writes %v, want none", w)
+	}
+}
+
+func TestUpdateReplicationToOtherKind(t *testing.T) {
+	r, _, _ := labeledReplication(t)
+	if _, err := updateReplication(r, "ns1", "nginx", rest.DefaultUpdatedObjectInfo(&v1alpha1.HarborArtifact{}), false, &metav1.UpdateOptions{}); !apierrors.IsBadRequest(err) {
+		t.Errorf("got %v, want BadRequest", err)
+	}
+}
+
 func TestReplicationTable(t *testing.T) {
 	r, h, _ := newReplications()
 	scheduled := replication("web")
 	scheduled.Spec.Schedule = "0 0 3 * * *"
 	create(t, r, "ns1", scheduled)
-	h.errs = map[string]error{"StartReplication": harbor.ErrUnavailable}
 	create(t, r, "ns1", replication("api"))
+	api, _ := h.policy("k8s.proj.ns1.api")
+	h.executions = slices.DeleteFunc(h.executions, func(e harbor.ReplicationExecution) bool { return e.PolicyID == api.ID })
 	list, err := r.List(inNamespace("ns1"), nil)
 	if err != nil {
 		t.Fatal(err)

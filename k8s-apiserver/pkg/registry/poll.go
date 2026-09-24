@@ -15,7 +15,7 @@ import (
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 )
 
-// listConcurrency is how many requests a poll or list sends to Harbor at once.
+// listConcurrency is how many artifact lists a poll, or execution reads a list of replications, sends to Harbor at once.
 const listConcurrency = 4
 
 // retryDelay is how long a poller waits to retry a poll that fails after one that did not.
@@ -142,7 +142,7 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 	}
 	if linksErr != nil {
-		klog.ErrorS(linksErr, "Listing replication policies failed, so artifacts keep the replications that they were linked to before until the staleness limit", "project", p.store.project)
+		klog.ErrorS(linksErr, "Listing replication policies failed, so artifacts keep their links from the last list that succeeded", "project", p.store.project)
 	}
 	p.store.update(items, start, older, links, linksErr)
 	for repository, started := range older {

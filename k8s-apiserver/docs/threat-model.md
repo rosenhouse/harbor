@@ -51,6 +51,7 @@ This model covers an install from `deploy/`, with or without that component, as 
    Replication requests, and each poll's list of replication policies, carry the replication robot's credentials to the same URL as in boundary 4.
    Harbor authorizes them by system permission alone, and checks neither the project nor the registry endpoints of a policy ([replication.go](../../src/server/v2.0/handler/replication.go)).
    The server enforces those itself.
+   For each run, harbor-core lists the source repository's tags at the endpoint, and matches them against the tag pattern.
    Harbor's job service then pulls from the endpoint with the endpoint's credentials, and writes into the project as Harbor.
 
 ## Threats
@@ -131,6 +132,8 @@ Mitigations:
 - Replication requests use fixed messages too ([replications.go](../pkg/registry/replications.go)): `harbor is unavailable` (503), `harbor rejected the robot account credentials`, `harbor denied the robot account access`, or `unexpected error from harbor` (500), and `harbor rejected the replication policy` (400).
   Some create errors name the Harbor policy, whose name comes from the replication's namespace and name.
   Lists of artifacts by the replication label can fail with `listing replication policies failed`, followed by one of the 503 messages above.
+- A replication's `status.lastExecution.message` is Harbor's text for its last run, unfiltered.
+  It can hold endpoint URLs, such as Harbor's own in-cluster URL, and the source registry's responses, and anyone who can view the replication can read it.
 - The server logs the full error of a failed Harbor request.
   That error holds the request URL, the HTTP status, and Harbor's error message ([client.go](../pkg/harbor/client.go)).
   The credentials travel only in the `Authorization` header, which no error includes, and `net/http` redacts any password in a URL.
@@ -266,8 +269,10 @@ Removing `harbor.goharbor.io/project` from a namespace, or changing it, hides th
 Their policies stay in Harbor, and their schedules keep running.
 Kubernetes users can no longer see or delete them, and deleting the namespace no longer deletes them.
 Restoring the label shows them again.
-The same happens to the replications of an endpoint that `registries` no longer allows, to all replications when `--replication-prefix` changes or replications are disabled, and to a policy whose name, description, source, destination, filters, or trigger someone changes in Harbor.
-Other changes in Harbor, such as disabling a policy, leave it visible, and the server doesn't show them.
+The same happens to the replications of an endpoint that `registries` no longer allows, to all replications when `--replication-prefix` changes or replications are disabled, and to a policy whose name, source, destination, filters, trigger, or description's namespace, namespace UID, name, or spec someone changes in Harbor.
+Other changes in Harbor leave the policy visible.
+The server shows a change to the description's UID, labels, or annotations as a change to the replication, even to its UID.
+It doesn't show other changes, such as disabling the policy.
 
 Mitigations: delete the replications before you remove a label, an endpoint, or the component.
 A Harbor administrator can find the policies by their name prefix, `<prefix>.<project>.<namespace>.`, and delete them.
@@ -338,12 +343,18 @@ After a poll that fails, or that keeps a repository's artifacts from an earlier 
 Requests for replications call Harbor directly, as the replication robot ([replications.go](../pkg/registry/replications.go)):
 
 - A `get` makes one policy list and one execution read.
+  An execution read lists 10 executions at a time, until it finds one that Harbor did not skip.
 - A `list` makes one list of the policies of its namespace, or of every namespace, then one execution read per replication that it returns, 4 at a time.
 - A `create` lists the registry endpoints, then creates, reads, and starts the policy, and reads its execution.
+  If a step after the create fails, it deletes the policy, even after the request has ended, first listing the policies if Harbor did not return the policy's ID.
   A dry run lists the policies instead of creating one.
+- An `update` or `patch` finds the replication as a `get` does, and changes nothing. A server-side apply of a missing replication creates it as a `create` does.
 - A `delete` finds the replication as a `get` does, then deletes the policy.
   While Harbor refuses, because an execution runs, it lists and stops the running executions, and retries every second for up to 30 seconds.
-- Each replication runs jobs in Harbor's job service, which all of Harbor shares: once when it is created, and then on its schedule.
+- Each replication runs once when it is created, and then on its schedule.
+  Each run lists the source repository's tags in harbor-core, and matches each tag against the tag pattern.
+  harbor-core runs at most 10 of these flows at once per replica, for all of Harbor, and deleting a replication does not stop a flow that is running ([execution.go](../../src/controller/replication/execution.go)).
+  Then the run copies the matching artifacts in Harbor's job service, which all of Harbor shares.
 
 Limits:
 
@@ -352,8 +363,10 @@ Limits:
 - `--harbor-timeout` (10s) bounds each Harbor request, and `--harbor-staleness-limit` (5m) bounds each poll.
 - Each poll has at most 5 Harbor requests in flight: 4 for the project, and 1 for the replication policies.
 - Each replication `list` has at most 4 Harbor requests in flight.
-- Each replica serves at most 400 read requests and 200 creates and deletes at once.
+- Each replica serves at most 400 read requests and 200 other requests at once.
 - A schedule runs a replication at most once an hour. On Harbor 2.14 or later, runs of one replication don't overlap.
+- A schedule must match a date that exists. Harbor's job service loops forever on one that never runs, such as February 30 ([enqueuer.go](../../src/jobservice/period/enqueuer.go)).
+- A tag pattern has at most two `*` and one `{}` group. Harbor's matcher tries every way to match, so each `*` multiplies its time by up to the tag's length, and each `{}` group by its number of alternatives. With these limits, it matches a tag in milliseconds.
 - kube-apiserver's API Priority and Fairness applies to the requests it proxies, but not to direct calls to the Service.
 
 Residual risk: the polls' load on Harbor grows with the project's size and the number of replicas, but not with Kubernetes requests.
@@ -364,16 +377,19 @@ Beyond 100,000, those policy lists fail.
 Then cluster-wide lists of replications fail, and, once `--harbor-staleness-limit` passes, so do lists of artifacts by the `harbor.goharbor.io/replication` label.
 Lists of replications in one namespace read only its policies, so other namespaces' replications don't affect them.
 A replication creator can load Harbor's job service, which also runs garbage collection, scans, and other replications, with many replications, or with one of a large repository and `tag: "*"`.
+A source repository with many long tags still costs harbor-core some milliseconds per tag in each run, and many such replications can occupy its 10 flows, which delays every replication in Harbor.
 The server ignores `limit` and `continue`.
 
 The page and size limits do not bound memory in practice.
 Each replica holds the project in memory ([store.go](../pkg/registry/store.go)).
 A list holds every object in memory, once per labeled namespace, and then encodes the whole response.
+Each poll also holds every replication policy of the project, each with up to 8 KiB of labels and annotations, and so does a cluster-wide list of replications.
+Nothing limits the number of replications, so replication creators can grow every replica's memory, by about 80 MiB for 10,000 replications with the most metadata.
 The pods request 64 MiB of memory, and have no memory limit and no priority class.
 So a list of a large project across all namespaces, such as from a monitoring or dashboard ServiceAccount with cluster-wide `list`, or a few concurrent lists, can grow a pod far beyond its request.
 Under node memory pressure, such a pod is among the first that the kubelet evicts or the kernel kills, and other pods on the node suffer too.
 If both replicas go, the APIService becomes unavailable, which breaks discovery and namespace deletion cluster-wide.
-Not yet done: a memory limit with headroom, a cap on the objects or bytes in a response that fails the request instead of exhausting memory, and `priorityClassName: system-cluster-critical`, as metrics-server uses.
+Not yet done: a memory limit with headroom, a cap on the objects or bytes in a response that fails the request instead of exhausting memory, a cap on the number of replications, and `priorityClassName: system-cluster-critical`, as metrics-server uses.
 
 ### Harbor outages
 
@@ -411,6 +427,7 @@ If all replicas restart then, the APIService is unavailable for that long.
 Project members who can push or update repositories control repository names, descriptions, tags, and OCI annotations.
 The server copies them into `status` without interpreting them.
 It derives object names that fit Kubernetes rules, and skips an artifact whose digest cannot form a name.
+The source registry controls part of each replication's `status.lastExecution.message`, which can quote its responses.
 Clients that display these fields should treat them as untrusted.
 
 Residual risk: a pusher can make one repository's artifact list fail on every poll, such as by pushing more than 100000 artifacts, or artifacts whose annotations make a page exceed 16 MiB.

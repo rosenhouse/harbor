@@ -18,4 +18,4 @@ metadata:
 rules:
   - apiGroups: [harbor.goharbor.io]
     resources: [harborreplications]
-    verbs: [create, delete]
+    verbs: [create, update, patch, delete]

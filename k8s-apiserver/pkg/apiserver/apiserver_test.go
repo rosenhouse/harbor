@@ -1,7 +1,6 @@
 package apiserver_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
 	restclient "k8s.io/client-go/rest"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apiserver"
@@ -64,6 +64,8 @@ func newHandlerWithReplications(t *testing.T, replications *registry.Replication
 	c := apiserver.NewConfig()
 	c.ExternalAddress = "localhost:443"
 	c.LoopbackClientConfig = &restclient.Config{}
+	// Server-side apply authorizes the create that it may do.
+	c.Authorization.Authorizer = authorizerfactory.NewAlwaysAllowAuthorizer()
 	s, err := apiserver.New(c.Complete(nil), store, replications)
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +219,7 @@ func TestProtobufFallsBackToJSON(t *testing.T) {
 }
 
 func TestOpenAPI(t *testing.T) {
-	h := newHandler(t)
+	h := newReplicationHandler(t)
 	for _, tc := range []struct{ path, definitions string }{
 		{"/openapi/v2", "definitions"},
 		{"/openapi/v3/apis/harbor.goharbor.io/v1alpha1", "components.schemas"},
@@ -228,7 +230,7 @@ func TestOpenAPI(t *testing.T) {
 		for _, key := range strings.Split(tc.definitions, ".") {
 			defs, _ = defs[key].(map[string]any)
 		}
-		for _, k := range kinds {
+		for _, k := range append(kinds, struct{ resource, kind string }{"harborreplications", "HarborReplication"}) {
 			def, _ := defs["io.goharbor.harbor.v1alpha1."+k.kind].(map[string]any)
 			gvks, _ := json.Marshal(def["x-kubernetes-group-version-kind"])
 			want := `[{"group":"harbor.goharbor.io","kind":"` + k.kind + `","version":"v1alpha1"}]`
@@ -239,14 +241,35 @@ func TestOpenAPI(t *testing.T) {
 	}
 }
 
-// fakeReplicationHarbor has registry docker-hub, and no replication policies.
-type fakeReplicationHarbor struct{ registry.ReplicationHarbor }
+// fakeReplicationHarbor has registry docker-hub, and keeps the policies that it creates. They never run.
+type fakeReplicationHarbor struct {
+	registry.ReplicationHarbor
+	policies []harbor.ReplicationPolicy
+}
 
-func (fakeReplicationHarbor) ListRegistries(context.Context) ([]harbor.Registry, error) {
+func (*fakeReplicationHarbor) ListRegistries(context.Context) ([]harbor.Registry, error) {
 	return []harbor.Registry{{ID: 1, Name: "docker-hub"}}, nil
 }
 
-func (fakeReplicationHarbor) ListReplicationPolicies(context.Context, string) ([]harbor.ReplicationPolicy, error) {
+func (f *fakeReplicationHarbor) ListReplicationPolicies(_ context.Context, prefix string) ([]harbor.ReplicationPolicy, error) {
+	return slices.DeleteFunc(slices.Clone(f.policies), func(p harbor.ReplicationPolicy) bool { return !strings.HasPrefix(p.Name, prefix) }), nil
+}
+
+func (f *fakeReplicationHarbor) CreateReplicationPolicy(_ context.Context, p *harbor.ReplicationPolicy) (int64, error) {
+	stored := *p
+	stored.ID = int64(len(f.policies) + 1)
+	stored.SrcRegistry = &harbor.Registry{ID: 1, Name: "docker-hub"}
+	f.policies = append(f.policies, stored)
+	return stored.ID, nil
+}
+
+func (f *fakeReplicationHarbor) GetReplicationPolicy(_ context.Context, id int64) (*harbor.ReplicationPolicy, error) {
+	return &f.policies[id-1], nil
+}
+
+func (*fakeReplicationHarbor) StartReplication(context.Context, int64) (int64, error) { return 1, nil }
+
+func (*fakeReplicationHarbor) LatestReplicationExecution(context.Context, int64) (*harbor.ReplicationExecution, error) {
 	return nil, nil
 }
 
@@ -271,9 +294,23 @@ func TestReplicationsAreAbsentWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestReplicationsArePresentWhenEnabled(t *testing.T) {
-	h := newHandlerWithReplications(t, registry.NewReplications(fakeReplicationHarbor{}, allowed{},
+func newReplicationHandler(t *testing.T) http.Handler {
+	t.Helper()
+	return newHandlerWithReplications(t, registry.NewReplications(&fakeReplicationHarbor{}, allowed{},
 		registry.ReplicationConfig{Project: "proj", Prefix: "k8s", Registries: []string{"docker-hub"}}))
+}
+
+func send(t *testing.T, h http.Handler, method, path, contentType, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestReplicationsArePresentWhenEnabled(t *testing.T) {
+	h := newReplicationHandler(t)
 
 	r, ok := discover(t, h, "harborreplications")
 	if !ok {
@@ -282,16 +319,19 @@ func TestReplicationsArePresentWhenEnabled(t *testing.T) {
 	if r.Kind != "HarborReplication" || !r.Namespaced || r.SingularName != "harborreplication" {
 		t.Errorf("kind %q, namespaced %v, singular %q", r.Kind, r.Namespaced, r.SingularName)
 	}
-	if verbs := slices.Sorted(slices.Values(r.Verbs)); !slices.Equal(verbs, []string{"create", "delete", "get", "list"}) {
-		t.Errorf("verbs %v, want [create delete get list]", verbs)
+	want := []string{"create", "delete", "get", "list", "patch", "update"}
+	if verbs := slices.Sorted(slices.Values(r.Verbs)); !slices.Equal(verbs, want) {
+		t.Errorf("verbs %v, want %v", verbs, want)
 	}
 
 	body := `{"apiVersion":"harbor.goharbor.io/v1alpha1","kind":"HarborReplication","metadata":{"name":"nginx"},` +
 		`"spec":{"registry":"docker-hub","repository":"library/nginx","tag":"1.27"}}`
-	req := httptest.NewRequest(http.MethodPost, "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborreplications?dryRun=All", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	rec := send(t, h, http.MethodPost, "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborreplications?dryRun=All", "application/json", body)
+	checkCreated(t, rec)
+}
+
+func checkCreated(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
 	var created struct {
 		Kind   string
 		Status struct{ Destination string }
@@ -299,5 +339,129 @@ func TestReplicationsArePresentWhenEnabled(t *testing.T) {
 	decode(t, rec, http.StatusCreated, &created)
 	if created.Kind != "HarborReplication" || created.Status.Destination != "proj/k8s/allowed/nginx" {
 		t.Errorf("created %+v", created)
+	}
+}
+
+func TestServerSideApplyCreatesReplication(t *testing.T) {
+	body := `
+apiVersion: harbor.goharbor.io/v1alpha1
+kind: HarborReplication
+metadata:
+  name: nginx
+spec:
+  registry: docker-hub
+  repository: library/nginx
+  tag: "1.27"
+`
+	rec := send(t, newReplicationHandler(t), http.MethodPatch,
+		"/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborreplications/nginx?dryRun=All&fieldManager=test", "application/apply-patch+yaml", body)
+	checkCreated(t, rec)
+}
+
+// kubectl validates a kind on the server only if the kind's PATCH operation takes fieldValidation.
+// Otherwise it lists CRDs, which the view, edit, and admin roles do not allow.
+func TestReplicationPatchTakesFieldValidation(t *testing.T) {
+	var doc struct {
+		Paths map[string]struct {
+			Patch *struct {
+				GVK        map[string]string `json:"x-kubernetes-group-version-kind"`
+				Parameters []struct{ Name, In string }
+			}
+		}
+	}
+	decode(t, get(t, newReplicationHandler(t), "/openapi/v3/apis/harbor.goharbor.io/v1alpha1"), http.StatusOK, &doc)
+	for _, item := range doc.Paths {
+		if item.Patch == nil || item.Patch.GVK["kind"] != "HarborReplication" {
+			continue
+		}
+		for _, p := range item.Patch.Parameters {
+			if p.Name == "fieldValidation" && p.In == "query" {
+				return
+			}
+		}
+	}
+	t.Error("no PATCH operation of HarborReplication takes the query parameter fieldValidation")
+}
+
+func TestReplicationUpdatesAcceptOnlyUnchangedReplications(t *testing.T) {
+	h := newReplicationHandler(t)
+	path := "/apis/harbor.goharbor.io/v1alpha1/namespaces/allowed/harborreplications/"
+	const apply, manifest = "application/apply-patch+yaml", `
+apiVersion: harbor.goharbor.io/v1alpha1
+kind: HarborReplication
+metadata:
+  name: nginx
+  labels:
+    app: web
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: "{}"
+spec:
+  registry: docker-hub
+  repository: library/nginx
+  tag: "1.27"
+`
+	newTag := strings.Replace(manifest, "1.27", "1.28", 1)
+	withoutLabels := strings.Replace(manifest, "  labels:\n    app: web\n", "", 1)
+	withoutTag := strings.Replace(manifest, "  tag: \"1.27\"\n", "", 1)
+	withoutLastApplied := strings.Replace(manifest, "  annotations:\n    kubectl.kubernetes.io/last-applied-configuration: \"{}\"\n", "", 1)
+	// kubectl's server-side apply sends this to keep the annotation of an earlier client-side apply.
+	onlyLastApplied := `
+apiVersion: harbor.goharbor.io/v1alpha1
+kind: HarborReplication
+metadata:
+  name: nginx
+  namespace: allowed
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: "{}"
+`
+	onlyLabels := `
+apiVersion: harbor.goharbor.io/v1alpha1
+kind: HarborReplication
+metadata:
+  name: nginx
+  labels:
+    app: web
+`
+	checkCreated(t, send(t, h, http.MethodPatch, path+"nginx?fieldManager=test", apply, manifest))
+	current := get(t, h, path+"nginx").Body.String()
+
+	for _, tc := range []struct {
+		name, method, nameAndQuery, contentType, body string
+		code                                          int
+		field                                         string
+	}{
+		{"server-side apply", http.MethodPatch, "nginx?fieldManager=test", apply, manifest, http.StatusOK, ""},
+		{"server-side apply without the labels", http.MethodPatch, "nginx?fieldManager=test", apply, withoutLabels, http.StatusUnprocessableEntity, "metadata.labels"},
+		{"server-side apply without the tag", http.MethodPatch, "nginx?fieldManager=test", apply, withoutTag, http.StatusUnprocessableEntity, "spec"},
+		// kubectl's server-side apply rewrites that annotation.
+		{"server-side apply by kubectl without kubectl's last-applied configuration", http.MethodPatch, "nginx?fieldManager=kubectl", apply, withoutLastApplied, http.StatusOK, ""},
+		{"server-side apply of only kubectl's last-applied configuration", http.MethodPatch, "nginx?fieldManager=kubectl-last-applied", apply, onlyLastApplied, http.StatusOK, ""},
+		{"server-side apply of only the labels", http.MethodPatch, "nginx?fieldManager=test", apply, onlyLabels, http.StatusUnprocessableEntity, "spec"},
+		{"merge patch of kubectl's last-applied configuration", http.MethodPatch, "nginx", "application/merge-patch+json", `{"metadata":{"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"a\":1}"}}}`, http.StatusOK, ""},
+		{"JSON patch that removes kubectl's last-applied configuration", http.MethodPatch, "nginx", "application/json-patch+json", `[{"op":"remove","path":"/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration"}]`, http.StatusOK, ""},
+		{"server-side apply of a new tag", http.MethodPatch, "nginx?fieldManager=test", apply, newTag, http.StatusConflict, ""},
+		{"forced server-side apply of a new tag", http.MethodPatch, "nginx?fieldManager=test&force=true", apply, newTag, http.StatusUnprocessableEntity, "spec"},
+		{"update", http.MethodPut, "nginx", "application/json", current, http.StatusOK, ""},
+		{"update of a missing replication", http.MethodPut, "other", "application/json", strings.Replace(current, `"name":"nginx"`, `"name":"other"`, 1), http.StatusNotFound, ""},
+		{"merge patch", http.MethodPatch, "nginx", "application/merge-patch+json", `{"metadata":{"labels":{"team":"a"}}}`, http.StatusUnprocessableEntity, "metadata.labels"},
+		{"strategic merge patch", http.MethodPatch, "nginx", "application/strategic-merge-patch+json", `{"spec":{"tag":"1.28"}}`, http.StatusUnprocessableEntity, "spec"},
+		{"JSON patch", http.MethodPatch, "nginx", "application/json-patch+json", `[{"op":"add","path":"/metadata/annotations","value":{"a":"b"}}]`, http.StatusUnprocessableEntity, "metadata.annotations"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := send(t, h, tc.method, path+tc.nameAndQuery, tc.contentType, tc.body)
+			if rec.Code != tc.code {
+				t.Fatalf("status %d, want %d: %s", rec.Code, tc.code, rec.Body)
+			}
+			if tc.code == http.StatusOK && rec.Body.String() != current {
+				t.Errorf("got %s\nwant %s", rec.Body, current)
+			}
+			if tc.field != "" {
+				var status metav1.Status
+				decode(t, rec, tc.code, &status)
+				if c := status.Details.Causes; len(c) != 1 || c[0].Field != tc.field {
+					t.Errorf("causes %+v, want one for %s", c, tc.field)
+				}
+			}
+		})
 	}
 }

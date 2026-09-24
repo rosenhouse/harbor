@@ -97,25 +97,22 @@ func (f *fakeHarbor) ListArtifacts(_ context.Context, project, repository string
 	return artifacts, nil
 }
 
-// fakeNamespaces lets the named namespaces see the project. Each has UID "uid-<name>".
-type fakeNamespaces []string
+// namespaceObjects lets the namespaces it holds see the project.
+type namespaceObjects map[string]*corev1.Namespace
 
-func (f fakeNamespaces) Allows(ns string) bool { return slices.Contains(f, ns) }
-func (f fakeNamespaces) Namespaces() []string  { return f }
-func (f fakeNamespaces) Namespace(name string) (*corev1.Namespace, bool) {
-	if !f.Allows(name) {
-		return nil, false
+// namespacesNamed returns namespaceObjects that hold namespace(name) for each name.
+func namespacesNamed(names ...string) namespaceObjects {
+	n := namespaceObjects{}
+	for _, name := range names {
+		n[name] = namespace(name)
 	}
-	return namespace(name), true
+	return n
 }
 
 // namespace returns a namespace with UID "uid-<name>".
 func namespace(name string) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID("uid-" + name)}}
 }
-
-// namespaceObjects lets the namespaces it holds see the project.
-type namespaceObjects map[string]*corev1.Namespace
 
 func (n namespaceObjects) Allows(name string) bool { return n[name] != nil }
 func (n namespaceObjects) Namespaces() []string    { return slices.Sorted(maps.Keys(n)) }
@@ -137,7 +134,7 @@ const stalenessLimit = time.Minute
 
 // newUnreadFixture returns a fixture that has not read Harbor yet.
 func newUnreadFixture(h *fakeHarbor) *fixture {
-	s := NewStore("proj", stalenessLimit, fakeNamespaces{"ns1", "ns2"})
+	s := NewStore("proj", stalenessLimit, namespacesNamed("ns1", "ns2"))
 	c := testingclock.NewFakeClock(time.Now())
 	s.clock = c
 	return &fixture{harbor: h, clock: c, poller: NewPoller(h, s), repositories: NewRepositories(s), artifacts: NewArtifacts(s)}
@@ -173,6 +170,12 @@ type fakeReplicationHarbor struct {
 	delay       time.Duration
 	// onCreate runs when a policy is created.
 	onCreate func()
+	// lostReply stores a created policy, then fails with ErrUnavailable, as when Harbor's reply is lost.
+	lostReply bool
+	// ignorePrefix lists every policy, whatever the name prefix.
+	ignorePrefix bool
+	// failEndedRequests fails calls whose context is done, as the Harbor client does.
+	failEndedRequests bool
 
 	mu                    sync.Mutex
 	policies              []harbor.ReplicationPolicy
@@ -183,9 +186,12 @@ type fakeReplicationHarbor struct {
 }
 
 // record records a call such as "GetReplicationPolicy 1".
-func (f *fakeReplicationHarbor) record(method string, args ...any) error {
+func (f *fakeReplicationHarbor) record(ctx context.Context, method string, args ...any) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failEndedRequests && ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", harbor.ErrUnavailable, ctx.Err())
+	}
 	f.calls = append(f.calls, strings.TrimSuffix(fmt.Sprintln(append([]any{method}, args...)...), "\n"))
 	return f.errs[method]
 }
@@ -237,30 +243,30 @@ func (f *fakeReplicationHarbor) put(p harbor.ReplicationPolicy) {
 	slices.SortFunc(f.policies, func(a, b harbor.ReplicationPolicy) int { return int(a.ID - b.ID) })
 }
 
-func (f *fakeReplicationHarbor) ListRegistries(context.Context) ([]harbor.Registry, error) {
-	if err := f.record("ListRegistries"); err != nil {
+func (f *fakeReplicationHarbor) ListRegistries(ctx context.Context) ([]harbor.Registry, error) {
+	if err := f.record(ctx, "ListRegistries"); err != nil {
 		return nil, err
 	}
 	return slices.Clone(f.registries), nil
 }
 
-func (f *fakeReplicationHarbor) ListReplicationPolicies(_ context.Context, namePrefix string) ([]harbor.ReplicationPolicy, error) {
-	if err := f.record("ListReplicationPolicies", namePrefix); err != nil {
+func (f *fakeReplicationHarbor) ListReplicationPolicies(ctx context.Context, namePrefix string) ([]harbor.ReplicationPolicy, error) {
+	if err := f.record(ctx, "ListReplicationPolicies", namePrefix); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []harbor.ReplicationPolicy
 	for _, p := range f.policies {
-		if strings.HasPrefix(p.Name, namePrefix) {
+		if f.ignorePrefix || strings.HasPrefix(p.Name, namePrefix) {
 			out = append(out, clone(p))
 		}
 	}
 	return out, nil
 }
 
-func (f *fakeReplicationHarbor) GetReplicationPolicy(_ context.Context, id int64) (*harbor.ReplicationPolicy, error) {
-	if err := f.record("GetReplicationPolicy", id); err != nil {
+func (f *fakeReplicationHarbor) GetReplicationPolicy(ctx context.Context, id int64) (*harbor.ReplicationPolicy, error) {
+	if err := f.record(ctx, "GetReplicationPolicy", id); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
@@ -274,8 +280,8 @@ func (f *fakeReplicationHarbor) GetReplicationPolicy(_ context.Context, id int64
 	return nil, harbor.ErrNotFound
 }
 
-func (f *fakeReplicationHarbor) CreateReplicationPolicy(_ context.Context, p *harbor.ReplicationPolicy) (int64, error) {
-	if err := f.record("CreateReplicationPolicy", p.Name); err != nil {
+func (f *fakeReplicationHarbor) CreateReplicationPolicy(ctx context.Context, p *harbor.ReplicationPolicy) (int64, error) {
+	if err := f.record(ctx, "CreateReplicationPolicy", p.Name); err != nil {
 		return 0, err
 	}
 	if _, ok := f.policy(p.Name); ok {
@@ -286,13 +292,13 @@ func (f *fakeReplicationHarbor) CreateReplicationPolicy(_ context.Context, p *ha
 	f.lastID++
 	stored.ID = f.lastID
 	f.mu.Unlock()
-	stored.CreationTime, stored.UpdateTime = created, created
+	stored.CreationTime = created
 	for _, r := range f.registries {
 		if r.ID == stored.SrcRegistry.ID {
 			stored.SrcRegistry = &r
 		}
 	}
-	stored.DestRegistry = &harbor.Registry{ID: 0, Name: "Local", Type: "harbor"}
+	stored.DestRegistry = &harbor.Registry{ID: 0, Name: "Local"}
 	if f.beforeHarbor23 {
 		stored.DestNamespaceReplaceCount = nil
 	}
@@ -300,11 +306,14 @@ func (f *fakeReplicationHarbor) CreateReplicationPolicy(_ context.Context, p *ha
 	if f.onCreate != nil {
 		f.onCreate()
 	}
+	if f.lostReply {
+		return 0, harbor.ErrUnavailable
+	}
 	return stored.ID, nil
 }
 
-func (f *fakeReplicationHarbor) DeleteReplicationPolicy(_ context.Context, id int64) error {
-	if err := f.record("DeleteReplicationPolicy", id); err != nil {
+func (f *fakeReplicationHarbor) DeleteReplicationPolicy(ctx context.Context, id int64) error {
+	if err := f.record(ctx, "DeleteReplicationPolicy", id); err != nil {
 		return err
 	}
 	f.mu.Lock()
@@ -327,8 +336,8 @@ func (f *fakeReplicationHarbor) DeleteReplicationPolicy(_ context.Context, id in
 	return nil
 }
 
-func (f *fakeReplicationHarbor) StartReplication(_ context.Context, policyID int64) (int64, error) {
-	if err := f.record("StartReplication", policyID); err != nil {
+func (f *fakeReplicationHarbor) StartReplication(ctx context.Context, policyID int64) (int64, error) {
+	if err := f.record(ctx, "StartReplication", policyID); err != nil {
 		return 0, err
 	}
 	f.mu.Lock()
@@ -343,8 +352,8 @@ func (f *fakeReplicationHarbor) StartReplication(_ context.Context, policyID int
 	return f.lastID, nil
 }
 
-func (f *fakeReplicationHarbor) LatestReplicationExecution(_ context.Context, policyID int64) (*harbor.ReplicationExecution, error) {
-	err := f.record("LatestReplicationExecution", policyID)
+func (f *fakeReplicationHarbor) LatestReplicationExecution(ctx context.Context, policyID int64) (*harbor.ReplicationExecution, error) {
+	err := f.record(ctx, "LatestReplicationExecution", policyID)
 	f.mu.Lock()
 	f.inFlight++
 	f.maxInFlight = max(f.maxInFlight, f.inFlight)
@@ -358,7 +367,7 @@ func (f *fakeReplicationHarbor) LatestReplicationExecution(_ context.Context, po
 	}
 	var latest *harbor.ReplicationExecution
 	for i, e := range f.executions {
-		if e.PolicyID == policyID && (latest == nil || e.ID > latest.ID) {
+		if e.PolicyID == policyID && !strings.HasPrefix(e.StatusText, "Execution skipped") && (latest == nil || e.ID > latest.ID) {
 			latest = &f.executions[i]
 		}
 	}
@@ -369,8 +378,8 @@ func (f *fakeReplicationHarbor) LatestReplicationExecution(_ context.Context, po
 	return &e, nil
 }
 
-func (f *fakeReplicationHarbor) ListRunningReplicationExecutions(_ context.Context, policyID int64) ([]harbor.ReplicationExecution, error) {
-	if err := f.record("ListRunningReplicationExecutions", policyID); err != nil {
+func (f *fakeReplicationHarbor) ListRunningReplicationExecutions(ctx context.Context, policyID int64) ([]harbor.ReplicationExecution, error) {
+	if err := f.record(ctx, "ListRunningReplicationExecutions", policyID); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
@@ -384,8 +393,8 @@ func (f *fakeReplicationHarbor) ListRunningReplicationExecutions(_ context.Conte
 	return running, nil
 }
 
-func (f *fakeReplicationHarbor) StopReplicationExecution(_ context.Context, id int64) error {
-	if err := f.record("StopReplicationExecution", id); err != nil {
+func (f *fakeReplicationHarbor) StopReplicationExecution(ctx context.Context, id int64) error {
+	if err := f.record(ctx, "StopReplicationExecution", id); err != nil {
 		return err
 	}
 	f.mu.Lock()

@@ -6,9 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -54,7 +57,7 @@ func replicator(t *testing.T, ns string) string {
 	mustKubectl(t, "-n", ns, "create", "rolebinding", "replicator", "--clusterrole=harbor.goharbor.io:replicate", "--serviceaccount="+ns+":replicator")
 	as := "--as=system:serviceaccount:" + ns + ":replicator"
 	// harbor-apiserver caches denials, so wait until RBAC allows the replicator before any test asks.
-	for _, verb := range []string{"get", "create", "delete"} {
+	for _, verb := range []string{"get", "create", "patch", "delete"} {
 		eventually(t, func() error {
 			out, err := kubectl(t, "-n", ns, "auth", "can-i", verb, "harborreplications.harbor.goharbor.io", as)
 			if out != "yes" {
@@ -75,9 +78,8 @@ func replicationManifest(ns, name string, spec v1alpha1.HarborReplicationSpec) m
 	}
 }
 
-// apply runs kubectl apply on a manifest, and returns kubectl's output.
-// kubectl validates a kind without a PATCH operation by listing CRDs, so apply turns validation off for users who cannot list CRDs.
-func apply(t *testing.T, manifest any, args ...string) (string, error) {
+// manifestFile writes a manifest to a file, and returns the file's path.
+func manifestFile(t *testing.T, manifest any) string {
 	t.Helper()
 	b, err := json.Marshal(manifest)
 	if err != nil {
@@ -87,7 +89,13 @@ func apply(t *testing.T, manifest any, args ...string) (string, error) {
 	if err := os.WriteFile(file, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return kubectl(t, append([]string{"apply", "--validate=false", "-f", file}, args...)...)
+	return file
+}
+
+// apply runs kubectl apply on a manifest, and returns kubectl's output.
+func apply(t *testing.T, manifest any, args ...string) (string, error) {
+	t.Helper()
+	return kubectl(t, append([]string{"apply", "-f", manifestFile(t, manifest)}, args...)...)
 }
 
 // createReplication applies a manifest, retrying because the replica serving the create may not see the namespace's label yet.
@@ -125,7 +133,7 @@ func waitForReplication(t *testing.T, ns, name string) v1alpha1.HarborReplicatio
 
 // policyNames returns the names of Harbor's replication policies for a namespace.
 func policyNames(ctx context.Context, ns string) ([]string, error) {
-	policies, err := NewAdmin(HarborURL).replicationPolicies(ctx, replicationPrefix+"."+HarborProject+"."+ns+".")
+	policies, err := NewAdmin(HarborURL).replicationPolicies(ctx, policyPrefix(ns))
 	var names []string
 	for _, p := range policies {
 		names = append(names, p.Name)
@@ -153,12 +161,11 @@ func TestReplication(t *testing.T) {
 	createReplication(t, manifest, as)
 	r := waitForReplication(t, ns, "app")
 
-	destination := HarborProject + "/k8s/" + ns + "/app"
-	if e := r.Status.LastExecution; r.UID == "" || r.Status.Destination != destination || e.Trigger != v1alpha1.ReplicationTriggerManual ||
+	if e := r.Status.LastExecution; r.UID == "" || r.Status.Destination != destination(ns, "app") || e.Trigger != v1alpha1.ReplicationTriggerManual ||
 		e.Succeeded == 0 || e.Failed != 0 || e.StartTime == nil || e.EndTime == nil {
 		t.Errorf("uid %q, destination %q, last execution %+v", r.UID, r.Status.Destination, *e)
 	}
-	replicated := destination + "/" + sourceApp
+	replicated := destination(ns, "app") + "/" + sourceApp
 	wantArtifacts := []string{replicated + "@" + digest(t, seed.SourceV1)}
 	wantOwners := []metav1.OwnerReference{{APIVersion: v1alpha1.SchemeGroupVersion.String(), Kind: "HarborReplication", Name: "app", UID: r.UID}}
 	for _, a := range expectArtifacts(t, wantArtifacts, "-n", ns, "-l", v1alpha1.ReplicationLabel+"=app") {
@@ -170,6 +177,29 @@ func TestReplication(t *testing.T) {
 	if out, err := apply(t, manifest, as); err != nil || !strings.HasSuffix(out, " unchanged") {
 		t.Errorf("second apply: %q, %v", out, err)
 	}
+	v2 := replicationManifest(ns, "app", v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v2"})
+	if _, err := apply(t, v2, as); err == nil || !strings.Contains(err.Error(), "spec: Invalid value") || !strings.Contains(err.Error(), "field is immutable") {
+		t.Errorf("apply of a new tag: got %v, want an immutable spec", err)
+	}
+	if _, err := kubectl(t, "-n", ns, "label", "harborreplication", "app", "team=web", as); err == nil || !strings.Contains(err.Error(), "metadata.labels: Invalid value: field is immutable") {
+		t.Errorf("label: got %v, want immutable labels", err)
+	}
+	// These rewrite the annotation that client-side apply keeps, which the server ignores.
+	before := mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "json")
+	current := filepath.Join(t.TempDir(), "current.json")
+	if err := os.WriteFile(current, []byte(before), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// kubectl's server-side apply warns if it cannot keep the annotation.
+	if out, stderr, err := kubectlWithStderr(t, "apply", "--server-side", "-f", manifestFile(t, manifest), as); err != nil || stderr != "" {
+		t.Errorf("server-side apply: %q, %q, %v", out, stderr, err)
+	}
+	if out, err := kubectl(t, "replace", "-f", current, as); err != nil {
+		t.Errorf("replace: %q, %v", out, err)
+	}
+	if after := mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "json"); after != before {
+		t.Errorf("after server-side apply and replace: %s\nwant %s", after, before)
+	}
 	row := strings.Fields(mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "--no-headers", as))
 	if len(row) != 7 || !slices.Equal(row[:6], []string{"app", ReplicationRegistry, sourceApp, "v1", "<none>", "Succeeded"}) {
 		t.Errorf("row %q", row)
@@ -177,7 +207,7 @@ func TestReplication(t *testing.T) {
 
 	mustKubectl(t, "-n", ns, "delete", "harborreplication", "app", "--dry-run=server", as)
 	mustKubectl(t, "-n", ns, "get", "harborreplication", "app", as)
-	expectPolicies(t, ns, replicationPrefix+"."+HarborProject+"."+ns+".app")
+	expectPolicies(t, ns, policyPrefix(ns)+"app")
 
 	mustKubectl(t, "-n", ns, "delete", "harborreplication", "app", as)
 	if _, err := kubectl(t, "-n", ns, "get", "harborreplication", "app", as); err == nil || !strings.Contains(err.Error(), "NotFound") {
@@ -197,6 +227,61 @@ func TestReplication(t *testing.T) {
 		}
 		return nil
 	}, "-n", ns, "get", "harborartifacts", "-o", "json", "--field-selector", "status.repository="+replicated)
+}
+
+func TestServerSideApplyReplication(t *testing.T) {
+	ns := replicationNamespace(t)
+	as := replicator(t, ns)
+	unlabeled := replicationManifest(ns, "app", v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v1"})
+	manifest := replicationManifest(ns, "app", v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v1"})
+	manifest["metadata"] = map[string]any{"namespace": ns, "name": "app", "labels": map[string]string{"team": "web"}}
+	createReplication(t, manifest, "--server-side", as)
+	created := waitForReplication(t, ns, "app")
+
+	out, err := apply(t, manifest, "--server-side", "-o", "json", as)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reapplied v1alpha1.HarborReplication
+	if err := json.Unmarshal([]byte(out), &reapplied); err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(created, reapplied); diff != "" {
+		t.Errorf("second apply (-want +got):\n%s", diff)
+	}
+	if _, err := apply(t, unlabeled, "--server-side", as); err == nil || !strings.Contains(err.Error(), "metadata.labels: Invalid value: field is immutable") {
+		t.Errorf("apply without the label: got %v, want immutable labels", err)
+	}
+	// Client-side apply adds its annotation, which the server ignores.
+	if out, err := apply(t, manifest, as); err != nil || !strings.HasSuffix(out, " configured") {
+		t.Errorf("client-side apply: %q, %v", out, err)
+	}
+	var got v1alpha1.HarborReplication
+	if err := json.Unmarshal([]byte(mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "json")), &got); err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(created, got); diff != "" {
+		t.Errorf("after client-side apply (-want +got):\n%s", diff)
+	}
+
+	v2 := replicationManifest(ns, "app", v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v2"})
+	if _, err := apply(t, v2, "--server-side", as); err == nil || !strings.Contains(err.Error(), `conflict with "before-first-apply"`) {
+		t.Errorf("apply of a new tag: got %v, want a conflict", err)
+	}
+	if _, err := apply(t, v2, "--server-side", "--force-conflicts", as); err == nil || !strings.Contains(err.Error(), "spec: Invalid value") || !strings.Contains(err.Error(), "field is immutable") {
+		t.Errorf("forced apply of a new tag: got %v, want an immutable spec", err)
+	}
+	if tag := mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "jsonpath={.spec.tag}"); tag != "v1" {
+		t.Errorf("tag %q, want v1", tag)
+	}
+
+	// kubectl apply --force deletes and recreates a replication that it cannot patch.
+	if _, err := apply(t, v2, "--force", as); err != nil {
+		t.Fatal(err)
+	}
+	if tag := mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "jsonpath={.spec.tag}"); tag != "v2" {
+		t.Errorf("tag %q after a forced apply, want v2", tag)
+	}
 }
 
 // TestDeleteRunningReplication checks that a delete stops the run, because Harbor refuses to delete the policy of a running replication.
@@ -221,6 +306,36 @@ func TestDeleteRunningReplication(t *testing.T) {
 	expectPolicies(t, ns)
 }
 
+// TestSkippedRunDoesNotHideTheRun checks the phase when Harbor skips a run because the previous run is still going.
+// Harbor records the skipped run as a newer failed execution.
+func TestSkippedRunDoesNotHideTheRun(t *testing.T) {
+	ns := replicationNamespace(t)
+	createReplication(t, replicationManifest(ns, "app", v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v1"}))
+	running := mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "jsonpath={.status.lastExecution.id}")
+	admin := NewAdmin(HarborURL)
+	policies, err := admin.replicationPolicies(t.Context(), policyPrefix(ns)+"app")
+	if err != nil || len(policies) != 1 {
+		t.Fatalf("policies %v, %v", policies, err)
+	}
+	if err := admin.do(t.Context(), http.MethodPost, "/replication/executions", map[string]int64{"policy_id": policies[0].ID}, nil, http.StatusCreated); err != nil {
+		t.Fatal(err)
+	}
+	var newest []struct {
+		StatusText string `json:"status_text"`
+	}
+	query := url.Values{"policy_id": {strconv.FormatInt(policies[0].ID, 10)}, "sort": {"-id"}, "page_size": {"1"}}
+	if err := admin.do(t.Context(), http.MethodGet, "/replication/executions?"+query.Encode(), nil, &newest, http.StatusOK); err != nil {
+		t.Fatal(err)
+	}
+	if len(newest) != 1 || !strings.HasPrefix(newest[0].StatusText, "Execution skipped") {
+		t.Fatalf("newest execution %+v, want one that Harbor skipped", newest)
+	}
+
+	if id := waitForReplication(t, ns, "app").Status.LastExecution.ID; strconv.FormatInt(id, 10) != running {
+		t.Errorf("last execution %d, want %s", id, running)
+	}
+}
+
 func TestNamespaceDeletionDeletesReplications(t *testing.T) {
 	seed := NewSeed()
 	ns := replicationNamespace(t)
@@ -231,7 +346,7 @@ func TestNamespaceDeletionDeletesReplications(t *testing.T) {
 	if r := waitForReplication(t, ns, "every-tag"); r.Spec.Schedule != schedule {
 		t.Errorf("schedule %q, want %q", r.Spec.Schedule, schedule)
 	}
-	replicated := HarborProject + "/k8s/" + ns + "/every-tag/" + sourceApp
+	replicated := destination(ns, "every-tag") + "/" + sourceApp
 	want := []string{replicated + "@" + digest(t, seed.SourceV1), replicated + "@" + digest(t, seed.SourceV2)}
 	slices.Sort(want)
 	expectArtifacts(t, want, "-n", ns, "-l", v1alpha1.ReplicationLabel+"=every-tag")
@@ -258,9 +373,12 @@ func TestReplicationRejections(t *testing.T) {
 	viewer := "--as=system:serviceaccount:" + labeled + ":viewer"
 
 	valid := v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v1"}
-	unlisted, everyFiveMinutes := valid, valid
+	unlisted, everyFiveMinutes, february30, badPattern, slowPattern := valid, valid, valid, valid, valid
 	unlisted.Registry = unlistedRegistry
 	everyFiveMinutes.Schedule = "0 */5 * * * *"
+	february30.Schedule = "0 0 0 30 2 *"
+	badPattern.Tag = "v["
+	slowPattern.Tag = "*?*?*Z"
 	for _, tc := range []struct {
 		name, namespace string
 		spec            v1alpha1.HarborReplicationSpec
@@ -269,7 +387,10 @@ func TestReplicationRejections(t *testing.T) {
 	}{
 		{"registry not on the allow-list", labeled, unlisted, nil, `spec.registry: Unsupported value: "e2e-unlisted"`},
 		{"schedule more often than hourly", labeled, everyFiveMinutes, nil, `spec.schedule: Invalid value: "0 */5 * * * *"`},
-		{"unlabeled namespace", unlabeled, valid, nil, "namespace " + unlabeled + " is not labeled"},
+		{"schedule that never runs", labeled, february30, nil, `spec.schedule: Invalid value: "0 0 0 30 2 *": must match a date that exists`},
+		{"tag that is not a pattern", labeled, badPattern, nil, `spec.tag: Invalid value: "v["`},
+		{"tag pattern that Harbor matches slowly", labeled, slowPattern, nil, `spec.tag: Invalid value: "*?*?*Z": must have at most two *`},
+		{"unlabeled namespace", unlabeled, valid, nil, "namespace " + unlabeled + " does not exist, or is not labeled"},
 		{"viewer", labeled, valid, []string{viewer}, `cannot create resource "harborreplications"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

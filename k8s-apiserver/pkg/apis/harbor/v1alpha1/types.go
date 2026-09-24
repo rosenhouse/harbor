@@ -153,12 +153,13 @@ type HarborArtifactList struct {
 
 // HarborReplication copies artifacts from a remote registry into the project that the namespace is labeled with.
 // It is a Harbor replication policy in pull mode. It runs once when created, and then on its schedule.
-// It cannot be updated. Delete and recreate it to change it.
+// Updates cannot change it. Delete and recreate it to change it.
 type HarborReplication struct {
 	metav1.TypeMeta `json:",inline"`
 	// Standard object metadata.
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
+	// Spec is what to copy, and when.
 	Spec HarborReplicationSpec `json:"spec"`
 	// Status is the replication as observed in Harbor.
 	// +optional
@@ -172,6 +173,7 @@ type HarborReplicationSpec struct {
 	// Repository is the path of the source repository, such as library/nginx. It takes no glob.
 	Repository string `json:"repository"`
 	// Tag is a Harbor tag filter, a glob such as 1.27*. Use * to copy every tag.
+	// It has at most two * and one {} group, so that Harbor matches it quickly.
 	Tag string `json:"tag"`
 	// Schedule is a Harbor cron expression that runs the replication again, such as "0 0 3 * * *".
 	// Harbor runs it in UTC. Its first field is seconds, which must be 0. Minutes must be a single number.
@@ -185,7 +187,7 @@ type HarborReplicationStatus struct {
 	// A source repository library/nginx lands in <destination>/library/nginx.
 	// +optional
 	Destination string `json:"destination,omitempty"`
-	// LastExecution is the newest run. It is empty until the first run starts.
+	// LastExecution is the newest run that Harbor did not skip. It is empty until the first run starts.
 	// +optional
 	LastExecution *HarborReplicationExecution `json:"lastExecution,omitempty"`
 }
@@ -194,14 +196,18 @@ type HarborReplicationStatus struct {
 // Each of its tasks copies one source repository.
 type HarborReplicationExecution struct {
 	// ID is Harbor's ID for the execution.
-	ID      int64                    `json:"id"`
+	ID int64 `json:"id"`
+	// Trigger is what started the run.
 	Trigger HarborReplicationTrigger `json:"trigger"`
-	Phase   HarborReplicationPhase   `json:"phase"`
-	// Message is Harbor's status text.
+	// Phase is the state of the run.
+	Phase HarborReplicationPhase `json:"phase"`
+	// Message is Harbor's status text, such as why the run failed.
 	// +optional
 	Message string `json:"message,omitempty"`
+	// StartTime is when the run started.
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
+	// EndTime is when the run ended.
 	// +optional
 	EndTime *metav1.Time `json:"endTime,omitempty"`
 	// Total is the number of tasks.

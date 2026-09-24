@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -124,8 +125,8 @@ var wantNginxPolicy = harbor.ReplicationPolicy{
 	ID:                        7,
 	Name:                      "k8s.proj.team-a.nginx",
 	Description:               `{"managedBy":"harbor-apiserver"}`,
-	SrcRegistry:               &harbor.Registry{ID: 3, Name: "dockerhub", Type: "docker-hub"},
-	DestRegistry:              &harbor.Registry{ID: 0, Name: "Local", Type: "harbor"},
+	SrcRegistry:               &harbor.Registry{ID: 3, Name: "dockerhub"},
+	DestRegistry:              &harbor.Registry{ID: 0, Name: "Local"},
 	DestNamespace:             "proj/k8s/team-a/nginx",
 	DestNamespaceReplaceCount: new(int8),
 	Trigger:                   &harbor.ReplicationTrigger{Type: "scheduled", Settings: &harbor.ReplicationTriggerSettings{Cron: "0 30 2 * * *"}},
@@ -138,7 +139,6 @@ var wantNginxPolicy = harbor.ReplicationPolicy{
 	Enabled:                 true,
 	SingleActiveReplication: true,
 	CreationTime:            time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
-	UpdateTime:              time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC),
 }
 
 func TestListRegistries(t *testing.T) {
@@ -152,7 +152,7 @@ func TestListRegistries(t *testing.T) {
 	if diff := cmp.Diff(onlyGet("/api/v2.0/registries?page=1&page_size=100&sort=id"), got()); diff != "" {
 		t.Errorf("requests (-want +got):\n%s", diff)
 	}
-	if diff := cmp.Diff([]harbor.Registry{{ID: 3, Name: "dockerhub", Type: "docker-hub"}}, registries); diff != "" {
+	if diff := cmp.Diff([]harbor.Registry{{ID: 3, Name: "dockerhub"}}, registries); diff != "" {
 		t.Errorf("registries (-want +got):\n%s", diff)
 	}
 }
@@ -375,7 +375,7 @@ func TestLatestReplicationExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if diff := cmp.Diff(onlyGet("/api/v2.0/replication/executions?page=1&page_size=1&policy_id=7&sort=-id"), got()); diff != "" {
+	if diff := cmp.Diff(onlyGet("/api/v2.0/replication/executions?page=1&page_size=10&policy_id=7&sort=-id"), got()); diff != "" {
 		t.Errorf("requests (-want +got):\n%s", diff)
 	}
 	want := &harbor.ReplicationExecution{
@@ -398,6 +398,53 @@ func TestLatestReplicationExecution(t *testing.T) {
 func TestLatestReplicationExecutionOfANeverRunPolicy(t *testing.T) {
 	c, _ := replier(t, http.StatusOK, "", `[]`)
 	if e, err := c.LatestReplicationExecution(context.Background(), 7); e != nil || err != nil {
+		t.Errorf("got %v, %v; want nil, nil", e, err)
+	}
+}
+
+// executionPages serves executions, newest first, in the pages that the request asks for.
+func executionPages(t *testing.T, executions []harbor.ReplicationExecution) *fakeHarbor {
+	t.Helper()
+	return newFakeHarbor(t, func(w http.ResponseWriter, r *http.Request) {
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		size, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+		writeJSON(t, w, executions[min(len(executions), (page-1)*size):min(len(executions), page*size)])
+	})
+}
+
+// skipped is how Harbor 2.14 records a run that it skipped because the previous run was still going.
+func skipped(id int64) harbor.ReplicationExecution {
+	return harbor.ReplicationExecution{ID: id, PolicyID: 7, Status: "Failed", StatusText: "Execution skipped: active replication still in progress.", Trigger: "scheduled"}
+}
+
+func TestLatestReplicationExecutionIgnoresSkippedRuns(t *testing.T) {
+	running := harbor.ReplicationExecution{ID: 100, PolicyID: 7, Status: "InProgress", Trigger: "manual"}
+	executions := []harbor.ReplicationExecution{}
+	for id := int64(112); id > running.ID; id-- {
+		executions = append(executions, skipped(id))
+	}
+	f := executionPages(t, append(executions, running, harbor.ReplicationExecution{ID: 99, PolicyID: 7, Status: "Succeed"}))
+
+	e, err := newClient(t, f).LatestReplicationExecution(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"/api/v2.0/replication/executions?page=1&page_size=10&policy_id=7&sort=-id",
+		"/api/v2.0/replication/executions?page=2&page_size=10&policy_id=7&sort=-id",
+	}
+	if diff := cmp.Diff(want, f.requests); diff != "" {
+		t.Errorf("requests (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(&running, e); diff != "" {
+		t.Errorf("execution (-want +got):\n%s", diff)
+	}
+}
+
+func TestLatestReplicationExecutionOfOnlySkippedRuns(t *testing.T) {
+	f := executionPages(t, []harbor.ReplicationExecution{skipped(2), skipped(1)})
+	if e, err := newClient(t, f).LatestReplicationExecution(context.Background(), 7); e != nil || err != nil {
 		t.Errorf("got %v, %v; want nil, nil", e, err)
 	}
 }
