@@ -229,7 +229,7 @@ func TestCreateReplicationOverHiddenPolicy(t *testing.T) {
 			n["ns1"] = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns1", UID: "recreated"}}
 			h.calls = nil
 			_, err := r.Create(inNamespace("ns1"), replication("nginx"), nil, tc.options)
-			if !apierrors.IsAlreadyExists(err) || !strings.Contains(err.Error(), "policy k8s.proj.ns1.nginx") || !strings.Contains(err.Error(), "A Harbor administrator must delete it") {
+			if !apierrors.IsAlreadyExists(err) || !strings.Contains(err.Error(), "policy k8s.proj.ns1.nginx") || !strings.Contains(err.Error(), "The server hides that policy") {
 				t.Errorf("got %v, want AlreadyExists that names the hidden policy", err)
 			}
 			if diff := cmp.Diff(tc.writes, h.writes()); diff != "" {
@@ -1280,7 +1280,7 @@ func TestUpdateCreatesMissingReplicationOverHiddenPolicy(t *testing.T) {
 	create(t, r, "ns1", replication("nginx"))
 	n["ns1"] = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns1", UID: "recreated"}}
 	_, _, err := r.Update(inNamespace("ns1"), "nginx", rest.DefaultUpdatedObjectInfo(replication("nginx")), nil, nil, true, &metav1.UpdateOptions{})
-	if !apierrors.IsAlreadyExists(err) || !strings.Contains(err.Error(), "A Harbor administrator must delete it") {
+	if !apierrors.IsAlreadyExists(err) || !strings.Contains(err.Error(), "The server hides that policy") {
 		t.Errorf("got %v, want AlreadyExists that names the hidden policy", err)
 	}
 }

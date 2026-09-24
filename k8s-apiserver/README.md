@@ -314,8 +314,8 @@ Select by field instead.
 
 Replications let Kubernetes users copy images into the project from registry endpoints that you allow.
 They are off by default, because they need a system-level Harbor robot account that can pull from any registry endpoint into the project.
+Anyone who can read its Secret, or create pods in `harbor-apiserver`, can do what the robot can.
 With upstream Harbor, the robot can replicate between any project and any endpoint.
-Anyone who can read its Secret, or create pods in `harbor-apiserver`, can do the same.
 Users who can create replications can copy anything that an allowed endpoint's credentials can read into the project, which every labeled namespace shares.
 Read the [threat model](docs/threat-model.md#the-replication-robot-controls-pulls-into-the-project) before you enable them.
 
@@ -337,11 +337,9 @@ Give the robot only these permissions:
 | Project | Replication | List, Create |
 
 The server lists registry endpoints to find their IDs.
-Grant the project permissions on the `project` of Secret `harbor-apiserver`.
-On another project, the server sees no replications, and namespaces finish deleting while their policies keep running.
+Grant the project permissions on the `project` of Secret `harbor-apiserver` (see [Namespace deletion waits for Harbor](docs/threat-model.md#namespace-deletion-waits-for-harbor)).
 
-Only Harbor core from this fork lets a system-level robot hold replication permissions on a project.
-Run jobservice from the fork too, or a pull can mount any blob in Harbor that the source manifest names.
+Only Harbor core and jobservice from this fork let a system-level robot hold replication permissions on a project, and keep its pulls in the project.
 The fork's core migrates Harbor's database to the schema of Harbor 2.16, and the core of an older release can't use it.
 
 Harbor's UI can't grant the project permissions yet ([issue 31](https://github.com/rosenhouse/harbor/issues/31)), and editing the robot in the UI drops them.
@@ -375,7 +373,7 @@ jq -r .secret "$dir/robot.json" >"$dir/password"
 Upstream Harbor accepts replication permissions only at the system level, so move the project entry's actions into the system entry.
 
 A robot that an earlier install created with system replication permissions keeps them.
-To narrow it, create a robot as above, replace the Secret's `username` and `password`, restart the pods, and delete the old robot.
+To narrow it, create a robot as above, replace the Secret's `username` and `password`, and delete the old robot.
 
 ### Create the replication Secret
 
@@ -519,7 +517,7 @@ The ownerReference only shows where the artifacts came from. Deleting the replic
   Delete the replications first.
 - A policy that the server hides blocks its namespace and name until a Harbor administrator deletes it.
   Examples are a policy from an earlier namespace of the same name, and one that someone changed in Harbor (see the [threat model](docs/threat-model.md#removing-the-label-leaves-replications-running)).
-  A policy with the same name that pulls into another project blocks it too, because Harbor hides that policy from the robot.
+  A policy with the same name that the robot can't read, such as one in another project, blocks it too.
   Creating the replication fails with AlreadyExists, and the message names the policy.
 - The server needs Harbor 2.3 or later. Before Harbor 2.14, a run can start while the previous one is still running.
 - A schedule has 6 fields separated by single spaces: seconds, minutes, hours, day of month, month, and day of week, in UTC.

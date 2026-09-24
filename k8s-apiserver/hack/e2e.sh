@@ -20,7 +20,7 @@ for component in core jobservice; do
     --provenance=false --target "$component" -t "harbor-$component:e2e" -f hack/e2e/harbor.Dockerfile .. || exit
 done >"$harbor_build_log" 2>&1 &
 harbor_build=$!
-trap 'pkill -P "$harbor_build" 2>/dev/null || true; rm -f "$harbor_build_log"' EXIT
+trap 'pkill -P "$harbor_build" || true; kill "$harbor_build" 2>/dev/null || true; rm -f "$harbor_build_log"' EXIT
 
 if ! kind get clusters | grep -x "$cluster" >/dev/null; then
   kind create cluster --name "$cluster" --config hack/e2e/kind.yaml --wait 2m
@@ -34,7 +34,7 @@ kind export kubeconfig --name "$cluster"
 build_log=$(mktemp)
 docker build ${ca_bundle:+--secret "id=ca-bundle,src=$ca_bundle"} -t "$image" . >"$build_log" 2>&1 &
 build=$!
-trap 'pkill -P "$harbor_build" 2>/dev/null; kill "$build" 2>/dev/null || true; rm -f "$harbor_build_log" "$build_log"' EXIT
+trap 'pkill -P "$harbor_build" || true; kill "$harbor_build" "$build" 2>/dev/null || true; rm -f "$harbor_build_log" "$build_log"' EXIT
 
 # An interrupted TestHarborOutageIsServiceUnavailable leaves Harbor scaled down.
 if kubectl -n harbor get deployment harbor-nginx >/dev/null 2>&1; then

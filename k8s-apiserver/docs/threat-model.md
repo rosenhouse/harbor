@@ -301,7 +301,7 @@ A Harbor administrator can find the policies by their name prefix, `<prefix>.<pr
 
 Each policy's description holds its replication's namespace, namespace UID, name, UID, labels, annotations, and spec, as JSON ([replication_policy.go](../pkg/registry/replication_policy.go)).
 After `kubectl apply`, the annotations include `kubectl.kubernetes.io/last-applied-configuration`, which repeats the object.
-Harbor system admins, and robots that may read a policy, such as the replication robot, can read its description, in Harbor's UI under **Administration** > **Replications** or through its API.
+Harbor system admins and the replication robot can read the descriptions, in Harbor's UI under **Administration** > **Replications** or through its API.
 
 Mitigation: don't put secrets in a replication's labels or annotations.
 
