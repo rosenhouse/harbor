@@ -160,6 +160,38 @@ func TestValidateNilAccessElement(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestValidateProjectReplicationPermissions(t *testing.T) {
+	rAPI := &robotAPI{}
+	for _, access := range []*models.Access{
+		{Resource: "replication-policy", Action: "create"},
+		{Resource: "replication-policy", Action: "read"},
+		{Resource: "replication-policy", Action: "list"},
+		{Resource: "replication-policy", Action: "update"},
+		{Resource: "replication-policy", Action: "delete"},
+		{Resource: "replication", Action: "create"},
+		{Resource: "replication", Action: "read"},
+		{Resource: "replication", Action: "list"},
+	} {
+		permissions := []*models.RobotPermission{{Kind: robot.LEVELPROJECT, Namespace: "p", Access: []*models.Access{access}}}
+		assert.NoError(t, rAPI.validate(-1, robot.LEVELSYSTEM, permissions), "system robot with %s:%s", access.Resource, access.Action)
+		assert.Error(t, rAPI.validate(-1, robot.LEVELPROJECT, permissions), "project robot with %s:%s", access.Resource, access.Action)
+	}
+}
+
+func TestUpdateValidatesPermissionsForTheStoredLevel(t *testing.T) {
+	duration := int64(-1)
+	params := operation.UpdateRobotParams{Robot: &models.Robot{
+		Level:    robot.LEVELSYSTEM,
+		Duration: &duration,
+		Permissions: []*models.RobotPermission{{Kind: robot.LEVELPROJECT, Namespace: "p", Access: []*models.Access{
+			{Resource: "replication-policy", Action: "create"},
+		}}},
+	}}
+
+	err := (&robotAPI{}).updateV2Robot(context.Background(), params, &robot.Robot{Level: robot.LEVELPROJECT})
+	assert.ErrorContains(t, err, "bad request permission: replication-policy:create")
+}
+
 func TestContainsAccess(t *testing.T) {
 	system := rbac.PoliciesMap["System"]
 	systests := []struct {

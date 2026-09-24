@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -368,6 +369,9 @@ func (rAPI *robotAPI) validate(d int64, level string, permissions []*models.Robo
 			}
 		} else if perm.Kind == robot.LEVELPROJECT {
 			polices := provider.GetPermissions(rbac.ScopeProject)
+			if level == robot.LEVELSYSTEM {
+				polices = slices.Concat(polices, rbac.SystemRobotProjectPolicies)
+			}
 			for _, acc := range perm.Access {
 				if !containsAccess(polices, acc) {
 					return errors.New(nil).WithMessagef("bad request permission: %s:%s", acc.Resource, acc.Action).WithCode(errors.BadRequestCode)
@@ -385,7 +389,7 @@ func (rAPI *robotAPI) updateV2Robot(ctx context.Context, params operation.Update
 	if params.Robot.Duration == nil {
 		params.Robot.Duration = &r.Duration
 	}
-	if err := rAPI.validate(*params.Robot.Duration, params.Robot.Level, params.Robot.Permissions); err != nil {
+	if err := rAPI.validate(*params.Robot.Duration, r.Level, params.Robot.Permissions); err != nil {
 		return err
 	}
 	if r.Level != robot.LEVELSYSTEM {

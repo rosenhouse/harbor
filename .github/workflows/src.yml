@@ -1,0 +1,32 @@
+name: src
+
+on:
+  push:
+    branches: [agg]
+    paths: [src/**, api/**, tools/swagger/**, .github/workflows/src.yml]
+  pull_request:
+    paths: [src/**, api/**, tools/swagger/**, .github/workflows/src.yml]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: src
+
+jobs:
+  # Runs the tests of the packages that this fork changes. They need no database.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+      - run: go install github.com/go-swagger/go-swagger/cmd/swagger@v0.33.1
+      - run: >-
+          swagger generate server -q -f ../api/v2.0/swagger.yaml -A harbor --target server/v2.0
+          --template-dir=../tools/swagger/templates --exclude-main
+          --additional-initialism=CVE --additional-initialism=GC --additional-initialism=OIDC
+      - run: go test ./common/rbac/... ./controller/replication/... ./server/v2.0/handler/...
