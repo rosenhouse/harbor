@@ -197,6 +197,15 @@ func (s *stageTestSuite) TestReplaceNamespace() {
 	s.Equal("n/a", result)
 }
 
+func (s *stageTestSuite) TestReplaceNamespaceRejectsRelativePaths() {
+	for _, repository := range []string{"x/../victim/img", "a/b/../../../victim/img", "a/./img", "a//img", "a/..", ".."} {
+		for _, replaceCount := range []int8{-1, 0, 1} {
+			_, err := replaceNamespace(repository, "p/pre", replaceCount, "")
+			s.Error(err, "%s with count %d", repository, replaceCount)
+		}
+	}
+}
+
 func TestStage(t *testing.T) {
 	suite.Run(t, &stageTestSuite{})
 }

@@ -17,6 +17,7 @@ package flow
 import (
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 
 	repctlmodel "github.com/goharbor/harbor/src/controller/replication/model"
@@ -195,6 +196,11 @@ func replaceNamespace(repository string, namespace string, replaceCount int8, ds
 	}
 
 	srcRepoPathComponents := strings.Split(repository, "/")
+	// path.Join below would otherwise move the result out of the namespace
+	if slices.ContainsFunc(srcRepoPathComponents, func(c string) bool { return c == "" || c == "." || c == ".." }) {
+		return "", errors.New(nil).WithCode(errors.BadRequestCode).
+			WithMessagef("the source repository %q contains an empty, \".\" or \"..\" path component", repository)
+	}
 	srcLength := len(srcRepoPathComponents)
 
 	var dstRepoPrefix string

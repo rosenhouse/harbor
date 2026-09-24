@@ -24,6 +24,8 @@ import (
 	"github.com/go-openapi/strfmt"
 
 	"github.com/goharbor/harbor/src/common/rbac"
+	"github.com/goharbor/harbor/src/common/security"
+	robotSec "github.com/goharbor/harbor/src/common/security/robot"
 	"github.com/goharbor/harbor/src/controller/replication"
 	repctlmodel "github.com/goharbor/harbor/src/controller/replication/model"
 	"github.com/goharbor/harbor/src/jobservice/job"
@@ -50,10 +52,71 @@ func (r *replicationAPI) Prepare(_ context.Context, _ string, _ any) middleware.
 	return nil
 }
 
-func (r *replicationAPI) CreateReplicationPolicy(ctx context.Context, params operation.CreateReplicationPolicyParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionCreate, rbac.ResourceReplicationPolicy); err != nil {
-		return r.SendError(ctx, err)
+// fallsBackToProject reports whether to check a project permission after the system check returned systemErr.
+// It does only for system-level robots without the system permission, because only they can hold it on a project.
+func fallsBackToProject(ctx context.Context, systemErr error) bool {
+	sc, _ := security.FromContext(ctx)
+	robot, ok := sc.(*robotSec.SecurityContext)
+	return errors.IsErr(systemErr, errors.ForbiddenCode) && ok && robot.User().IsSysLevel()
+}
+
+// requireAccess passes callers with the system permission, and system-level robots with the permission on
+// the project that the policy pulls into.
+func (r *replicationAPI) requireAccess(ctx context.Context, action rbac.Action, resource rbac.Resource, policy *repctlmodel.Policy) error {
+	err := r.RequireSystemAccess(ctx, action, resource)
+	if !fallsBackToProject(ctx, err) {
+		return err
 	}
+	project, ok := pullProject(policy)
+	if !ok {
+		return err
+	}
+	has, permErr := r.HasProjectPermission(ctx, project, action, resource)
+	if permErr != nil {
+		return permErr
+	}
+	if !has {
+		return err
+	}
+	return nil
+}
+
+// requirePolicyAccess is requireAccess for a stored policy.
+// It gets the policy only for system-level robots without the system permission.
+func (r *replicationAPI) requirePolicyAccess(ctx context.Context, id int64, action rbac.Action, resource rbac.Resource) error {
+	if err := r.RequireSystemAccess(ctx, action, resource); !fallsBackToProject(ctx, err) {
+		return err
+	}
+	policy, err := r.ctl.GetPolicy(ctx, id)
+	if err != nil {
+		return err
+	}
+	return r.requireAccess(ctx, action, resource, policy)
+}
+
+// requireExecutionAccess is requirePolicyAccess for the policy of an execution.
+func (r *replicationAPI) requireExecutionAccess(ctx context.Context, id int64, action rbac.Action) error {
+	if err := r.RequireSystemAccess(ctx, action, rbac.ResourceReplication); !fallsBackToProject(ctx, err) {
+		return err
+	}
+	execution, err := r.ctl.GetExecution(ctx, id)
+	if err != nil {
+		return err
+	}
+	return r.requirePolicyAccess(ctx, execution.PolicyID, action, rbac.ResourceReplication)
+}
+
+// pullProject returns the project that the policy pulls into from a remote registry.
+func pullProject(policy *repctlmodel.Policy) (string, bool) {
+	pulls := policy.SrcRegistry != nil && policy.SrcRegistry.ID != 0 &&
+		(policy.DestRegistry == nil || policy.DestRegistry.ID == 0)
+	if !pulls || policy.DestNamespace == "" {
+		return "", false
+	}
+	return strings.Split(policy.DestNamespace, "/")[0], true
+}
+
+func (r *replicationAPI) CreateReplicationPolicy(ctx context.Context, params operation.CreateReplicationPolicyParams) middleware.Responder {
 	sc, err := r.GetSecurityContext(ctx)
 	if err != nil {
 		return r.SendError(ctx, err)
@@ -113,6 +176,10 @@ func (r *replicationAPI) CreateReplicationPolicy(ctx context.Context, params ope
 		policy.CopyByChunk = *params.Policy.CopyByChunk
 	}
 
+	if err := r.requireAccess(ctx, rbac.ActionCreate, rbac.ResourceReplicationPolicy, policy); err != nil {
+		return r.SendError(ctx, err)
+	}
+
 	if params.Policy.SingleActiveReplication != nil {
 		// Validate and assign SingleActiveReplication only for non-event_based triggers
 		if params.Policy.Trigger != nil && params.Policy.Trigger.Type == model.TriggerTypeEventBased && *params.Policy.SingleActiveReplication {
@@ -130,7 +197,7 @@ func (r *replicationAPI) CreateReplicationPolicy(ctx context.Context, params ope
 }
 
 func (r *replicationAPI) UpdateReplicationPolicy(ctx context.Context, params operation.UpdateReplicationPolicyParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionUpdate, rbac.ResourceReplicationPolicy); err != nil {
+	if err := r.requirePolicyAccess(ctx, params.ID, rbac.ActionUpdate, rbac.ResourceReplicationPolicy); err != nil {
 		return r.SendError(ctx, err)
 	}
 	policy := &repctlmodel.Policy{
@@ -189,6 +256,10 @@ func (r *replicationAPI) UpdateReplicationPolicy(ctx context.Context, params ope
 		policy.CopyByChunk = *params.Policy.CopyByChunk
 	}
 
+	if err := r.requireAccess(ctx, rbac.ActionUpdate, rbac.ResourceReplicationPolicy, policy); err != nil {
+		return r.SendError(ctx, err)
+	}
+
 	if params.Policy.SingleActiveReplication != nil {
 		// Validate and assign SingleActiveReplication only for non-event_based triggers
 		if params.Policy.Trigger != nil && params.Policy.Trigger.Type == model.TriggerTypeEventBased && *params.Policy.SingleActiveReplication {
@@ -204,8 +275,9 @@ func (r *replicationAPI) UpdateReplicationPolicy(ctx context.Context, params ope
 }
 
 func (r *replicationAPI) ListReplicationPolicies(ctx context.Context, params operation.ListReplicationPoliciesParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplicationPolicy); err != nil {
-		return r.SendError(ctx, err)
+	systemErr := r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplicationPolicy)
+	if systemErr != nil && !fallsBackToProject(ctx, systemErr) {
+		return r.SendError(ctx, systemErr)
 	}
 	query, err := r.BuildQuery(ctx, params.Q, params.Sort, params.Page, params.PageSize)
 	if err != nil {
@@ -216,11 +288,19 @@ func (r *replicationAPI) ListReplicationPolicies(ctx context.Context, params ope
 			Value: *params.Name,
 		}
 	}
-	total, err := r.ctl.PolicyCount(ctx, query)
-	if err != nil {
-		return r.SendError(ctx, err)
+	var total int64
+	var policies []*repctlmodel.Policy
+	if systemErr == nil {
+		total, err = r.ctl.PolicyCount(ctx, query)
+		if err != nil {
+			return r.SendError(ctx, err)
+		}
+		policies, err = r.ctl.ListPolicies(ctx, query)
+	} else {
+		policies, err = r.listProjectPolicies(ctx, query)
+		total = int64(len(policies))
+		policies = page(policies, query.PageNumber, query.PageSize)
 	}
-	policies, err := r.ctl.ListPolicies(ctx, query)
 	if err != nil {
 		return r.SendError(ctx, err)
 	}
@@ -234,8 +314,51 @@ func (r *replicationAPI) ListReplicationPolicies(ctx context.Context, params ope
 		WithPayload(result)
 }
 
+// listProjectPolicies lists, on all pages, the policies that pull into projects where the caller can list policies.
+func (r *replicationAPI) listProjectPolicies(ctx context.Context, query *q.Query) ([]*repctlmodel.Policy, error) {
+	allPages := q.MustClone(query)
+	allPages.PageNumber, allPages.PageSize = 0, 0
+	allPages.Keywords["DestRegistryID"] = 0
+	policies, err := r.ctl.ListPolicies(ctx, allPages)
+	if err != nil {
+		return nil, err
+	}
+	canList := map[string]bool{}
+	var result []*repctlmodel.Policy
+	for _, policy := range policies {
+		project, ok := pullProject(policy)
+		if !ok {
+			continue
+		}
+		allowed, checked := canList[project]
+		if !checked {
+			allowed, err = r.HasProjectPermission(ctx, project, rbac.ActionList, rbac.ResourceReplicationPolicy)
+			if err != nil {
+				return nil, err
+			}
+			canList[project] = allowed
+		}
+		if allowed {
+			result = append(result, policy)
+		}
+	}
+	return result, nil
+}
+
+func page[T any](items []T, number, size int64) []T {
+	if size <= 0 {
+		return items
+	}
+	skip := max(number-1, 0)
+	if skip > int64(len(items))/size {
+		return nil
+	}
+	start := skip * size
+	return items[start:min(start+size, int64(len(items)))]
+}
+
 func (r *replicationAPI) GetReplicationPolicy(ctx context.Context, params operation.GetReplicationPolicyParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionRead, rbac.ResourceReplicationPolicy); err != nil {
+	if err := r.requirePolicyAccess(ctx, params.ID, rbac.ActionRead, rbac.ResourceReplicationPolicy); err != nil {
 		return r.SendError(ctx, err)
 	}
 	policy, err := r.ctl.GetPolicy(ctx, params.ID)
@@ -246,7 +369,7 @@ func (r *replicationAPI) GetReplicationPolicy(ctx context.Context, params operat
 }
 
 func (r *replicationAPI) DeleteReplicationPolicy(ctx context.Context, params operation.DeleteReplicationPolicyParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionDelete, rbac.ResourceReplicationPolicy); err != nil {
+	if err := r.requirePolicyAccess(ctx, params.ID, rbac.ActionDelete, rbac.ResourceReplicationPolicy); err != nil {
 		return r.SendError(ctx, err)
 	}
 	if err := r.ctl.DeletePolicy(ctx, params.ID); err != nil {
@@ -256,7 +379,7 @@ func (r *replicationAPI) DeleteReplicationPolicy(ctx context.Context, params ope
 }
 
 func (r *replicationAPI) StartReplication(ctx context.Context, params operation.StartReplicationParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionCreate, rbac.ResourceReplication); err != nil {
+	if err := r.requirePolicyAccess(ctx, params.Execution.PolicyID, rbac.ActionCreate, rbac.ResourceReplication); err != nil {
 		return r.SendError(ctx, err)
 	}
 	policy, err := r.ctl.GetPolicy(ctx, params.Execution.PolicyID)
@@ -280,7 +403,7 @@ func (r *replicationAPI) StartReplication(ctx context.Context, params operation.
 }
 
 func (r *replicationAPI) StopReplication(ctx context.Context, params operation.StopReplicationParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionCreate, rbac.ResourceReplication); err != nil {
+	if err := r.requireExecutionAccess(ctx, params.ID, rbac.ActionCreate); err != nil {
 		return r.SendError(ctx, err)
 	}
 	if err := r.ctl.Stop(ctx, params.ID); err != nil {
@@ -290,7 +413,17 @@ func (r *replicationAPI) StopReplication(ctx context.Context, params operation.S
 }
 
 func (r *replicationAPI) ListReplicationExecutions(ctx context.Context, params operation.ListReplicationExecutionsParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplication); err != nil {
+	var err error
+	if params.PolicyID != nil {
+		err = r.requirePolicyAccess(ctx, *params.PolicyID, rbac.ActionList, rbac.ResourceReplication)
+	} else {
+		err = r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplication)
+	}
+	if errors.IsNotFoundErr(err) {
+		// A missing policy has no executions.
+		return operation.NewListReplicationExecutionsOK().WithXTotalCount(0).WithPayload([]*models.ReplicationExecution{})
+	}
+	if err != nil {
 		return r.SendError(ctx, err)
 	}
 	query, err := r.BuildQuery(ctx, nil, params.Sort, params.Page, params.PageSize)
@@ -352,7 +485,7 @@ func (r *replicationAPI) ListReplicationExecutions(ctx context.Context, params o
 }
 
 func (r *replicationAPI) GetReplicationExecution(ctx context.Context, params operation.GetReplicationExecutionParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionRead, rbac.ResourceReplication); err != nil {
+	if err := r.requireExecutionAccess(ctx, params.ID, rbac.ActionRead); err != nil {
 		return r.SendError(ctx, err)
 	}
 	execution, err := r.ctl.GetExecution(ctx, params.ID)
@@ -363,7 +496,7 @@ func (r *replicationAPI) GetReplicationExecution(ctx context.Context, params ope
 }
 
 func (r *replicationAPI) ListReplicationTasks(ctx context.Context, params operation.ListReplicationTasksParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplication); err != nil {
+	if err := r.requireExecutionAccess(ctx, params.ID, rbac.ActionList); err != nil {
 		return r.SendError(ctx, err)
 	}
 	// check the existence of the replication execution
@@ -423,7 +556,7 @@ func (r *replicationAPI) ListReplicationTasks(ctx context.Context, params operat
 }
 
 func (r *replicationAPI) GetReplicationLog(ctx context.Context, params operation.GetReplicationLogParams) middleware.Responder {
-	if err := r.RequireSystemAccess(ctx, rbac.ActionRead, rbac.ResourceReplication); err != nil {
+	if err := r.requireExecutionAccess(ctx, params.ID, rbac.ActionRead); err != nil {
 		return r.SendError(ctx, err)
 	}
 	execution, err := r.ctl.GetExecution(ctx, params.ID)

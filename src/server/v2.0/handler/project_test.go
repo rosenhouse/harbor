@@ -15,23 +15,61 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
+	repctlmodel "github.com/goharbor/harbor/src/controller/replication/model"
 	"github.com/goharbor/harbor/src/lib/pattern"
+	"github.com/goharbor/harbor/src/lib/q"
 	"github.com/goharbor/harbor/src/pkg/project/models"
+	regmodel "github.com/goharbor/harbor/src/pkg/reg/model"
 	"github.com/goharbor/harbor/src/pkg/scan/dao/scanner"
 	v1 "github.com/goharbor/harbor/src/pkg/scan/rest/v1"
 	apiModels "github.com/goharbor/harbor/src/server/v2.0/models"
 	"github.com/goharbor/harbor/src/server/v2.0/restapi"
 	projecttesting "github.com/goharbor/harbor/src/testing/controller/project"
+	replicationtesting "github.com/goharbor/harbor/src/testing/controller/replication"
+	repositorytesting "github.com/goharbor/harbor/src/testing/controller/repository"
 	scannertesting "github.com/goharbor/harbor/src/testing/controller/scanner"
 	"github.com/goharbor/harbor/src/testing/mock"
 	htesting "github.com/goharbor/harbor/src/testing/server/v2.0/handler"
 )
+
+func TestProjectIsNotDeletableWhilePoliciesPullIntoIt(t *testing.T) {
+	cases := map[string]struct {
+		policies  []*repctlmodel.Policy
+		deletable bool
+	}{
+		"a pull into the project": {[]*repctlmodel.Policy{storedPull(1, "p/team")}, false},
+		"a pull into a project with a longer name, and a push from the project": {[]*repctlmodel.Policy{
+			storedPull(1, "p2/team"),
+			{ID: 2, SrcRegistry: &regmodel.Registry{ID: 0}, DestRegistry: &regmodel.Registry{ID: 3}, DestNamespace: "p"},
+		}, true},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			projectCtl := &projecttesting.Controller{}
+			repositoryCtl := &repositorytesting.Controller{}
+			replicationCtl := &replicationtesting.Controller{}
+			mock.OnAnything(projectCtl, "Get").Return(&models.Project{ProjectID: 7, Name: "p"}, nil)
+			mock.OnAnything(repositoryCtl, "Count").Return(int64(0), nil)
+			replicationCtl.On("ListPolicies", mock.Anything, mock.Anything).Return(c.policies, nil)
+			api := &projectAPI{projectCtl: projectCtl, repositoryCtl: repositoryCtl, replicationCtl: replicationCtl}
+
+			_, result, err := api.deletable(context.Background(), "p")
+			require.NoError(t, err)
+			require.Equal(t, c.deletable, result.Deletable)
+
+			query := replicationCtl.Calls[0].Arguments.Get(1).(*q.Query)
+			require.Equal(t, 0, query.Keywords["DestRegistryID"])
+			require.Equal(t, &q.FuzzyMatchValue{Value: "p"}, query.Keywords["DestNamespace"])
+		})
+	}
+}
 
 func TestValidateProxyCacheRepositoryFilterUpdate(t *testing.T) {
 	tests := []struct {

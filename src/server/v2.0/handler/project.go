@@ -35,6 +35,7 @@ import (
 	"github.com/goharbor/harbor/src/controller/project"
 	"github.com/goharbor/harbor/src/controller/quota"
 	"github.com/goharbor/harbor/src/controller/registry"
+	"github.com/goharbor/harbor/src/controller/replication"
 	"github.com/goharbor/harbor/src/controller/repository"
 	"github.com/goharbor/harbor/src/controller/retention"
 	"github.com/goharbor/harbor/src/controller/scanner"
@@ -70,37 +71,39 @@ const (
 
 func newProjectAPI() *projectAPI {
 	return &projectAPI{
-		auditMgr:      audit.Mgr,
-		artCtl:        artifact.Ctl,
-		auditextMgr:   auditext.Mgr,
-		metadataMgr:   pkg.ProjectMetaMgr,
-		userCtl:       user.Ctl,
-		repositoryCtl: repository.Ctl,
-		projectCtl:    project.Ctl,
-		memberMgr:     member.Mgr,
-		quotaCtl:      quota.Ctl,
-		robotMgr:      robot.Mgr,
-		preheatCtl:    preheat.Ctl,
-		retentionCtl:  retention.Ctl,
-		scannerCtl:    scanner.DefaultController,
+		auditMgr:       audit.Mgr,
+		artCtl:         artifact.Ctl,
+		auditextMgr:    auditext.Mgr,
+		metadataMgr:    pkg.ProjectMetaMgr,
+		userCtl:        user.Ctl,
+		repositoryCtl:  repository.Ctl,
+		projectCtl:     project.Ctl,
+		memberMgr:      member.Mgr,
+		quotaCtl:       quota.Ctl,
+		robotMgr:       robot.Mgr,
+		preheatCtl:     preheat.Ctl,
+		replicationCtl: replication.Ctl,
+		retentionCtl:   retention.Ctl,
+		scannerCtl:     scanner.DefaultController,
 	}
 }
 
 type projectAPI struct {
 	BaseAPI
-	auditMgr      audit.Manager
-	auditextMgr   auditext.Manager
-	artCtl        artifact.Controller
-	metadataMgr   metadata.Manager
-	userCtl       user.Controller
-	repositoryCtl repository.Controller
-	projectCtl    project.Controller
-	memberMgr     member.Manager
-	quotaCtl      quota.Controller
-	robotMgr      robot.Manager
-	preheatCtl    preheat.Controller
-	retentionCtl  retention.Controller
-	scannerCtl    scanner.Controller
+	auditMgr       audit.Manager
+	auditextMgr    auditext.Manager
+	artCtl         artifact.Controller
+	metadataMgr    metadata.Manager
+	userCtl        user.Controller
+	repositoryCtl  repository.Controller
+	projectCtl     project.Controller
+	memberMgr      member.Manager
+	quotaCtl       quota.Controller
+	robotMgr       robot.Manager
+	preheatCtl     preheat.Controller
+	replicationCtl replication.Controller
+	retentionCtl   retention.Controller
+	scannerCtl     scanner.Controller
 }
 
 func (a *projectAPI) CreateProject(ctx context.Context, params operation.CreateProjectParams) middleware.Responder {
@@ -791,6 +794,21 @@ func (a *projectAPI) deletable(ctx context.Context, projectNameOrID any) (*proje
 	if p.RepoCount > 0 {
 		result.Deletable = false
 		result.Message = "the project contains repositories, can not be deleted"
+	}
+
+	// A pull would otherwise copy into a new project with the same name.
+	policies, err := a.replicationCtl.ListPolicies(ctx, q.New(q.KeyWords{
+		"DestRegistryID": 0,
+		"DestNamespace":  &q.FuzzyMatchValue{Value: p.Name},
+	}))
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, policy := range policies {
+		if project, ok := pullProject(policy); ok && project == p.Name {
+			result.Deletable = false
+			result.Message = "replication policies pull into the project, can not be deleted"
+		}
 	}
 
 	return p, result, nil

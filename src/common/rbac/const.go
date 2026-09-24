@@ -160,6 +160,20 @@ func (n *NolimitProvider) GetPermissions(s scope) []*types.Policy {
 	return []*types.Policy{}
 }
 
+// SystemRobotProjectPolicies are project permissions that only system-level robots can hold.
+// Project admins can create project-level robots, and so could otherwise grant themselves these.
+var SystemRobotProjectPolicies = []*types.Policy{
+	{Resource: ResourceReplicationPolicy, Action: ActionRead},
+	{Resource: ResourceReplicationPolicy, Action: ActionCreate},
+	{Resource: ResourceReplicationPolicy, Action: ActionDelete},
+	{Resource: ResourceReplicationPolicy, Action: ActionList},
+	{Resource: ResourceReplicationPolicy, Action: ActionUpdate},
+
+	{Resource: ResourceReplication, Action: ActionRead},
+	{Resource: ResourceReplication, Action: ActionCreate},
+	{Resource: ResourceReplication, Action: ActionList},
+}
+
 var (
 	PoliciesMap = map[scope][]*types.Policy{
 		ScopeSystem: {
