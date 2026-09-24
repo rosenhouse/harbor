@@ -52,11 +52,19 @@ func (r *replicationAPI) Prepare(_ context.Context, _ string, _ any) middleware.
 	return nil
 }
 
+// mayHoldOnProject reports whether a caller that lacks the system permission may hold it on a project.
+// Only system-level robots can.
+func mayHoldOnProject(ctx context.Context, systemErr error) bool {
+	sc, _ := security.FromContext(ctx)
+	robot, ok := sc.(*robotSec.SecurityContext)
+	return errors.IsErr(systemErr, errors.ForbiddenCode) && ok && robot.User().IsSysLevel()
+}
+
 // requireAccess passes callers with the system permission. Otherwise, it passes callers with the
 // permission on the project that the policy pulls into.
 func (r *replicationAPI) requireAccess(ctx context.Context, action rbac.Action, resource rbac.Resource, policy *repctlmodel.Policy) error {
 	err := r.RequireSystemAccess(ctx, action, resource)
-	if !errors.IsErr(err, errors.ForbiddenCode) {
+	if !mayHoldOnProject(ctx, err) {
 		return err
 	}
 	project, ok := pullProject(policy)
@@ -76,7 +84,7 @@ func (r *replicationAPI) requireAccess(ctx context.Context, action rbac.Action, 
 // requirePolicyAccess is requireAccess for a stored policy.
 // It gets the policy only for callers without the system permission.
 func (r *replicationAPI) requirePolicyAccess(ctx context.Context, id int64, action rbac.Action, resource rbac.Resource) error {
-	if err := r.RequireSystemAccess(ctx, action, resource); !errors.IsErr(err, errors.ForbiddenCode) {
+	if err := r.RequireSystemAccess(ctx, action, resource); !mayHoldOnProject(ctx, err) {
 		return err
 	}
 	policy, err := r.ctl.GetPolicy(ctx, id)
@@ -88,7 +96,7 @@ func (r *replicationAPI) requirePolicyAccess(ctx context.Context, id int64, acti
 
 // requireExecutionAccess is requirePolicyAccess for the policy of an execution.
 func (r *replicationAPI) requireExecutionAccess(ctx context.Context, id int64, action rbac.Action) error {
-	if err := r.RequireSystemAccess(ctx, action, rbac.ResourceReplication); !errors.IsErr(err, errors.ForbiddenCode) {
+	if err := r.RequireSystemAccess(ctx, action, rbac.ResourceReplication); !mayHoldOnProject(ctx, err) {
 		return err
 	}
 	execution, err := r.ctl.GetExecution(ctx, id)
@@ -268,7 +276,7 @@ func (r *replicationAPI) UpdateReplicationPolicy(ctx context.Context, params ope
 
 func (r *replicationAPI) ListReplicationPolicies(ctx context.Context, params operation.ListReplicationPoliciesParams) middleware.Responder {
 	systemErr := r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplicationPolicy)
-	if systemErr != nil && (!errors.IsErr(systemErr, errors.ForbiddenCode) || !isSystemRobot(ctx)) {
+	if systemErr != nil && !mayHoldOnProject(ctx, systemErr) {
 		return r.SendError(ctx, systemErr)
 	}
 	query, err := r.BuildQuery(ctx, params.Q, params.Sort, params.Page, params.PageSize)
@@ -335,14 +343,6 @@ func (r *replicationAPI) listProjectPolicies(ctx context.Context, query *q.Query
 		}
 	}
 	return result, nil
-}
-
-// isSystemRobot reports whether the caller is a system-level robot.
-// Only these robots can hold replication permissions on projects.
-func isSystemRobot(ctx context.Context) bool {
-	sc, _ := security.FromContext(ctx)
-	robot, ok := sc.(*robotSec.SecurityContext)
-	return ok && robot.User().IsSysLevel()
 }
 
 func page[T any](items []T, number, size int64) []T {

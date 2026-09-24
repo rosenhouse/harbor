@@ -20,7 +20,7 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/http/httptest"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -48,19 +48,27 @@ import (
 	htesting "github.com/goharbor/harbor/src/testing/server/v2.0/handler"
 )
 
+// replicationAccessTestSuite serves requests as a robot at the level with the granted access.
+// Tests that clear Caller serve them as Security, which isn't a robot.
 type replicationAccessTestSuite struct {
 	htesting.Suite
 	ctl     *replicationtesting.Controller
+	level   string
 	granted map[string]bool
+	access  map[string][]*types.Policy // by scope, such as "/project/7"
+	project project.Controller
 }
 
 func (s *replicationAccessTestSuite) SetupSuite() {
 	s.ctl = &replicationtesting.Controller{}
 	s.Config = &restapi.Config{ReplicationAPI: &replicationAPI{ctl: s.ctl}}
 	s.Suite.SetupSuite()
+	// The robot's evaluator gets projects from project.Ctl.
+	s.project, project.Ctl = project.Ctl, projectCtlMock
 }
 
 func (s *replicationAccessTestSuite) TearDownSuite() {
+	project.Ctl = s.project
 	projectCtlMock.ExpectedCalls, projectCtlMock.Calls = nil, nil
 	s.Suite.TearDownSuite()
 }
@@ -70,7 +78,10 @@ func (s *replicationAccessTestSuite) SetupTest() {
 	s.Security.ExpectedCalls, s.Security.Calls = nil, nil
 	projectCtlMock.ExpectedCalls, projectCtlMock.Calls = nil, nil
 
+	s.level = robot.LEVELSYSTEM
 	s.granted = map[string]bool{}
+	s.access = map[string][]*types.Policy{}
+	s.Caller = s.robot()
 	s.Security.On("IsAuthenticated").Return(true)
 	s.Security.On("GetUsername").Return("robot$replicator")
 	s.Security.On("Can", mock.Anything, mock.Anything, mock.Anything).Return(
@@ -82,6 +93,9 @@ func (s *replicationAccessTestSuite) SetupTest() {
 	projectCtlMock.On("GetByName", mock.Anything, "other").Return(&project.Project{ProjectID: 8, Name: "other"}, nil)
 	projectCtlMock.On("GetByName", mock.Anything, "broken").Return(nil, errors.New("database is down"))
 	projectCtlMock.On("GetByName", mock.Anything, mock.Anything).Return(nil, errors.NotFoundError(nil))
+	projectCtlMock.On("Get", mock.Anything, int64(7), mock.Anything).Return(&project.Project{ProjectID: 7, Name: "p"}, nil)
+	projectCtlMock.On("Get", mock.Anything, int64(8), mock.Anything).Return(&project.Project{ProjectID: 8, Name: "other"}, nil)
+	projectCtlMock.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.NotFoundError(nil))
 
 	s.ctl.On("DeletePolicy", mock.Anything, mock.Anything).Return(nil)
 	s.ctl.On("UpdatePolicy", mock.Anything, mock.Anything).Return(nil)
@@ -97,9 +111,20 @@ func (s *replicationAccessTestSuite) SetupTest() {
 
 // grant lets the caller do each action on the resource, such as "/project/7/replication-policy".
 func (s *replicationAccessTestSuite) grant(resource string, actions ...string) {
+	scope := path.Dir(resource)
 	for _, action := range actions {
 		s.granted[resource+":"+action] = true
+		s.access[scope] = append(s.access[scope], &types.Policy{Resource: types.Resource(path.Base(resource)), Action: types.Action(action)})
 	}
+	s.Caller = s.robot()
+}
+
+func (s *replicationAccessTestSuite) robot() security.Context {
+	var permissions []*robot.Permission
+	for scope, access := range s.access {
+		permissions = append(permissions, &robot.Permission{Scope: scope, Access: access})
+	}
+	return robotsec.NewSecurityContext(&robot.Robot{Robot: robotmodel.Robot{Name: "robot$replicator"}, Level: s.level, Permissions: permissions})
 }
 
 func pullPolicy(destNamespace string) *models.ReplicationPolicy {
@@ -255,8 +280,47 @@ func (s *replicationAccessTestSuite) TestUnauthenticated() {
 	cases := append(slices.Clone(allCases),
 		accessCase{method: http.MethodPost, path: "/replication/policies", body: pullPolicy("p")},
 		accessCase{method: http.MethodGet, path: "/replication/policies"})
+	for _, caller := range []security.Context{nil, robotsec.NewSecurityContext(nil)} {
+		s.Caller = caller
+		for _, c := range cases {
+			s.Equal(http.StatusUnauthorized, s.do(c, c.id(5)).StatusCode, "%T %s %s", caller, c.method, c.path)
+		}
+	}
+	s.Empty(s.ctl.Calls)
+}
+
+func (s *replicationAccessTestSuite) TestNonRobotIsForbidden() {
+	s.stubStoredPolicies()
+	for _, resource := range []string{"replication-policy", "replication"} {
+		s.grant("/project/7/"+resource, "create", "read", "list", "update", "delete")
+	}
+	s.Caller = nil
+
+	cases := append(slices.Clone(allCases),
+		accessCase{method: http.MethodPost, path: "/replication/policies", body: pullPolicy("p")},
+		accessCase{method: http.MethodGet, path: "/replication/policies"})
 	for _, c := range cases {
-		s.Equal(http.StatusUnauthorized, s.do(c, c.id(5)).StatusCode, "%s %s", c.method, c.path)
+		for _, policy := range []int64{5, 404} {
+			s.Equal(http.StatusForbidden, s.do(c, c.id(policy)).StatusCode, "%s %s %d", c.method, c.path, policy)
+		}
+	}
+	s.Empty(s.ctl.Calls)
+}
+
+func (s *replicationAccessTestSuite) TestProjectRobotIsForbidden() {
+	s.stubStoredPolicies()
+	s.level = robot.LEVELPROJECT
+	for _, resource := range []string{"replication-policy", "replication"} {
+		s.grant("/project/7/"+resource, "create", "read", "list", "update", "delete")
+	}
+
+	cases := append(slices.Clone(allCases),
+		accessCase{method: http.MethodPost, path: "/replication/policies", body: pullPolicy("p")},
+		accessCase{method: http.MethodGet, path: "/replication/policies"})
+	for _, c := range cases {
+		for _, policy := range []int64{5, 404} {
+			s.Equal(http.StatusForbidden, s.do(c, c.id(policy)).StatusCode, "%s %s %d", c.method, c.path, policy)
+		}
 	}
 	s.Empty(s.ctl.Calls)
 }
@@ -391,29 +455,6 @@ func (s *replicationAccessTestSuite) listPolicies(path string) ([]*models.Replic
 	return policies, res
 }
 
-// listAsRobot lists policies as a robot at the level with the access to project p.
-func (s *replicationAccessTestSuite) listAsRobot(level, rawQuery string, access ...*types.Policy) ([]*models.ReplicationPolicy, *httptest.ResponseRecorder) {
-	projectCtlMock.On("Get", mock.Anything, int64(7), mock.Anything).Return(&project.Project{ProjectID: 7, Name: "p"}, nil)
-	projectCtlMock.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.NotFoundError(nil))
-	defer func(ctl project.Controller) { project.Ctl = ctl }(project.Ctl)
-	project.Ctl = projectCtlMock
-	sc := robotsec.NewSecurityContext(&robot.Robot{Robot: robotmodel.Robot{Name: "robot$replicator"}, Level: level, Permissions: []*robot.Permission{
-		{Kind: robot.LEVELPROJECT, Namespace: "p", Scope: "/project/7", Access: access},
-	}})
-
-	h, _, err := restapi.HandlerAPI(*s.Config)
-	s.Require().NoError(err)
-	req := httptest.NewRequest(http.MethodGet, "/api/v2.0/replication/policies?"+rawQuery, nil)
-	res := httptest.NewRecorder()
-	h.ServeHTTP(res, req.WithContext(security.NewContext(req.Context(), sc)))
-
-	var policies []*models.ReplicationPolicy
-	if res.Code == http.StatusOK {
-		s.Require().NoError(json.Unmarshal(res.Body.Bytes(), &policies))
-	}
-	return policies, res
-}
-
 func policyIDs(policies []*models.ReplicationPolicy) []int64 {
 	ids := []int64{}
 	for _, p := range policies {
@@ -427,11 +468,13 @@ func (s *replicationAccessTestSuite) TestListWithProjectPermission() {
 	s.ctl.On("ListPolicies", mock.Anything, mock.Anything).Return(
 		[]*repctlmodel.Policy{storedPull(1, "p/a"), storedPull(2, "other"), push, storedPull(4, "p"), storedPull(5, "gone"), storedPull(6, "p/b"), storedPull(7, "other/b")}, nil)
 
-	policies, res := s.listAsRobot(robot.LEVELSYSTEM, "name=pull&sort=-id&page=2&page_size=2", &types.Policy{Resource: "replication-policy", Action: "list"})
-	s.Equal(http.StatusOK, res.Code)
+	s.grant("/project/7/replication-policy", "list")
+
+	policies, res := s.listPolicies("/replication/policies?name=pull&sort=-id&page=2&page_size=2")
+	s.Equal(http.StatusOK, res.StatusCode)
 	s.Equal([]int64{6}, policyIDs(policies))
-	s.Equal("3", res.Header().Get("X-Total-Count"))
-	s.Contains(res.Header().Get("Link"), `rel="prev"`)
+	s.Equal("3", res.Header.Get("X-Total-Count"))
+	s.Contains(res.Header.Get("Link"), `rel="prev"`)
 
 	query := s.ctl.Calls[0].Arguments.Get(1).(*q.Query)
 	s.Zero(query.PageSize)
@@ -444,31 +487,21 @@ func (s *replicationAccessTestSuite) TestListWithProjectPermission() {
 func (s *replicationAccessTestSuite) TestListFailsWhenTheProjectLookupFails() {
 	s.ctl.On("ListPolicies", mock.Anything, mock.Anything).Return([]*repctlmodel.Policy{storedPull(1, "broken")}, nil)
 
-	_, res := s.listAsRobot(robot.LEVELSYSTEM, "", &types.Policy{Resource: "replication-policy", Action: "list"})
-	s.Equal(http.StatusInternalServerError, res.Code)
+	s.grant("/project/7/replication-policy", "list")
+
+	_, res := s.listPolicies("/replication/policies")
+	s.Equal(http.StatusInternalServerError, res.StatusCode)
 }
 
 func (s *replicationAccessTestSuite) TestListWithoutPermission() {
 	s.ctl.On("ListPolicies", mock.Anything, mock.Anything).Return([]*repctlmodel.Policy{storedPull(1, "p")}, nil)
 
-	policies, res := s.listAsRobot(robot.LEVELSYSTEM, "", &types.Policy{Resource: "replication-policy", Action: "read"})
-	s.Equal(http.StatusOK, res.Code)
+	s.grant("/project/7/replication-policy", "read")
+
+	policies, res := s.listPolicies("/replication/policies")
+	s.Equal(http.StatusOK, res.StatusCode)
 	s.Empty(policies)
-	s.Equal("0", res.Header().Get("X-Total-Count"))
-}
-
-func (s *replicationAccessTestSuite) TestListAsProjectRobotIsForbidden() {
-	_, res := s.listAsRobot(robot.LEVELPROJECT, "", &types.Policy{Resource: "replication-policy", Action: "list"})
-	s.Equal(http.StatusForbidden, res.Code)
-	s.False(s.called("ListPolicies"))
-}
-
-func (s *replicationAccessTestSuite) TestListAsNonRobotIsForbidden() {
-	s.grant("/project/7/replication-policy", "list")
-
-	_, res := s.listPolicies("/replication/policies")
-	s.Equal(http.StatusForbidden, res.StatusCode)
-	s.False(s.called("ListPolicies"))
+	s.Equal("0", res.Header.Get("X-Total-Count"))
 }
 
 func (s *replicationAccessTestSuite) TestListWithSystemPermission() {

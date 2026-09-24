@@ -36,8 +36,10 @@ type Suite struct {
 
 	Config   *restapi.Config
 	Security *securitytesting.Context
-	ts       *httptest.Server
-	tc       *http.Client
+	// Caller replaces Security when set.
+	Caller security.Context
+	ts     *httptest.Server
+	tc     *http.Client
 }
 
 // SetupSuite ...
@@ -50,7 +52,11 @@ func (suite *Suite) SetupSuite() {
 
 	suite.Security = &securitytesting.Context{}
 	m := middleware.New(func(w http.ResponseWriter, r *http.Request, next http.Handler) {
-		next.ServeHTTP(w, r.WithContext(security.NewContext(r.Context(), suite.Security)))
+		var caller security.Context = suite.Security
+		if suite.Caller != nil {
+			caller = suite.Caller
+		}
+		next.ServeHTTP(w, r.WithContext(security.NewContext(r.Context(), caller)))
 	})
 
 	suite.ts = httptest.NewServer(m(h))
