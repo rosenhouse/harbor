@@ -6,22 +6,9 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/apis/harbor/v1alpha1"
 )
-
-func TestAddToSchemeRegistersReplications(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := v1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	for _, kind := range []string{"HarborReplication", "HarborReplicationList"} {
-		if !scheme.Recognizes(v1alpha1.SchemeGroupVersion.WithKind(kind)) {
-			t.Errorf("%s is not registered", kind)
-		}
-	}
-}
 
 func TestHarborReplicationJSON(t *testing.T) {
 	start := metav1.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)

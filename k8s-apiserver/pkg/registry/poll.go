@@ -15,7 +15,7 @@ import (
 	"github.com/rosenhouse/harbor/k8s-apiserver/pkg/harbor"
 )
 
-// listConcurrency is how many artifact lists a poll, or execution reads a list of replications, sends to Harbor at once.
+// listConcurrency bounds the Harbor requests in flight for a poll's artifact lists, and for a replication list's execution reads.
 const listConcurrency = 4
 
 // retryDelay is how long a poller waits to retry a poll that fails after one that did not.
@@ -102,7 +102,7 @@ func (p *Poller) Run(ctx context.Context, interval time.Duration) {
 }
 
 // Poll lists the project's repositories and their artifacts into the store. A failed poll leaves the store's items in place.
-// Meanwhile, it lists the replication policies. If only that list fails, the poll updates the items and keeps the links.
+// Then it lists the replication policies. If only that list fails, the poll updates the items and keeps the links.
 // A poll fails once it takes longer than the staleness limit, since its result would be stale.
 // A poll that keeps a repository's artifacts from an earlier poll updates the store, and returns errArtifactsRead.
 func (p *Poller) Poll(ctx context.Context) error {
@@ -112,17 +112,12 @@ func (p *Poller) Poll(ctx context.Context) error {
 	start := p.store.clock.Now()
 	pollCtx, cancel := context.WithTimeout(ctx, p.store.stalenessLimit)
 	defer cancel()
-	linksCtx, cancelLinks := context.WithCancel(pollCtx)
-	defer cancelLinks()
+	items, err := p.read(pollCtx, start)
 	var links []replicationLink
 	var linksErr error
-	var linking sync.WaitGroup
-	linking.Go(func() { links, linksErr = p.readLinks(linksCtx) })
-	items, err := p.read(pollCtx, start)
-	if err != nil {
-		cancelLinks()
+	if err == nil {
+		links, linksErr = p.readLinks(pollCtx)
 	}
-	linking.Wait()
 	if ctx.Err() != nil {
 		// The server is shutting down.
 		return err

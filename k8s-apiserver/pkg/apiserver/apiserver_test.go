@@ -231,11 +231,13 @@ func TestOpenAPI(t *testing.T) {
 			defs, _ = defs[key].(map[string]any)
 		}
 		for _, k := range append(kinds, struct{ resource, kind string }{"harborreplications", "HarborReplication"}) {
-			def, _ := defs["io.goharbor.harbor.v1alpha1."+k.kind].(map[string]any)
-			gvks, _ := json.Marshal(def["x-kubernetes-group-version-kind"])
-			want := `[{"group":"harbor.goharbor.io","kind":"` + k.kind + `","version":"v1alpha1"}]`
-			if string(gvks) != want {
-				t.Errorf("%s: %s has GVKs %s, want %s", tc.path, k.kind, gvks, want)
+			for _, kind := range []string{k.kind, k.kind + "List"} {
+				def, _ := defs["io.goharbor.harbor.v1alpha1."+kind].(map[string]any)
+				gvks, _ := json.Marshal(def["x-kubernetes-group-version-kind"])
+				want := `[{"group":"harbor.goharbor.io","kind":"` + kind + `","version":"v1alpha1"}]`
+				if string(gvks) != want {
+					t.Errorf("%s: %s has GVKs %s, want %s", tc.path, kind, gvks, want)
+				}
 			}
 		}
 	}
@@ -424,6 +426,12 @@ metadata:
 `
 	checkCreated(t, send(t, h, http.MethodPatch, path+"nginx?fieldManager=test", apply, manifest))
 	current := get(t, h, path+"nginx").Body.String()
+	var created metav1.PartialObjectMetadata
+	if err := json.Unmarshal([]byte(current), &created); err != nil {
+		t.Fatal(err)
+	}
+	withUID := strings.Replace(manifest, "  name: nginx\n", "  name: nginx\n  uid: "+string(created.UID)+"\n", 1)
+	withUIDWithoutLabels := strings.Replace(withUID, "  labels:\n    app: web\n", "", 1)
 
 	for _, tc := range []struct {
 		name, method, nameAndQuery, contentType, body string
@@ -433,6 +441,8 @@ metadata:
 		{"server-side apply", http.MethodPatch, "nginx?fieldManager=test", apply, manifest, http.StatusOK, ""},
 		{"server-side apply without the labels", http.MethodPatch, "nginx?fieldManager=test", apply, withoutLabels, http.StatusUnprocessableEntity, "metadata.labels"},
 		{"server-side apply without the tag", http.MethodPatch, "nginx?fieldManager=test", apply, withoutTag, http.StatusUnprocessableEntity, "spec"},
+		{"server-side apply with the UID", http.MethodPatch, "nginx?fieldManager=test", apply, withUID, http.StatusOK, ""},
+		{"server-side apply with the UID and without the labels", http.MethodPatch, "nginx?fieldManager=test", apply, withUIDWithoutLabels, http.StatusUnprocessableEntity, "metadata.labels"},
 		// kubectl's server-side apply rewrites that annotation.
 		{"server-side apply by kubectl without kubectl's last-applied configuration", http.MethodPatch, "nginx?fieldManager=kubectl", apply, withoutLastApplied, http.StatusOK, ""},
 		{"server-side apply of only kubectl's last-applied configuration", http.MethodPatch, "nginx?fieldManager=kubectl-last-applied", apply, onlyLastApplied, http.StatusOK, ""},

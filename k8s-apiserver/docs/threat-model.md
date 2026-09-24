@@ -10,7 +10,7 @@ This model covers an install from `deploy/`, with or without that component, as 
   With the README's permissions, they can list repository and artifact metadata in one project, but cannot pull, push, or change anything.
 - Secret `harbor-apiserver-replication`, from the replication component, holds a system-level robot account's credentials.
   With the README's permissions, they can list registry endpoints, and create, start, stop, and delete replication policies anywhere in Harbor.
-- The project's content and storage quota, which replications write to.
+- The project's content and storage quota are at stake, because replications write into the project.
 - The project metadata includes repository names and descriptions, artifact digests, tags, sizes, media types, OCI annotations, and push and pull times and counts.
 - Secret `harbor-apiserver-ca` holds the serving CA's key, and Secret `harbor-apiserver-tls` holds the serving key.
   The aggregator trusts every serving certificate that the CA signs for this API.
@@ -269,7 +269,9 @@ Removing `harbor.goharbor.io/project` from a namespace, or changing it, hides th
 Their policies stay in Harbor, and their schedules keep running.
 Kubernetes users can no longer see or delete them, and deleting the namespace no longer deletes them.
 Restoring the label shows them again.
-The same happens to the replications of an endpoint that `registries` no longer allows, to all replications when `--replication-prefix` changes or replications are disabled, and to a policy whose name, source, destination, filters, trigger, or description's namespace, namespace UID, name, or spec someone changes in Harbor.
+The same happens to the replications of an endpoint that `registries` no longer allows.
+It happens to all replications when `--replication-prefix` changes or replications are disabled.
+It also happens to a policy when someone changes, in Harbor, what the server checks before it shows the policy (see [The replication robot controls replication across Harbor](#the-replication-robot-controls-replication-across-harbor)).
 Other changes in Harbor leave the policy visible.
 The server shows a change to the description's UID, labels, or annotations as a change to the replication, even to its UID.
 It doesn't show other changes, such as disabling the policy.
@@ -335,7 +337,7 @@ The clusters share the project's quota.
 Requests for repositories and artifacts never call Harbor.
 Instead, each replica polls Harbor ([poll.go](../pkg/registry/poll.go)).
 Each poll makes one repository list, then one artifact list per repository, 4 at a time.
-With replications, each poll also lists the replication policies, alongside those lists.
+With replications, each poll then lists the replication policies.
 Each Harbor list pages through 100 items at a time, and starts over after 1 second, up to 3 tries in all, when the item count drops during it.
 After a poll, the replica waits `--harbor-poll-interval` (30s) plus up to 10% jitter.
 After a poll that fails, or that keeps a repository's artifacts from an earlier poll, it retries once after 1 second, and then waits the poll interval until a poll succeeds.
@@ -361,12 +363,13 @@ Limits:
 - [client.go](../pkg/harbor/client.go) reads at most 1000 pages per list and 16 MiB per response, and fails the list beyond either.
 - A replication's labels and annotations total at most 8 KiB, so a page of 100 policies stays below 16 MiB, even when escaping grows each byte to 7.
 - `--harbor-timeout` (10s) bounds each Harbor request, and `--harbor-staleness-limit` (5m) bounds each poll.
-- Each poll has at most 5 Harbor requests in flight: 4 for the project, and 1 for the replication policies.
+- Each poll has at most 4 Harbor requests in flight.
 - Each replication `list` has at most 4 Harbor requests in flight.
 - Each replica serves at most 400 read requests and 200 other requests at once.
 - A schedule runs a replication at most once an hour. On Harbor 2.14 or later, runs of one replication don't overlap.
 - A schedule must match a date that exists. Harbor's job service loops forever on one that never runs, such as February 30 ([enqueuer.go](../../src/jobservice/period/enqueuer.go)).
-- A tag pattern has at most two `*` and one `{}` group. Harbor's matcher tries every way to match, so each `*` multiplies its time by up to the tag's length, and each `{}` group by its number of alternatives. With these limits, it matches a tag in milliseconds.
+- A tag pattern has at most two `*`, and no `{}` group. Harbor's matcher tries every way to match, so each `*` multiplies its time by up to the tag's length, and each `{}` group by its number of alternatives.
+  With these limits, it matches a 128-character tag in about 5 ms at worst ([replications_test.go](../pkg/registry/replications_test.go)).
 - kube-apiserver's API Priority and Fairness applies to the requests it proxies, but not to direct calls to the Service.
 
 Residual risk: the polls' load on Harbor grows with the project's size and the number of replicas, but not with Kubernetes requests.
@@ -377,7 +380,7 @@ Beyond 100,000, those policy lists fail.
 Then cluster-wide lists of replications fail, and, once `--harbor-staleness-limit` passes, so do lists of artifacts by the `harbor.goharbor.io/replication` label.
 Lists of replications in one namespace read only its policies, so other namespaces' replications don't affect them.
 A replication creator can load Harbor's job service, which also runs garbage collection, scans, and other replications, with many replications, or with one of a large repository and `tag: "*"`.
-A source repository with many long tags still costs harbor-core some milliseconds per tag in each run, and many such replications can occupy its 10 flows, which delays every replication in Harbor.
+A source repository with many long tags still costs harbor-core up to about 5 ms per tag in each run, and many such replications can occupy its 10 flows, which delays every replication in Harbor.
 The server ignores `limit` and `continue`.
 
 The page and size limits do not bound memory in practice.
@@ -389,7 +392,8 @@ The pods request 64 MiB of memory, and have no memory limit and no priority clas
 So a list of a large project across all namespaces, such as from a monitoring or dashboard ServiceAccount with cluster-wide `list`, or a few concurrent lists, can grow a pod far beyond its request.
 Under node memory pressure, such a pod is among the first that the kubelet evicts or the kernel kills, and other pods on the node suffer too.
 If both replicas go, the APIService becomes unavailable, which breaks discovery and namespace deletion cluster-wide.
-Not yet done: a memory limit with headroom, a cap on the objects or bytes in a response that fails the request instead of exhausting memory, a cap on the number of replications, and `priorityClassName: system-cluster-critical`, as metrics-server uses.
+The install doesn't yet set a memory limit with headroom, or `priorityClassName: system-cluster-critical` as metrics-server does.
+The server doesn't yet cap the number of replications, or the objects or bytes in a response, which would fail the request instead of exhausting memory.
 
 ### Harbor outages
 

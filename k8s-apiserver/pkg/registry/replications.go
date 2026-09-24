@@ -419,11 +419,17 @@ func (r *Replications) Update(ctx context.Context, name string, objInfo rest.Upd
 		return nil, false, err
 	}
 	// Server-side apply keeps the fields that its configuration leaves out, because the server stores no managed fields.
-	// So check the object that the configuration alone makes, which apply builds when the current object has no UID.
-	// Other patches then fail with NotFound, and an update returns its object again.
-	if alone, err := objInfo.UpdatedObject(ctx, r.New()); err == nil && !onlyLastApplied(alone) {
-		if _, err := r.checkUnchanged(ctx, alone, current); err != nil {
+	// So check the object that the configuration alone makes.
+	if forceAllowCreate {
+		base := &v1alpha1.HarborReplication{ObjectMeta: metav1.ObjectMeta{Name: current.Name, Namespace: current.Namespace, UID: current.UID}}
+		alone, err := objInfo.UpdatedObject(ctx, base.DeepCopy())
+		if err != nil {
 			return nil, false, err
+		}
+		if !onlyLastApplied(alone, base) {
+			if _, err := r.checkUnchanged(ctx, alone, current); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 	if updateValidation != nil {
@@ -442,9 +448,9 @@ func (r *Replications) createMissing(ctx context.Context, objInfo rest.UpdatedOb
 	return r.Create(ctx, obj, createValidation, &metav1.CreateOptions{DryRun: options.DryRun})
 }
 
-// onlyLastApplied returns whether obj holds only its name, its namespace, and kubectl's last-applied configuration.
+// onlyLastApplied returns whether obj is base with kubectl's last-applied configuration.
 // kubectl's server-side apply sends that configuration to keep the annotation, which the server keeps anyway.
-func onlyLastApplied(obj runtime.Object) bool {
+func onlyLastApplied(obj runtime.Object, base *v1alpha1.HarborReplication) bool {
 	repl, ok := obj.(*v1alpha1.HarborReplication)
 	if !ok || !metav1.HasAnnotation(repl.ObjectMeta, corev1.LastAppliedConfigAnnotation) {
 		return false
@@ -452,7 +458,7 @@ func onlyLastApplied(obj runtime.Object) bool {
 	others := repl.DeepCopy()
 	delete(others.Annotations, corev1.LastAppliedConfigAnnotation)
 	others.TypeMeta, others.ManagedFields = metav1.TypeMeta{}, nil
-	return apiequality.Semantic.DeepEqual(others, &v1alpha1.HarborReplication{ObjectMeta: metav1.ObjectMeta{Name: repl.Name, Namespace: repl.Namespace}})
+	return apiequality.Semantic.DeepEqual(others, base)
 }
 
 // checkUnchanged returns obj, prepared for update, if it differs from current only in what the server ignores.
@@ -642,28 +648,19 @@ var (
 	// cronParser parses a schedule as Harbor's utils.CronParser does.
 	cronParser   = cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	singleNumber = regexp.MustCompile(`^[0-9]+$`)
-	// tagPattern holds the characters of tags and of Harbor's tag patterns, which JSON does not escape.
+	// tagPattern holds the characters of tags and of Harbor's tag patterns without {} groups, which JSON does not escape.
 	// So a policy's filters fit in Harbor's column for them.
-	tagPattern = regexp.MustCompile(`^[A-Za-z0-9_.*?\[\]^{},-]+$`)
-	// braceInClass finds a {, }, or , in a character class.
-	braceInClass = regexp.MustCompile(`\[[^\]]*[{},]`)
+	tagPattern = regexp.MustCompile(`^[A-Za-z0-9_.*?\[\]^-]+$`)
 )
 
 // tagPatternError returns why Harbor's doublestar matcher could fail a run on a pattern that matches tagPattern, or match it slowly.
-// That matcher tries every way to match a tag. Each * multiplies its time by up to the tag's length, and each {} group by its number of alternatives.
-// Its {} groups end at the first }, even in a character class.
+// That matcher tries every way to match a tag, so each * multiplies its time by up to the tag's length.
 func tagPatternError(pattern string) string {
-	switch {
-	case strings.Count(pattern, "*") > 2:
+	if strings.Count(pattern, "*") > 2 {
 		return "must have at most two *"
-	case strings.Count(pattern, "{") > 1:
-		return "must have at most one {} group"
-	case braceInClass.MatchString(pattern):
-		return "must not have {, }, or , in a character class"
 	}
 	// path.Match checks the whole pattern, and has the same character classes.
-	_, err := path.Match(pattern, "")
-	if _, group, braced := strings.Cut(pattern, "{"); err != nil || braced && !strings.Contains(group, "}") {
+	if _, err := path.Match(pattern, ""); err != nil {
 		return "must be a valid pattern"
 	}
 	return ""
@@ -705,7 +702,7 @@ func (c ReplicationConfig) validate(obj *v1alpha1.HarborReplication) field.Error
 	case len(obj.Spec.Tag) > maxTagLength:
 		errs = append(errs, field.TooLong(spec.Child("tag"), obj.Spec.Tag, maxTagLength))
 	case !tagPattern.MatchString(obj.Spec.Tag):
-		errs = append(errs, field.Invalid(spec.Child("tag"), obj.Spec.Tag, "must hold only letters, digits, and the characters _.-*?[]^{},"))
+		errs = append(errs, field.Invalid(spec.Child("tag"), obj.Spec.Tag, "must hold only letters, digits, and the characters _.-*?[]^"))
 	case tagMsg != "":
 		errs = append(errs, field.Invalid(spec.Child("tag"), obj.Spec.Tag, tagMsg))
 	}

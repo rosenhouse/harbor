@@ -510,33 +510,11 @@ func TestFirstPollWithoutPoliciesServesArtifactsWithoutLinks(t *testing.T) {
 	expectReplicationSelectors(t, f, "listing replication policies failed: harbor rejected the robot account credentials")
 }
 
-// policiesUntilCancelled lists the policies only once the poll is cancelled, and records that it was.
-type policiesUntilCancelled struct {
-	ReplicationPolicyLister
-	cancelled chan struct{}
-}
-
-func (p policiesUntilCancelled) ListReplicationPolicies(ctx context.Context, namePrefix string) ([]harbor.ReplicationPolicy, error) {
-	select {
-	case <-ctx.Done():
-		close(p.cancelled)
-	case <-time.After(5 * time.Second):
-	}
-	return p.ReplicationPolicyLister.ListReplicationPolicies(context.Background(), namePrefix)
-}
-
-func TestFailedPollCancelsListingPoliciesAndKeepsLinks(t *testing.T) {
+func TestFailedPollKeepsLinks(t *testing.T) {
 	f := newReplicationFixture(t)
-	cancelled := make(chan struct{})
-	f.poller.LinkReplications(policiesUntilCancelled{f.replications, cancelled}, replicationConfig)
 	f.replications.policies = nil
 	f.harbor.setErr(harbor.ErrUnavailable)
 	f.poll(t)
-	select {
-	case <-cancelled:
-	default:
-		t.Error("the failed poll did not cancel listing policies")
-	}
 	if diff := cmp.Diff([]string{"ns1/" + replicatedArtifact}, artifactNames(artifactItems(t, f.artifacts, "ns1", byReplication("nginx")))); diff != "" {
 		t.Errorf("names (-want +got):\n%s", diff)
 	}
@@ -563,33 +541,5 @@ func TestStaleReplicatedArtifactsFailRequestsThatCouldReturnThem(t *testing.T) {
 		if tc.unavailable != apierrors.IsServiceUnavailable(err) || !tc.unavailable && err != nil {
 			t.Errorf("%s: got %v, want unavailable %v", tc.desc, err, tc.unavailable)
 		}
-	}
-}
-
-// beforeListing runs before each list of replication policies.
-type beforeListing struct {
-	ReplicationPolicyLister
-	before func()
-}
-
-func (b beforeListing) ListReplicationPolicies(ctx context.Context, namePrefix string) ([]harbor.ReplicationPolicy, error) {
-	b.before()
-	return b.ReplicationPolicyLister.ListReplicationPolicies(ctx, namePrefix)
-}
-
-func TestPollListsPoliciesWhileReadingTheProject(t *testing.T) {
-	f := newUnreadReplicationFixture()
-	listing := make(chan struct{})
-	f.poller.LinkReplications(beforeListing{f.replications, func() { close(listing) }}, replicationConfig)
-	f.harbor.onList = func() {
-		select {
-		case <-listing:
-		case <-time.After(5 * time.Second):
-			t.Error("did not list policies while listing repositories")
-		}
-	}
-	f.poll(t)
-	if diff := cmp.Diff([]string{"ns1/" + replicatedArtifact}, artifactNames(artifactItems(t, f.artifacts, "ns1", byReplication("nginx")))); diff != "" {
-		t.Errorf("names (-want +got):\n%s", diff)
 	}
 }

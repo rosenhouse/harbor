@@ -605,7 +605,7 @@ func schema_pkg_apis_harbor_v1alpha1_HarborReplicationSpec(ref common.ReferenceC
 					},
 					"tag": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Tag is a Harbor tag filter, a glob such as 1.27*. Use * to copy every tag. It has at most two * and one {} group, so that Harbor matches it quickly.",
+							Description: "Tag is a Harbor tag filter, a glob such as 1.27*. Use * to copy every tag. It has at most two *, so that Harbor matches it quickly, and no {} group.",
 							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",

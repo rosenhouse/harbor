@@ -173,7 +173,7 @@ type HarborReplicationSpec struct {
 	// Repository is the path of the source repository, such as library/nginx. It takes no glob.
 	Repository string `json:"repository"`
 	// Tag is a Harbor tag filter, a glob such as 1.27*. Use * to copy every tag.
-	// It has at most two * and one {} group, so that Harbor matches it quickly.
+	// It has at most two *, so that Harbor matches it quickly, and no {} group.
 	Tag string `json:"tag"`
 	// Schedule is a Harbor cron expression that runs the replication again, such as "0 0 3 * * *".
 	// Harbor runs it in UTC. Its first field is seconds, which must be 0. Minutes must be a single number.

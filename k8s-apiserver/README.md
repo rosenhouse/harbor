@@ -313,14 +313,9 @@ Select by field instead.
 ## Enable replications
 
 Replications let Kubernetes users copy images into the project from registry endpoints that you allow.
-They are off by default, because they weaken the security model.
-
-The server needs a system-level Harbor robot account for them, which Harbor cannot limit to one project, to one endpoint, or to pulling.
-With its credentials, anyone can replicate any project to any registry endpoint, and stop or delete any replication policy in Harbor.
-They can also copy anything that an endpoint's credentials can read into any project, including a public one, and so overwrite tags or expose private content.
-The server limits what it does with them, but anyone who can read Secret `harbor-apiserver-replication`, or create pods in `harbor-apiserver`, can use them directly.
-Users who can create replications can copy anything that an allowed endpoint's credentials can read into the project, which every labeled namespace sees, and whose quota they all share.
-While Harbor is unavailable, or rejects the replication robot, such as after it expires, no labeled namespace can finish deleting.
+They are off by default, because they need a system-level Harbor robot account, which Harbor cannot limit to one project, to one endpoint, or to pulling.
+Anyone who can read its Secret, or create pods in `harbor-apiserver`, can use it to replicate between any project and any endpoint in Harbor.
+Users who can create replications can copy anything that an allowed endpoint's credentials can read into the project, which every labeled namespace shares.
 Read the [threat model](docs/threat-model.md#the-replication-robot-controls-replication-across-harbor) before you enable them.
 
 ### Create registry endpoints
@@ -493,35 +488,34 @@ The ownerReference only shows where the artifacts came from. Deleting the replic
 ### Limits
 
 - A replication cannot change, not even its labels and annotations.
-  `update` and `patch` accept only requests that change nothing. They let server-side apply create and re-apply a replication, and let kubectl validate one without listing CRDs.
-  Any change, such as a new spec or label, fails with `field is immutable`.
-  So does a server-side apply whose manifest lacks a field or label of the replication, because the server keeps no managed fields.
-  Server-side apply without `--force-conflicts` reports a changed value as a conflict with `before-first-apply` instead.
-  To change a replication, delete and recreate it, such as with `kubectl apply --force`. Flux changes a replication only with `spec.force: true`, which recreates it.
-  Helm charts often change labels such as `helm.sh/chart` in each version, so `helm upgrade` fails on a replication with such labels. Leave them off replications.
-- The server ignores changes to the annotation `kubectl.kubernetes.io/last-applied-configuration`, which kubectl and other tools add, rewrite, and remove.
+  An update, patch, or server-side apply succeeds only if it changes nothing, and otherwise fails with `field is immutable`.
+  A server-side apply also fails if its manifest lacks a field or label of the replication, because the server keeps no managed fields.
+  Without `--force-conflicts`, it reports a changed value as a conflict with `before-first-apply` instead.
+  To change a replication, delete and recreate it, such as with `kubectl apply --force`, or Flux's `spec.force: true`.
+  Leave labels that change with each chart version, such as `helm.sh/chart`, off replications, or `helm upgrade` fails.
+- The server ignores changes to the annotation `kubectl.kubernetes.io/last-applied-configuration`.
   So client-side `kubectl apply` of a replication that it did not create warns that the annotation is missing, and reports `configured` without a change.
 - There is no watch. `kubectl get -w` fails, and `kubectl wait` logs watch errors and notices changes late.
+- Argo CD applies replications, but never prunes them or deletes them with their Application, because it tracks only kinds that it can watch. Delete them yourself.
+  Its Server-Side Diff fails on replications, so give such Applications the annotation `argocd.argoproj.io/compare-options: ServerSideDiff=false`.
 - The status has no conditions. So health checks that read conditions, such as Flux's `wait`, count a replication as ready whatever its last run did.
 - The server does not keep `generateName`.
 - There is no way to rerun a replication on demand yet.
-- Deleting a replication stops its runs, and deletes its policy and run history from Harbor.
-  It leaves the copied artifacts.
+- Deleting a replication stops its runs, and deletes its policy and run history from Harbor. It leaves the copied artifacts.
   If the runs have not stopped after 30 seconds, the delete fails with a Conflict. Retry it.
 - Deleting a labeled namespace deletes its replications' policies, and leaves their artifacts.
   The namespace stays Terminating until Harbor answers.
 - Removing a namespace's label, an endpoint from `registries`, or the component hides the affected replications, but their schedules keep running in Harbor.
-  Delete the replications first. Before you remove the component, run `kubectl delete harborreplications --all --all-namespaces`.
+  Delete the replications first.
 - A policy that the server hides blocks its namespace and name until a Harbor administrator deletes it.
-  Examples are a policy from an earlier namespace of the same name, and one whose source, destination, filters, or trigger someone changed in Harbor, or whose description's namespace, namespace UID, name, or spec someone changed.
+  Examples are a policy from an earlier namespace of the same name, and one that someone changed in Harbor (see the [threat model](docs/threat-model.md#removing-the-label-leaves-replications-running)).
   Creating the replication fails with AlreadyExists, and the message names the policy.
-  A change in Harbor to the description's UID, labels, or annotations doesn't hide the policy, but changes the replication.
 - The server needs Harbor 2.3 or later. Before Harbor 2.14, a run can start while the previous one is still running.
 - A schedule has 6 fields separated by single spaces: seconds, minutes, hours, day of month, month, and day of week, in UTC.
-  Seconds must be `0`, and minutes a single number, so a replication runs at most once an hour. It must be at most 64 characters.
-  It must match a date that exists, because Harbor's job service loops forever on a schedule such as `0 0 0 30 2 *`.
-- A tag pattern holds only letters, digits, and the characters `_.-*?[]^{},`.
-  It has at most two `*` and one `{}` group, and no `{`, `}`, or `,` in a character class, so that Harbor matches each tag in milliseconds.
+  Seconds must be `0`, and minutes a single number, so a replication runs at most once an hour.
+  It must be at most 64 characters, and match a date that exists.
+- A tag pattern holds only letters, digits, and the characters `_.-*?[]^`, with at most two `*`, so that Harbor matches each tag in milliseconds.
+  It cannot hold `{}` alternatives. Create a replication for each alternative instead.
 - The destination repository, `<project>/<prefix>/<namespace>/<name>/<repository>`, must fit in 255 characters.
 - A replication's labels and annotations together must fit in 8192 bytes, because its Harbor policy holds them.
   Client-side `kubectl apply` adds an annotation that holds the whole manifest, so apply a large manifest with `kubectl create` or `--server-side`.

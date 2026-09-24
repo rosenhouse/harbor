@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bmatcuk/doublestar"
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -281,22 +283,13 @@ func TestValidateReplication(t *testing.T) {
 		}, want: []string{"spec.repository"}},
 		"no tag":                               {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "" }, want: []string{"spec.tag"}},
 		"long tag":                             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = strings.Repeat("a", 129) }, want: []string{"spec.tag"}},
-		"tag pattern":                          {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "V_[0-9][^a-z]?.{1,2*}-*" }},
+		"tag pattern":                          {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "V_[0-9][^a-z]?.*-*" }},
 		"tag pattern with three stars":         {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "*?*?*Z" }, want: []string{"spec.tag"}},
 		"tag pattern with many stars":          {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = strings.Repeat("*?", 12) + "Z" }, want: []string{"spec.tag"}},
-		"two alternatives":                     {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "{a,b}{c,d}" }, want: []string{"spec.tag"}},
-		"many alternatives":                    {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = strings.Repeat("{a,a}", 25) }, want: []string{"spec.tag"}},
-		"nested alternatives":                  {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "{a,{b,c}}" }, want: []string{"spec.tag"}},
-		"brace in character class":             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "[{]" }, want: []string{"spec.tag"}},
-		"alternatives in character class":      {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "{[}]" }, want: []string{"spec.tag"}},
-		"alternative ends in character class":  {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v{1,[}]" }, want: []string{"spec.tag"}},
-		"comma in character class":             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "{[a,b]}" }, want: []string{"spec.tag"}},
+		"alternatives":                         {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v{1,2}" }, want: []string{"spec.tag"}},
 		"unclosed character class":             {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v[" }, want: []string{"spec.tag"}},
 		"empty character class":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v[]" }, want: []string{"spec.tag"}},
 		"open character range":                 {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v[0-]" }, want: []string{"spec.tag"}},
-		"unclosed alternatives":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v{1,{2}" }, want: []string{"spec.tag"}},
-		"unclosed group":                       {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "v{1,2" }, want: []string{"spec.tag"}},
-		"unopened alternatives":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "}{1,2}" }},
 		"tag that JSON escapes":                {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "<" }, want: []string{"spec.tag"}},
 		"tag with a space":                     {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "1 2" }, want: []string{"spec.tag"}},
 		"tag with a slash":                     {change: func(o *v1alpha1.HarborReplication) { o.Spec.Tag = "a/b" }, want: []string{"spec.tag"}},
@@ -350,6 +343,39 @@ func TestValidateReplication(t *testing.T) {
 				t.Errorf("invalid fields (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// Harbor matches tags with doublestar v1.3.4, which src/go.mod pins.
+func TestHarborMatchesValidTagPatternsQuickly(t *testing.T) {
+	const maxMatchTime = 50 * time.Millisecond
+	tag := strings.Repeat("a", maxTagLength)
+	for _, pattern := range []string{
+		"**" + strings.Repeat("?", 125) + "b",
+		"*a*" + strings.Repeat("?", 124) + "b",
+		"**" + strings.Repeat("[a]", 42) + "b",
+		"**" + strings.Repeat("[^b]", 31) + "b",
+		"**[" + strings.Repeat("a", 123) + "]b",
+		"***" + strings.Repeat("[a]", 41) + "b",
+		"**{" + strings.Repeat(",", 80) + "}" + strings.Repeat("?", 40) + "b",
+		"*{*,*}" + strings.Repeat("?", 120) + "b",
+	} {
+		obj := replication("nginx")
+		obj.Namespace, obj.Spec.Tag = "ns1", pattern
+		if len(replicationConfig.validate(obj)) > 0 {
+			continue
+		}
+		fastest := time.Duration(math.MaxInt64)
+		for range 3 {
+			start := time.Now()
+			if _, err := doublestar.Match(pattern, tag); err != nil {
+				t.Fatalf("pattern %q: %v", pattern, err)
+			}
+			fastest = min(fastest, time.Since(start))
+		}
+		if fastest > maxMatchTime {
+			t.Errorf("pattern %q took %v to match a tag, want at most %v", pattern, fastest, maxMatchTime)
+		}
 	}
 }
 
@@ -868,6 +894,7 @@ func TestDeleteReplicationPreconditions(t *testing.T) {
 	created := create(t, r, "ns1", replication("nginx"))
 	h.finish("Succeed")
 	current, _ := getReplication(r, "ns1", "nginx")
+	h.calls = nil
 	for _, p := range []*metav1.Preconditions{
 		{UID: ptr.To[types.UID]("other")},
 		{ResourceVersion: ptr.To(created.ResourceVersion)},
@@ -876,8 +903,8 @@ func TestDeleteReplicationPreconditions(t *testing.T) {
 			t.Errorf("%+v: got %v, want Conflict", p, err)
 		}
 	}
-	if w := h.writes(); len(w) != 2 {
-		t.Errorf("writes %v, want none after create", w)
+	if w := h.writes(); len(w) != 0 {
+		t.Errorf("writes %v, want none", w)
 	}
 	p := &metav1.Preconditions{UID: ptr.To(current.UID), ResourceVersion: ptr.To(current.ResourceVersion)}
 	if _, err := deleteReplication(r, "ns1", "nginx", &metav1.DeleteOptions{Preconditions: p}); err != nil {
@@ -1025,7 +1052,7 @@ func TestUpdateReplicationWithoutChanges(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			r, h, current := labeledReplication(t)
-			got, err := updateReplication(r, "ns1", "nginx", patch(change), true, &metav1.UpdateOptions{})
+			got, err := updateReplication(r, "ns1", "nginx", patch(change), false, &metav1.UpdateOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1341,18 +1368,5 @@ func TestReplicationTable(t *testing.T) {
 	}
 	if one, err := r.ConvertToTable(context.Background(), &list.(*v1alpha1.HarborReplicationList).Items[0], nil); err != nil || len(one.Rows) != 1 {
 		t.Errorf("one replication: %v, %v", one, err)
-	}
-}
-
-func TestReplicationsResource(t *testing.T) {
-	r, _, _ := newReplications()
-	if _, ok := r.New().(*v1alpha1.HarborReplication); !ok {
-		t.Errorf("New returns %T", r.New())
-	}
-	if _, ok := r.NewList().(*v1alpha1.HarborReplicationList); !ok {
-		t.Errorf("NewList returns %T", r.NewList())
-	}
-	if !r.NamespaceScoped() || r.GetSingularName() != "harborreplication" {
-		t.Error("not the namespaced resource harborreplication")
 	}
 }

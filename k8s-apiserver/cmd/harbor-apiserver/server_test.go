@@ -248,6 +248,7 @@ func TestServerLinksReplicatedArtifactsInItsFirstPoll(t *testing.T) {
 	o.PollInterval = time.Hour
 	h := startServerWithReplications(t, kube, replicatedHarbor{}, o, &fakeReplicationHarbor{}, enabledReplications)
 
+	// A server that polls before it lists namespaces would poll now, and link nothing until the next poll.
 	time.Sleep(100 * time.Millisecond)
 	close(releaseList)
 	waitForOK(t, h, "/readyz")

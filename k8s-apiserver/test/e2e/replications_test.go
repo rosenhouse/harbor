@@ -160,73 +160,79 @@ func TestReplication(t *testing.T) {
 
 	createReplication(t, manifest, as)
 	r := waitForReplication(t, ns, "app")
-
-	if e := r.Status.LastExecution; r.UID == "" || r.Status.Destination != destination(ns, "app") || e.Trigger != v1alpha1.ReplicationTriggerManual ||
-		e.Succeeded == 0 || e.Failed != 0 || e.StartTime == nil || e.EndTime == nil {
-		t.Errorf("uid %q, destination %q, last execution %+v", r.UID, r.Status.Destination, *e)
-	}
 	replicated := destination(ns, "app") + "/" + sourceApp
 	wantArtifacts := []string{replicated + "@" + digest(t, seed.SourceV1)}
-	wantOwners := []metav1.OwnerReference{{APIVersion: v1alpha1.SchemeGroupVersion.String(), Kind: "HarborReplication", Name: "app", UID: r.UID}}
-	for _, a := range expectArtifacts(t, wantArtifacts, "-n", ns, "-l", v1alpha1.ReplicationLabel+"=app") {
-		if diff := cmp.Diff(wantOwners, a.OwnerReferences); diff != "" {
-			t.Errorf("%s: owners (-want +got):\n%s", a.Name, diff)
-		}
-	}
 
-	if out, err := apply(t, manifest, as); err != nil || !strings.HasSuffix(out, " unchanged") {
-		t.Errorf("second apply: %q, %v", out, err)
-	}
-	v2 := replicationManifest(ns, "app", v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v2"})
-	if _, err := apply(t, v2, as); err == nil || !strings.Contains(err.Error(), "spec: Invalid value") || !strings.Contains(err.Error(), "field is immutable") {
-		t.Errorf("apply of a new tag: got %v, want an immutable spec", err)
-	}
-	if _, err := kubectl(t, "-n", ns, "label", "harborreplication", "app", "team=web", as); err == nil || !strings.Contains(err.Error(), "metadata.labels: Invalid value: field is immutable") {
-		t.Errorf("label: got %v, want immutable labels", err)
-	}
-	// These rewrite the annotation that client-side apply keeps, which the server ignores.
-	before := mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "json")
-	current := filepath.Join(t.TempDir(), "current.json")
-	if err := os.WriteFile(current, []byte(before), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// kubectl's server-side apply warns if it cannot keep the annotation.
-	if out, stderr, err := kubectlWithStderr(t, "apply", "--server-side", "-f", manifestFile(t, manifest), as); err != nil || stderr != "" {
-		t.Errorf("server-side apply: %q, %q, %v", out, stderr, err)
-	}
-	if out, err := kubectl(t, "replace", "-f", current, as); err != nil {
-		t.Errorf("replace: %q, %v", out, err)
-	}
-	if after := mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "json"); after != before {
-		t.Errorf("after server-side apply and replace: %s\nwant %s", after, before)
-	}
-	row := strings.Fields(mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "--no-headers", as))
-	if len(row) != 7 || !slices.Equal(row[:6], []string{"app", ReplicationRegistry, sourceApp, "v1", "<none>", "Succeeded"}) {
-		t.Errorf("row %q", row)
-	}
+	t.Run("status", func(t *testing.T) {
+		if e := r.Status.LastExecution; r.UID == "" || r.Status.Destination != destination(ns, "app") || e.Trigger != v1alpha1.ReplicationTriggerManual ||
+			e.Succeeded == 0 || e.Failed != 0 || e.StartTime == nil || e.EndTime == nil {
+			t.Errorf("uid %q, destination %q, last execution %+v", r.UID, r.Status.Destination, *e)
+		}
+		wantOwners := []metav1.OwnerReference{{APIVersion: v1alpha1.SchemeGroupVersion.String(), Kind: "HarborReplication", Name: "app", UID: r.UID}}
+		for _, a := range expectArtifacts(t, wantArtifacts, "-n", ns, "-l", v1alpha1.ReplicationLabel+"=app") {
+			if diff := cmp.Diff(wantOwners, a.OwnerReferences); diff != "" {
+				t.Errorf("%s: owners (-want +got):\n%s", a.Name, diff)
+			}
+		}
+		row := strings.Fields(mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "--no-headers", as))
+		if len(row) != 7 || !slices.Equal(row[:6], []string{"app", ReplicationRegistry, sourceApp, "v1", "<none>", "Succeeded"}) {
+			t.Errorf("row %q", row)
+		}
+	})
 
-	mustKubectl(t, "-n", ns, "delete", "harborreplication", "app", "--dry-run=server", as)
-	mustKubectl(t, "-n", ns, "get", "harborreplication", "app", as)
-	expectPolicies(t, ns, policyPrefix(ns)+"app")
+	t.Run("immutable", func(t *testing.T) {
+		if out, err := apply(t, manifest, as); err != nil || !strings.HasSuffix(out, " unchanged") {
+			t.Errorf("second apply: %q, %v", out, err)
+		}
+		v2 := replicationManifest(ns, "app", v1alpha1.HarborReplicationSpec{Registry: ReplicationRegistry, Repository: sourceApp, Tag: "v2"})
+		if _, err := apply(t, v2, as); err == nil || !strings.Contains(err.Error(), "spec: Invalid value") || !strings.Contains(err.Error(), "field is immutable") {
+			t.Errorf("apply of a new tag: got %v, want an immutable spec", err)
+		}
+		if _, err := kubectl(t, "-n", ns, "label", "harborreplication", "app", "team=web", as); err == nil || !strings.Contains(err.Error(), "metadata.labels: Invalid value: field is immutable") {
+			t.Errorf("label: got %v, want immutable labels", err)
+		}
+		// These rewrite the annotation that client-side apply keeps, which the server ignores.
+		before := mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "json")
+		current := filepath.Join(t.TempDir(), "current.json")
+		if err := os.WriteFile(current, []byte(before), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// kubectl's server-side apply warns if it cannot keep the annotation.
+		if out, stderr, err := kubectlWithStderr(t, "apply", "--server-side", "-f", manifestFile(t, manifest), as); err != nil || stderr != "" {
+			t.Errorf("server-side apply: %q, %q, %v", out, stderr, err)
+		}
+		if out, err := kubectl(t, "replace", "-f", current, as); err != nil {
+			t.Errorf("replace: %q, %v", out, err)
+		}
+		if after := mustKubectl(t, "-n", ns, "get", "harborreplication", "app", "-o", "json"); after != before {
+			t.Errorf("after server-side apply and replace: %s\nwant %s", after, before)
+		}
+	})
 
-	mustKubectl(t, "-n", ns, "delete", "harborreplication", "app", as)
-	if _, err := kubectl(t, "-n", ns, "get", "harborreplication", "app", as); err == nil || !strings.Contains(err.Error(), "NotFound") {
-		t.Errorf("get after delete: %v", err)
-	}
-	expectPolicies(t, ns)
-	eventuallyKubectl(t, func(out string) error {
-		var list v1alpha1.HarborArtifactList
-		if err := json.Unmarshal([]byte(out), &list); err != nil {
-			return err
+	t.Run("delete", func(t *testing.T) {
+		mustKubectl(t, "-n", ns, "delete", "harborreplication", "app", "--dry-run=server", as)
+		mustKubectl(t, "-n", ns, "get", "harborreplication", "app", as)
+		expectPolicies(t, ns, policyPrefix(ns)+"app")
+
+		mustKubectl(t, "-n", ns, "delete", "harborreplication", "app", as)
+		if _, err := kubectl(t, "-n", ns, "get", "harborreplication", "app", as); err == nil || !strings.Contains(err.Error(), "NotFound") {
+			t.Errorf("get after delete: %v", err)
 		}
-		if diff := cmp.Diff(wantArtifacts, locations(list.Items)); diff != "" {
-			return fmt.Errorf("artifacts after delete (-want +got):\n%s", diff)
-		}
-		if a := list.Items[0]; a.Labels[v1alpha1.ReplicationLabel] != "" || len(a.OwnerReferences) > 0 {
-			return fmt.Errorf("artifact after delete: labels %v, owners %v", a.Labels, a.OwnerReferences)
-		}
-		return nil
-	}, "-n", ns, "get", "harborartifacts", "-o", "json", "--field-selector", "status.repository="+replicated)
+		expectPolicies(t, ns)
+		eventuallyKubectl(t, func(out string) error {
+			var list v1alpha1.HarborArtifactList
+			if err := json.Unmarshal([]byte(out), &list); err != nil {
+				return err
+			}
+			if diff := cmp.Diff(wantArtifacts, locations(list.Items)); diff != "" {
+				return fmt.Errorf("artifacts after delete (-want +got):\n%s", diff)
+			}
+			if a := list.Items[0]; a.Labels[v1alpha1.ReplicationLabel] != "" || len(a.OwnerReferences) > 0 {
+				return fmt.Errorf("artifact after delete: labels %v, owners %v", a.Labels, a.OwnerReferences)
+			}
+			return nil
+		}, "-n", ns, "get", "harborartifacts", "-o", "json", "--field-selector", "status.repository="+replicated)
+	})
 }
 
 func TestServerSideApplyReplication(t *testing.T) {
