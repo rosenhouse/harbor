@@ -17,7 +17,7 @@ Read the [threat model](docs/threat-model.md) before you install.
 ## Prerequisites
 
 - A Kubernetes 1.25 or later cluster with the aggregation layer enabled, and cluster-admin access to it.
-- Harbor 2.2 or later, reachable over HTTPS from the cluster's pods. The e2e tests use Harbor 2.15.2 from Helm chart 1.19.2.
+- Harbor 2.2 or later, reachable over HTTPS from the cluster's pods. The e2e tests use Helm chart 1.19.2 (Harbor 2.15.2), with core and jobservice from this fork, and don't test upstream core.
 - A Harbor project whose name is a valid label value (at most 63 characters).
 - `git`, `kubectl`, `jq`, and Docker with Buildx.
 - A registry that the cluster can pull from.
@@ -313,10 +313,11 @@ Select by field instead.
 ## Enable replications
 
 Replications let Kubernetes users copy images into the project from registry endpoints that you allow.
-They are off by default, because they need a system-level Harbor robot account, which Harbor cannot limit to one project, to one endpoint, or to pulling.
-Anyone who can read its Secret, or create pods in `harbor-apiserver`, can use it to replicate between any project and any endpoint in Harbor.
+They are off by default, because they need a system-level Harbor robot account that can pull from any registry endpoint into the project.
+Anyone who can read its Secret, or create pods in `harbor-apiserver`, can do what the robot can.
+With upstream Harbor, the robot can replicate between any project and any endpoint.
 Users who can create replications can copy anything that an allowed endpoint's credentials can read into the project, which every labeled namespace shares.
-Read the [threat model](docs/threat-model.md#the-replication-robot-controls-replication-across-harbor) before you enable them.
+Read the [threat model](docs/threat-model.md#the-replication-robot-controls-pulls-into-the-project) before you enable them.
 
 ### Create registry endpoints
 
@@ -327,27 +328,27 @@ Never give an endpoint that points back at this Harbor the credentials of an acc
 
 ### Create a system robot account
 
-Give the robot only these system permissions:
+Give the robot only these permissions:
 
-| Resource | Actions |
-| --- | --- |
-| Registry | List |
-| Replication Policy | List, Read, Create, Delete |
-| Replication | List, Create |
+| Scope | Resource | Actions |
+| --- | --- | --- |
+| System | Registry | List |
+| Project | Replication Policy | List, Read, Create, Delete |
+| Project | Replication | List, Create |
 
-Keep the robot's name and secret in a private directory until you create the Secret below:
+The server lists registry endpoints to find their IDs.
+Grant the project permissions on the `project` of Secret `harbor-apiserver` (see [Namespace deletion waits for Harbor](docs/threat-model.md#namespace-deletion-waits-for-harbor)).
+
+Only Harbor core and jobservice from this fork let a system-level robot hold replication permissions on a project, and keep its pulls in the project.
+The fork's core migrates Harbor's database to the schema of Harbor 2.16, and the core of an older release can't use it.
+
+Harbor's UI can't grant the project permissions yet ([issue 31](https://github.com/rosenhouse/harbor/issues/31)), and editing the robot in the UI drops them.
+So create the robot through the API, as a Harbor system administrator.
+Keep its name and secret in a private directory until you create the Secret below:
 
 ```sh
 dir=$(mktemp -d)
 ```
-
-As a Harbor system administrator, open **Administration** > **Robot Accounts** > **New Robot Account**.
-Name it `harbor-apiserver-replication`, set an expiration, select only the system permissions above, and select no project permissions.
-The UI offers these permissions from Harbor 2.10.
-Harbor then shows the robot's full name, such as `robot$harbor-apiserver-replication`, and, only this once, its secret.
-Save them in `$dir/username` and `$dir/password`.
-
-Or, as a Harbor system administrator, use the API:
 
 ```sh
 curl -fsS -u my-harbor-admin -H 'Content-Type: application/json' \
@@ -355,17 +356,24 @@ curl -fsS -u my-harbor-admin -H 'Content-Type: application/json' \
     "name": "harbor-apiserver-replication",
     "level": "system",
     "duration": 90,
-    "permissions": [{"kind": "system", "namespace": "/", "access": [
-      {"resource": "registry", "action": "list"},
-      {"resource": "replication-policy", "action": "list"},
-      {"resource": "replication-policy", "action": "read"},
-      {"resource": "replication-policy", "action": "create"},
-      {"resource": "replication-policy", "action": "delete"},
-      {"resource": "replication", "action": "list"},
-      {"resource": "replication", "action": "create"}]}]}'
+    "permissions": [
+      {"kind": "system", "namespace": "/", "access": [
+        {"resource": "registry", "action": "list"}]},
+      {"kind": "project", "namespace": "my-project", "access": [
+        {"resource": "replication-policy", "action": "list"},
+        {"resource": "replication-policy", "action": "read"},
+        {"resource": "replication-policy", "action": "create"},
+        {"resource": "replication-policy", "action": "delete"},
+        {"resource": "replication", "action": "list"},
+        {"resource": "replication", "action": "create"}]}]}'
 jq -r .name "$dir/robot.json" >"$dir/username"
 jq -r .secret "$dir/robot.json" >"$dir/password"
 ```
+
+Upstream Harbor accepts replication permissions only at the system level, so move the project entry's actions into the system entry.
+
+A robot that an earlier install created with system replication permissions keeps them.
+To narrow it, create a robot as above, replace the Secret's `username` and `password`, and delete the old robot.
 
 ### Create the replication Secret
 
@@ -509,6 +517,7 @@ The ownerReference only shows where the artifacts came from. Deleting the replic
   Delete the replications first.
 - A policy that the server hides blocks its namespace and name until a Harbor administrator deletes it.
   Examples are a policy from an earlier namespace of the same name, and one that someone changed in Harbor (see the [threat model](docs/threat-model.md#removing-the-label-leaves-replications-running)).
+  A policy with the same name that the robot can't read, such as one in another project, blocks it too.
   Creating the replication fails with AlreadyExists, and the message names the policy.
 - The server needs Harbor 2.3 or later. Before Harbor 2.14, a run can start while the previous one is still running.
 - A schedule has 6 fields separated by single spaces: seconds, minutes, hours, day of month, month, and day of week, in UTC.
@@ -536,7 +545,7 @@ The Deployment sets only the required ones.
 | `--harbor-poll-interval` | How long to wait between polls of the project. Each wait adds up to 10% jitter. After a poll fails, the replica retries once after 1 second, and then waits this interval until a poll succeeds. Default `30s`. |
 | `--harbor-staleness-limit` | How old data can be before requests that need it fail with 503. A poll that takes longer than this fails. It must be longer than 2.2 times `--harbor-poll-interval` plus twice `--harbor-timeout`. Default `5m`. |
 | `--kubeconfig` | Kubeconfig for reading namespaces. Defaults to the in-cluster configuration. |
-| `--enable-replications` | Serve the writable `HarborReplication` kind. It needs a system-level Harbor robot account that Harbor cannot limit to the project (see the [threat model](docs/threat-model.md#the-replication-robot-controls-replication-across-harbor)). The other `--replication-*` flags need it. Default `false`. |
+| `--enable-replications` | Serve the writable `HarborReplication` kind. It needs a system-level Harbor robot account (see the [threat model](docs/threat-model.md#the-replication-robot-controls-pulls-into-the-project)). The other `--replication-*` flags need it. Default `false`. |
 | `--replication-registries` | Names of the Harbor registry endpoints that replications may copy from, separated by commas. Required with `--enable-replications`. |
 | `--replication-username-file` | File holding the replication robot account name. Required with `--enable-replications`. |
 | `--replication-password-file` | File holding the replication robot account secret. Required with `--enable-replications`. |

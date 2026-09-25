@@ -27,12 +27,12 @@ type replicationOptions struct {
 
 func (r *replicationOptions) addFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&r.Enabled, enableReplicationsFlag, false, "Serve the writable HarborReplication resource. "+
-		"It needs a system-level Harbor robot account, which Harbor cannot limit to the project. See docs/threat-model.md.")
+		"It needs a system-level Harbor robot account. See docs/threat-model.md.")
 	fs.Var((*trimmedStrings)(&r.Registries), "replication-registries", "Comma-separated names of the Harbor registry endpoints that replications may copy from. "+
 		"Anyone who may create replications can copy their content into the project.")
 	fs.StringVar(&r.UsernameFile, "replication-username-file", r.UsernameFile, "File holding the name of the system robot account for replications.")
 	fs.StringVar(&r.PasswordFile, "replication-password-file", r.PasswordFile, "File holding the secret of the system robot account for replications. "+
-		"Whoever has it can copy any Harbor project to or from any registry endpoint, and delete any replication policy.")
+		"Whoever has it can pull from any registry endpoint into the project, or, with upstream Harbor, replicate between any project and any endpoint.")
 	fs.StringVar(&r.Prefix, "replication-prefix", "k8s", "Path segment in the project that replications copy into, and the prefix of their Harbor policy names. "+
 		"Clusters that share a project need different prefixes.")
 	r.flags = fs

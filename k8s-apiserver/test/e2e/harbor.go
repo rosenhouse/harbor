@@ -320,7 +320,6 @@ func (a *Admin) CreateReplicationRobot(ctx context.Context) (name, secret string
 		resource string
 		actions  []string
 	}{
-		{"registry", []string{"list"}},
 		{"replication-policy", []string{"list", "read", "create", "delete"}},
 		{"replication", []string{"list", "create"}},
 	} {
@@ -333,7 +332,8 @@ func (a *Admin) CreateReplicationRobot(ctx context.Context) (name, secret string
 		"level":    "system",
 		"duration": -1,
 		"permissions": []map[string]any{
-			{"kind": "system", "namespace": "/", "access": access},
+			{"kind": "system", "namespace": "/", "access": []map[string]string{{"resource": "registry", "action": "list"}}},
+			{"kind": "project", "namespace": HarborProject, "access": access},
 		},
 	})
 }

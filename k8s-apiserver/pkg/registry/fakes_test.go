@@ -176,6 +176,8 @@ type fakeReplicationHarbor struct {
 	ignorePrefix bool
 	// failEndedRequests fails calls whose context is done, as the Harbor client does.
 	failEndedRequests bool
+	// robotProject drops policies that pull into other projects from lists, as Harbor does for a robot with project permissions.
+	robotProject string
 
 	mu                    sync.Mutex
 	policies              []harbor.ReplicationPolicy
@@ -234,6 +236,11 @@ func (f *fakeReplicationHarbor) policy(name string) (harbor.ReplicationPolicy, b
 	return harbor.ReplicationPolicy{}, false
 }
 
+func (f *fakeReplicationHarbor) readable(p harbor.ReplicationPolicy) bool {
+	project, _, _ := strings.Cut(p.DestNamespace, "/")
+	return f.robotProject == "" || project == f.robotProject
+}
+
 // put stores p, replacing the policy with its ID.
 func (f *fakeReplicationHarbor) put(p harbor.ReplicationPolicy) {
 	f.mu.Lock()
@@ -258,7 +265,7 @@ func (f *fakeReplicationHarbor) ListReplicationPolicies(ctx context.Context, nam
 	defer f.mu.Unlock()
 	var out []harbor.ReplicationPolicy
 	for _, p := range f.policies {
-		if f.ignorePrefix || strings.HasPrefix(p.Name, namePrefix) {
+		if f.readable(p) && (f.ignorePrefix || strings.HasPrefix(p.Name, namePrefix)) {
 			out = append(out, clone(p))
 		}
 	}

@@ -60,6 +60,20 @@ func fallsBackToProject(ctx context.Context, systemErr error) bool {
 	return errors.IsErr(systemErr, errors.ForbiddenCode) && ok && robot.User().IsSysLevel()
 }
 
+// holdsOnAProject reports whether the caller, a robot without the system permission, holds it on any project.
+func holdsOnAProject(ctx context.Context, action rbac.Action, resource rbac.Resource) bool {
+	sc, _ := security.FromContext(ctx)
+	robot, _ := sc.(*robotSec.SecurityContext)
+	for _, p := range robot.User().Permissions {
+		for _, a := range p.Access {
+			if a.Resource == resource && a.Action == action {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // requireAccess passes callers with the system permission, and system-level robots with the permission on
 // the project that the policy pulls into.
 func (r *replicationAPI) requireAccess(ctx context.Context, action rbac.Action, resource rbac.Resource, policy *repctlmodel.Policy) error {
@@ -276,7 +290,7 @@ func (r *replicationAPI) UpdateReplicationPolicy(ctx context.Context, params ope
 
 func (r *replicationAPI) ListReplicationPolicies(ctx context.Context, params operation.ListReplicationPoliciesParams) middleware.Responder {
 	systemErr := r.RequireSystemAccess(ctx, rbac.ActionList, rbac.ResourceReplicationPolicy)
-	if systemErr != nil && !fallsBackToProject(ctx, systemErr) {
+	if systemErr != nil && !(fallsBackToProject(ctx, systemErr) && holdsOnAProject(ctx, rbac.ActionList, rbac.ResourceReplicationPolicy)) {
 		return r.SendError(ctx, systemErr)
 	}
 	query, err := r.BuildQuery(ctx, params.Q, params.Sort, params.Page, params.PageSize)

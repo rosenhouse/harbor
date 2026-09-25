@@ -524,7 +524,7 @@ func TestCreateReplicationRobotReplacesExistingRobot(t *testing.T) {
 	}
 }
 
-func TestCreateReplicationRobotGrantsOnlyReplicationAccess(t *testing.T) {
+func TestCreateReplicationRobotGrantsReplicationAccessOnlyToTheProject(t *testing.T) {
 	h := newFakeHarbor(t)
 
 	if _, _, err := NewAdmin(h.URL).CreateReplicationRobot(t.Context()); err != nil {
@@ -543,7 +543,12 @@ func TestCreateReplicationRobotGrantsOnlyReplicationAccess(t *testing.T) {
 			"kind": "system",
 			"namespace": "/",
 			"access": [
-				{"resource": "registry", "action": "list"},
+				{"resource": "registry", "action": "list"}
+			]
+		}, {
+			"kind": "project",
+			"namespace": "e2e",
+			"access": [
 				{"resource": "replication-policy", "action": "list"},
 				{"resource": "replication-policy", "action": "read"},
 				{"resource": "replication-policy", "action": "create"},
